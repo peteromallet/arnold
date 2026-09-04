@@ -845,7 +845,12 @@ class SshProvider(Provider):
         )
 
     def _host_observation(self, operation: str) -> subprocess.CompletedProcess[str]:
-        """Run one of two internally constructed host observations."""
+        """Run one of the fixed host observations without WBC allocation.
+
+        Observation transport is deliberately outside ``_run``: that method
+        reserves and appends a process-adapter WBC attempt, which is valid for
+        effects but would make a preflight mutate custody before admission.
+        """
         if operation == "container":
             command = container_inspect_command(self._ssh.container)
             surface = "observe_container"
@@ -878,12 +883,21 @@ class SshProvider(Provider):
                 "invalid_provider_observation",
                 "SSH host observation is not allowlisted",
             )
-        return self._run(
-            [*self._ssh_destination_argv(), command],
-            capture_output=True,
-            surface=surface,
-            raise_on_failure=False,
-        )
+        argv = [*self._ssh_destination_argv(), command]
+        try:
+            return subprocess.run(
+                argv,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        except FileNotFoundError as exc:
+            return subprocess.CompletedProcess(
+                argv,
+                255,
+                "",
+                f"observation transport unavailable: {type(exc).__name__}",
+            )
 
     def observe_container(self) -> dict[str, Any]:
         result = self._host_observation("container")

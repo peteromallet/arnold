@@ -7,7 +7,7 @@ import os
 import time
 import uuid
 from contextlib import contextmanager
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from threading import Lock, RLock
@@ -17,6 +17,7 @@ from typing import Protocol, runtime_checkable
 import fcntl
 
 from .events import OperationEvent
+from .launch import LaunchEnvelope, LaunchReason, LaunchResult
 from .operation import OperationRun, OperationState, RetryMetadata
 from .scheduled_task import ScheduledTask, ScheduledTaskState
 from .typed_resources import ResourceType, TypedResource
@@ -33,6 +34,7 @@ __all__ = [
     "ScheduledTaskLeaseConflict",
     "ScheduledTaskLeaseTokenMismatch",
     "TypedResourceAlreadyExists",
+    "LaunchStoreResult",
 ]
 
 
@@ -72,6 +74,21 @@ class ScheduledTaskLeaseTokenMismatch(RuntimeError):
     """Raised when completing or failing a task with the wrong lease token."""
 
 
+@dataclass(frozen=True)
+class LaunchStoreResult:
+    """Canonical result of an authoritative launch admission/acceptance write."""
+
+    result: LaunchResult
+    reason: LaunchReason
+    operation: OperationRun
+    envelope: LaunchEnvelope
+    process_resource: TypedResource | None = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "result", LaunchResult(self.result))
+        object.__setattr__(self, "reason", LaunchReason(self.reason))
+
+
 class FileBackedDurableOpsStore:
     """JSON current-state store for operation runs, resources, and events."""
 
@@ -82,6 +99,288 @@ class FileBackedDurableOpsStore:
         self._path = self._root / "operation_runs.json"
         self._lock_path = self._root / "operation_runs.lock"
         self._lock = Lock()
+
+    def admit_launch(
+        self,
+        envelope: LaunchEnvelope,
+        *,
+        operation_type: str | None = None,
+    ) -> LaunchStoreResult:
+        """Atomically admit one immutable envelope as a ``PENDING`` operation.
+
+        Admission identity is kept in the existing operation-event substrate.
+        The operation and admission event are assembled in memory and become
+        visible together through the store's single replacement.
+        """
+
+        envelope = _coerce_launch_envelope(envelope)
+        with self._lock:
+            with interprocess_json_lock(self._lock_path, timeout_seconds=self.lock_timeout_seconds):
+                data = self._read_data()
+                runs = data["operation_runs"]
+                events = data["operation_events"]
+                current = _operation_run_from_json(runs[envelope.operation_id]) if envelope.operation_id in runs else None
+                admission_id = _launch_admission_event_id(envelope)
+                existing_raw = events.get(admission_id)
+                if existing_raw is not None:
+                    existing = _operation_event_from_json(existing_raw)
+                    if not _admission_event_matches(existing, envelope):
+                        return _launch_store_conflict(envelope, current)
+                    if current is None:
+                        return _launch_store_unknown(envelope, None)
+                    return LaunchStoreResult(
+                        LaunchResult.ACCEPTED,
+                        LaunchReason.REPLAY,
+                        current,
+                        envelope,
+                    )
+
+                # Any admission event for this operation is authoritative for
+                # its request identity; a second request cannot be appended.
+                for raw in events.values():
+                    if raw.get("operation_id") != envelope.operation_id:
+                        continue
+                    if raw.get("event_type") != _LAUNCH_ADMISSION_EVENT:
+                        continue
+                    prior = _operation_event_from_json(raw)
+                    if not _admission_event_matches(prior, envelope):
+                        return _launch_store_conflict(envelope, current)
+
+                if current is not None:
+                    if current.state is not OperationState.PENDING:
+                        return _launch_store_conflict(envelope, current)
+                    if current.idempotency_key not in (None, envelope.request_id):
+                        return _launch_store_conflict(envelope, current)
+                    stored = current
+                else:
+                    selected_type = operation_type or envelope.launch_spec.get("operation_type", "launch")
+                    if not isinstance(selected_type, str) or not selected_type:
+                        raise ValueError("operation_type must be a non-empty string")
+                    timestamp = _utc_now()
+                    stored = OperationRun(
+                        id=envelope.operation_id,
+                        operation_type=selected_type,
+                        state=OperationState.PENDING,
+                        idempotency_key=envelope.request_id,
+                        created_at=timestamp,
+                        updated_at=timestamp,
+                    )
+
+                event = OperationEvent(
+                    id=admission_id,
+                    operation_id=envelope.operation_id,
+                    event_type=_LAUNCH_ADMISSION_EVENT,
+                    summary="launch envelope admitted",
+                    sequence=_next_event_sequence(events, operation_id=envelope.operation_id),
+                    payload=_launch_admission_payload(envelope),
+                )
+                data["operation_runs"][stored.id] = _operation_run_to_json(stored)
+                data["operation_events"][event.id] = _operation_event_to_json(event)
+                try:
+                    self._write_data(data)
+                except Exception:
+                    return self._resolve_admission_write_failure(envelope, current)
+                return LaunchStoreResult(
+                    LaunchResult.ACCEPTED,
+                    LaunchReason.ADMITTED,
+                    stored,
+                    envelope,
+                )
+
+    def accept_launch(
+        self,
+        envelope: LaunchEnvelope,
+        *,
+        process_resource: TypedResource,
+        owner_evidence: dict[str, Any],
+        owner: str | None = None,
+    ) -> LaunchStoreResult:
+        """Atomically persist strict accepted identity and transition to RUNNING.
+
+        The resource identifier and acceptance event identifier are derived
+        from operation/request identity.  ``owner_evidence`` is persisted in
+        the acceptance event and must carry the same owner on exact replay.
+        """
+
+        envelope = _coerce_launch_envelope(envelope)
+        if not isinstance(process_resource, TypedResource):
+            raise TypeError("process_resource must be a TypedResource")
+        if not isinstance(owner_evidence, dict):
+            raise TypeError("owner_evidence must be a JSON object")
+        evidence_owner = owner or owner_evidence.get("owner") or owner_evidence.get("owner_id")
+        if not isinstance(evidence_owner, str) or not evidence_owner:
+            raise ValueError("owner_evidence must contain a non-empty owner")
+        if any(
+            key in owner_evidence and owner_evidence[key] != evidence_owner
+            for key in ("owner", "owner_id")
+        ):
+            return _launch_store_conflict(envelope, None)
+
+        expected_resource_id = _launch_process_resource_id(envelope)
+        if process_resource.operation_id != envelope.operation_id:
+            return _launch_store_conflict(envelope, None)
+        if process_resource.resource_type is not ResourceType.PROCESS_SESSION:
+            return _launch_store_conflict(envelope, None)
+        if not process_resource.name:
+            return _launch_store_conflict(envelope, None)
+
+        with self._lock:
+            with interprocess_json_lock(self._lock_path, timeout_seconds=self.lock_timeout_seconds):
+                data = self._read_data()
+                runs = data["operation_runs"]
+                events = data["operation_events"]
+                resources = data["typed_resources"]
+                current = runs.get(envelope.operation_id)
+                if current is None:
+                    return _launch_store_conflict(envelope, None)
+                operation = _operation_run_from_json(current)
+                admission_raw = events.get(_launch_admission_event_id(envelope))
+                if admission_raw is None or not _admission_event_matches(
+                    _operation_event_from_json(admission_raw), envelope
+                ):
+                    return _launch_store_conflict(envelope, operation)
+
+                acceptance_id = _launch_acceptance_event_id(envelope)
+                existing_event_raw = events.get(acceptance_id)
+                existing_resource_raw = resources.get(expected_resource_id)
+                if existing_event_raw is not None or existing_resource_raw is not None:
+                    existing_event = (
+                        _operation_event_from_json(existing_event_raw)
+                        if existing_event_raw is not None
+                        else None
+                    )
+                    existing_resource = (
+                        _typed_resource_from_json(existing_resource_raw)
+                        if existing_resource_raw is not None
+                        else None
+                    )
+                    if operation.state is OperationState.RUNNING:
+                        if existing_event is not None and existing_resource is not None:
+                            if _acceptance_matches(
+                                existing_event,
+                                existing_resource,
+                                envelope,
+                                process_resource,
+                                evidence_owner,
+                                owner_evidence,
+                            ):
+                                return LaunchStoreResult(
+                                    LaunchResult.ACCEPTED,
+                                    LaunchReason.REPLAY,
+                                    operation,
+                                    envelope,
+                                    existing_resource,
+                                )
+                            return _launch_store_conflict(envelope, operation, existing_resource)
+                        return _launch_store_unknown(envelope, operation, existing_resource)
+                    if operation.state is not OperationState.PENDING:
+                        return _launch_store_conflict(envelope, operation, existing_resource)
+
+                    # A replacement can be commit-unknown after one of the
+                    # accepted facts reached disk.  Validate the fact that is
+                    # present, then complete only the missing pieces in the
+                    # same idempotent composite write; never redispatch.
+                    stored_resource = _canonical_process_resource(
+                        process_resource,
+                        envelope,
+                        owner=evidence_owner,
+                    )
+                    if existing_resource is not None and not _resource_matches(
+                        existing_resource, stored_resource
+                    ):
+                        return _launch_store_conflict(envelope, operation, existing_resource)
+                    accepted_resource = existing_resource or stored_resource
+                    if existing_event is not None and not _acceptance_event_matches(
+                        existing_event,
+                        accepted_resource,
+                        envelope,
+                        process_resource,
+                        evidence_owner,
+                        owner_evidence,
+                    ):
+                        return _launch_store_conflict(envelope, operation, existing_resource)
+                    acceptance_event = existing_event or OperationEvent(
+                        id=acceptance_id,
+                        operation_id=envelope.operation_id,
+                        event_type=_LAUNCH_ACCEPTANCE_EVENT,
+                        summary="launch accepted",
+                        sequence=_next_event_sequence(events, operation_id=envelope.operation_id),
+                        payload=_launch_acceptance_payload(
+                            envelope,
+                            accepted_resource,
+                            owner=evidence_owner,
+                            owner_evidence=owner_evidence,
+                        ),
+                    )
+                    running = replace(
+                        operation.transition_to(OperationState.RUNNING),
+                        lock_version=operation.lock_version + 1,
+                    )
+                    data["operation_runs"][running.id] = _operation_run_to_json(running)
+                    data["typed_resources"][accepted_resource.id] = _typed_resource_to_json(accepted_resource)
+                    data["operation_events"][acceptance_event.id] = _operation_event_to_json(acceptance_event)
+                    try:
+                        self._write_data(data)
+                    except Exception:
+                        return self._resolve_acceptance_write_failure(
+                            envelope,
+                            process_resource,
+                            evidence_owner,
+                            owner_evidence,
+                            operation,
+                        )
+                    return LaunchStoreResult(
+                        LaunchResult.ACCEPTED,
+                        LaunchReason.DISPATCH_ACCEPTED,
+                        running,
+                        envelope,
+                        accepted_resource,
+                    )
+                if operation.state is not OperationState.PENDING:
+                    return _launch_store_conflict(envelope, operation)
+
+                stored_resource = _canonical_process_resource(
+                    process_resource,
+                    envelope,
+                    owner=evidence_owner,
+                )
+                acceptance_event = OperationEvent(
+                    id=acceptance_id,
+                    operation_id=envelope.operation_id,
+                    event_type=_LAUNCH_ACCEPTANCE_EVENT,
+                    summary="launch accepted",
+                    sequence=_next_event_sequence(events, operation_id=envelope.operation_id),
+                    payload=_launch_acceptance_payload(
+                        envelope,
+                        stored_resource,
+                        owner=evidence_owner,
+                        owner_evidence=owner_evidence,
+                    ),
+                )
+                running = replace(
+                    operation.transition_to(OperationState.RUNNING),
+                    lock_version=operation.lock_version + 1,
+                )
+                data["operation_runs"][running.id] = _operation_run_to_json(running)
+                data["typed_resources"][stored_resource.id] = _typed_resource_to_json(stored_resource)
+                data["operation_events"][acceptance_event.id] = _operation_event_to_json(acceptance_event)
+                try:
+                    self._write_data(data)
+                except Exception:
+                    return self._resolve_acceptance_write_failure(
+                        envelope,
+                        process_resource,
+                        evidence_owner,
+                        owner_evidence,
+                        operation,
+                    )
+                return LaunchStoreResult(
+                    LaunchResult.ACCEPTED,
+                    LaunchReason.DISPATCH_ACCEPTED,
+                    running,
+                    envelope,
+                    stored_resource,
+                )
 
     def create_operation_run(self, run: OperationRun) -> OperationRun:
         with self._lock:
@@ -307,6 +606,67 @@ class FileBackedDurableOpsStore:
                 data["scheduled_tasks"][stored.id] = _scheduled_task_to_json(stored)
                 self._write_data(data)
                 return stored
+
+    def _resolve_admission_write_failure(
+        self,
+        envelope: LaunchEnvelope,
+        prior_operation: OperationRun | None,
+    ) -> LaunchStoreResult:
+        """Resolve a replacement exception without ever issuing a rollback."""
+
+        data = self._read_data()
+        operation = _operation_run_from_json(data["operation_runs"][envelope.operation_id]) if envelope.operation_id in data["operation_runs"] else None
+        raw = data["operation_events"].get(_launch_admission_event_id(envelope))
+        if operation is not None and raw is not None and _admission_event_matches(
+            _operation_event_from_json(raw), envelope
+        ):
+            return LaunchStoreResult(
+                LaunchResult.ACCEPTED,
+                LaunchReason.REPLAY,
+                operation,
+                envelope,
+            )
+        if operation is None and raw is None:
+            raise
+        return _launch_store_unknown(envelope, operation or prior_operation)
+
+    def _resolve_acceptance_write_failure(
+        self,
+        envelope: LaunchEnvelope,
+        process_resource: TypedResource,
+        owner: str,
+        owner_evidence: dict[str, Any],
+        prior_operation: OperationRun,
+    ) -> LaunchStoreResult:
+        """Read back the exact accepted identity after a commit-unknown error."""
+
+        data = self._read_data()
+        raw_operation = data["operation_runs"].get(envelope.operation_id)
+        raw_event = data["operation_events"].get(_launch_acceptance_event_id(envelope))
+        raw_resource = data["typed_resources"].get(_launch_process_resource_id(envelope))
+        if raw_operation is None or raw_event is None or raw_resource is None:
+            if raw_event is None and raw_resource is None and raw_operation is not None:
+                operation = _operation_run_from_json(raw_operation)
+                if operation.state is OperationState.PENDING:
+                    raise
+            return _launch_store_unknown(
+                envelope,
+                _operation_run_from_json(raw_operation) if raw_operation is not None else prior_operation,
+            )
+        operation = _operation_run_from_json(raw_operation)
+        resource = _typed_resource_from_json(raw_resource)
+        event = _operation_event_from_json(raw_event)
+        if operation.state is OperationState.RUNNING and _acceptance_matches(
+            event, resource, envelope, process_resource, owner, owner_evidence
+        ):
+            return LaunchStoreResult(
+                LaunchResult.ACCEPTED,
+                LaunchReason.REPLAY,
+                operation,
+                envelope,
+                resource,
+            )
+        return _launch_store_unknown(envelope, operation, resource)
 
     def claim_due_scheduled_tasks(
         self,
@@ -583,6 +943,216 @@ class DurableOpsStore(Protocol):
         now: datetime | None = None,
     ) -> ScheduledTask:  # pragma: no cover - protocol
         ...
+
+
+_LAUNCH_ADMISSION_EVENT = "launch.admitted"
+_LAUNCH_ACCEPTANCE_EVENT = "launch.accepted"
+
+
+def _coerce_launch_envelope(envelope: LaunchEnvelope) -> LaunchEnvelope:
+    if not isinstance(envelope, LaunchEnvelope):
+        raise TypeError("envelope must be a LaunchEnvelope")
+    return envelope
+
+
+def _launch_admission_event_id(envelope: LaunchEnvelope) -> str:
+    return f"launch-admission:{envelope.operation_id}:{envelope.request_id}"
+
+
+def _launch_acceptance_event_id(envelope: LaunchEnvelope) -> str:
+    return f"launch-acceptance:{envelope.operation_id}:{envelope.request_id}"
+
+
+def _launch_process_resource_id(envelope: LaunchEnvelope) -> str:
+    return f"launch-process-session:{envelope.operation_id}:{envelope.request_id}"
+
+
+def _launch_admission_payload(envelope: LaunchEnvelope) -> dict[str, Any]:
+    return {
+        "version": envelope.version,
+        "request_id": envelope.request_id,
+        "envelope_digest": envelope.digest,
+        "envelope": envelope.to_json(),
+    }
+
+
+def _launch_acceptance_payload(
+    envelope: LaunchEnvelope,
+    resource: TypedResource,
+    *,
+    owner: str,
+    owner_evidence: dict[str, Any],
+) -> dict[str, Any]:
+    return {
+        "version": envelope.version,
+        "request_id": envelope.request_id,
+        "envelope_digest": envelope.digest,
+        "process_resource_id": resource.id,
+        "process_session_identity": resource.details.get("process_session_identity"),
+        "owner": owner,
+        "owner_evidence": dict(owner_evidence),
+    }
+
+
+def _admission_event_matches(event: OperationEvent, envelope: LaunchEnvelope) -> bool:
+    payload = event.payload
+    return (
+        event.id == _launch_admission_event_id(envelope)
+        and event.operation_id == envelope.operation_id
+        and event.event_type == _LAUNCH_ADMISSION_EVENT
+        and payload.get("version") == envelope.version
+        and payload.get("request_id") == envelope.request_id
+        and payload.get("envelope_digest") == envelope.digest
+        and payload.get("envelope") == envelope.to_json()
+    )
+
+
+def _canonical_process_resource(
+    resource: TypedResource,
+    envelope: LaunchEnvelope,
+    *,
+    owner: str,
+) -> TypedResource:
+    details = dict(resource.details)
+    process_session_identity = details.get("process_session_identity", resource.id)
+    if not isinstance(process_session_identity, str) or not process_session_identity:
+        raise ValueError("process_session_identity must be a non-empty string")
+    details.update(
+        {
+            "launch_operation_id": envelope.operation_id,
+            "launch_request_id": envelope.request_id,
+            "launch_envelope_digest": envelope.digest,
+            "process_session_identity": process_session_identity,
+            "owner": owner,
+        }
+    )
+    return TypedResource(
+        id=_launch_process_resource_id(envelope),
+        operation_id=envelope.operation_id,
+        resource_type=ResourceType.PROCESS_SESSION,
+        name=resource.name,
+        details=details,
+        created_at=resource.created_at,
+        updated_at=resource.updated_at,
+    )
+
+
+def _resource_matches(expected: TypedResource, candidate: TypedResource) -> bool:
+    """Compare persisted resource identity without treating timestamps as identity."""
+
+    return (
+        expected.id == candidate.id
+        and expected.operation_id == candidate.operation_id
+        and expected.resource_type is candidate.resource_type
+        and expected.name == candidate.name
+        and dict(expected.details) == dict(candidate.details)
+    )
+
+
+def _acceptance_event_matches(
+    event: OperationEvent,
+    resource: TypedResource,
+    envelope: LaunchEnvelope,
+    candidate_resource: TypedResource,
+    owner: str,
+    owner_evidence: dict[str, Any],
+) -> bool:
+    """Validate the accepted event against the exact canonical resource facts."""
+
+    return _acceptance_matches(
+        event,
+        resource,
+        envelope,
+        candidate_resource,
+        owner,
+        owner_evidence,
+    )
+
+
+def _acceptance_matches(
+    event: OperationEvent,
+    resource: TypedResource,
+    envelope: LaunchEnvelope,
+    candidate_resource: TypedResource,
+    owner: str,
+    owner_evidence: dict[str, Any],
+) -> bool:
+    expected_identity = candidate_resource.details.get(
+        "process_session_identity", candidate_resource.id
+    )
+    candidate_details = dict(candidate_resource.details)
+    stored_details = dict(resource.details)
+    for generated_key in (
+        "launch_operation_id",
+        "launch_request_id",
+        "launch_envelope_digest",
+        "process_session_identity",
+        "owner",
+    ):
+        candidate_details.pop(generated_key, None)
+        stored_details.pop(generated_key, None)
+    return (
+        resource.id == _launch_process_resource_id(envelope)
+        and resource.operation_id == envelope.operation_id
+        and resource.resource_type is ResourceType.PROCESS_SESSION
+        and resource.details.get("process_session_identity") == expected_identity
+        and resource.details.get("launch_envelope_digest") == envelope.digest
+        and resource.details.get("owner") == owner
+        and resource.name == candidate_resource.name
+        and stored_details == candidate_details
+        and event.id == _launch_acceptance_event_id(envelope)
+        and event.operation_id == envelope.operation_id
+        and event.event_type == _LAUNCH_ACCEPTANCE_EVENT
+        and event.payload.get("version") == envelope.version
+        and event.payload.get("request_id") == envelope.request_id
+        and event.payload.get("envelope_digest") == envelope.digest
+        and event.payload.get("process_resource_id") == resource.id
+        and event.payload.get("process_session_identity") == expected_identity
+        and event.payload.get("owner") == owner
+        and event.payload.get("owner_evidence") == dict(owner_evidence)
+    )
+
+
+def _launch_store_conflict(
+    envelope: LaunchEnvelope,
+    operation: OperationRun | None,
+    process_resource: TypedResource | None = None,
+) -> LaunchStoreResult:
+    if operation is None:
+        operation = OperationRun(
+            id=envelope.operation_id,
+            operation_type="launch",
+            state=OperationState.PENDING,
+            idempotency_key=envelope.request_id,
+        )
+    return LaunchStoreResult(
+        LaunchResult.CONFLICT,
+        LaunchReason.REQUEST_CONFLICT,
+        operation,
+        envelope,
+        process_resource,
+    )
+
+
+def _launch_store_unknown(
+    envelope: LaunchEnvelope,
+    operation: OperationRun | None,
+    process_resource: TypedResource | None = None,
+) -> LaunchStoreResult:
+    if operation is None:
+        operation = OperationRun(
+            id=envelope.operation_id,
+            operation_type="launch",
+            state=OperationState.PENDING,
+            idempotency_key=envelope.request_id,
+        )
+    return LaunchStoreResult(
+        LaunchResult.UNKNOWN,
+        LaunchReason.DISPATCH_UNCERTAIN,
+        operation,
+        envelope,
+        process_resource,
+    )
 
 
 def _operation_run_to_json(run: OperationRun) -> dict[str, Any]:

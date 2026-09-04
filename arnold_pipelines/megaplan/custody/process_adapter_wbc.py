@@ -5,6 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Mapping
+import hashlib
+import json
 import re
 import uuid
 
@@ -36,6 +38,62 @@ def process_adapter_wbc_dir(
         / _slug(producer_family)
         / _slug(adapter_name)
     )
+
+
+def observe_process_adapter_wbc(
+    evidence_root: str | Path,
+    *,
+    producer_family: str,
+    adapter_name: str,
+) -> dict[str, Any]:
+    """Read existing process-adapter WBC evidence without opening a writer.
+
+    Preflight may prove that a prior custody reference exists, but it must not
+    reserve an attempt or append a ``started`` event.  This deliberately uses
+    ordinary reads and returns a typed unknown result for absent, malformed, or
+    unreadable evidence.
+    """
+
+    evidence_dir = process_adapter_wbc_dir(
+        evidence_root,
+        producer_family=producer_family,
+        adapter_name=adapter_name,
+    )
+    events_path = evidence_dir / "events.ndjson"
+    base: dict[str, Any] = {
+        "schema": PROCESS_ADAPTER_WBC_SCHEMA,
+        "producer_family": producer_family,
+        "adapter_name": adapter_name,
+        "path": str(events_path),
+    }
+    try:
+        if not events_path.is_file():
+            return {**base, "status": "missing", "events": [], "reference": None}
+        raw = events_path.read_bytes()
+        lines = [line for line in raw.splitlines() if line.strip()]
+        events = [json.loads(line.decode("utf-8")) for line in lines]
+        if not events or any(
+            not isinstance(event, Mapping)
+            or event.get("kind") != "process_adapter_wbc"
+            or not isinstance(event.get("payload"), Mapping)
+            or event["payload"].get("schema") != PROCESS_ADAPTER_WBC_SCHEMA
+            for event in events
+        ):
+            return {**base, "status": "unknown", "events": [], "reference": None, "reason": "malformed"}
+        return {
+            **base,
+            "status": "available",
+            "events": events,
+            "reference": "sha256:" + hashlib.sha256(raw).hexdigest(),
+        }
+    except (OSError, UnicodeError, ValueError, TypeError, json.JSONDecodeError) as exc:
+        return {
+            **base,
+            "status": "unknown",
+            "events": [],
+            "reference": None,
+            "reason": type(exc).__name__,
+        }
 
 
 @dataclass
@@ -152,5 +210,6 @@ __all__ = [
     "PROCESS_ADAPTER_WBC_SCHEMA",
     "ProcessAdapterWbcAttempt",
     "begin_process_adapter_attempt",
+    "observe_process_adapter_wbc",
     "process_adapter_wbc_dir",
 ]

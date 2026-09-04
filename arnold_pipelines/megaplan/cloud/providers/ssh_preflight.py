@@ -18,15 +18,14 @@ from arnold_pipelines.megaplan.types import CliError
 
 _CONTAINER_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}\Z")
 _CONTAINER_OBSERVATION_SCHEMA = "arnold.cloud.ssh_container_observation.v1"
-_WORKSPACE_PRELAUNCH_SCHEMA = "arnold.cloud.ssh_workspace_prelaunch.v1"
+_WORKSPACE_PRELAUNCH_SCHEMA = "arnold.cloud.ssh_workspace_prelaunch.v2"
 _CAPACITY_INVENTORY_SCHEMA = "arnold.cloud.ssh_capacity_inventory.v1"
 _REQUIRED_CAPACITY_CHECKS = {
     "byte_floor",
     "inode_floor",
-    "reserve_fsync",
-    "sqlite_wal",
-    "receipt_atomic_fsync",
-    "cleanup",
+    "workspace_identity",
+    "temp_volume",
+    "output_bound",
 }
 _CAPACITY_TOP_LEVEL_FIELDS = {
     "schema",
@@ -35,6 +34,7 @@ _CAPACITY_TOP_LEVEL_FIELDS = {
     "checks",
     "errors",
     "mount",
+    "temp_mount",
     "capacity",
     "status",
     "verdict",
@@ -306,153 +306,73 @@ def classify_container_inspect(
 _CAPACITY_PROBE_SCRIPT = r"""
 import json
 import os
-import shutil
-import sqlite3
 import stat
 import sys
-import tempfile
 
 workspace = sys.argv[1]
 min_free_bytes = int(sys.argv[2])
 min_free_inodes = int(sys.argv[3])
-reserve_bytes = int(sys.argv[4])
+output_bound_bytes = int(sys.argv[4])
+temp_volume = sys.argv[5]
 result = {
-    "schema": "arnold.cloud.ssh_workspace_prelaunch.v1",
+    "schema": "arnold.cloud.ssh_workspace_prelaunch.v2",
     "workspace": workspace,
     "thresholds": {
         "min_free_bytes": min_free_bytes,
         "min_free_inodes": min_free_inodes,
-        "receipt_reserve_bytes": reserve_bytes,
+        "receipt_reserve_bytes": output_bound_bytes,
     },
     "checks": {},
     "errors": [],
 }
-probe_dir = None
 
-def mount_identity(path):
-    st = os.stat(path, follow_symlinks=False)
-    identity = {
-        "st_dev": st.st_dev,
-        "device_major": os.major(st.st_dev),
-        "device_minor": os.minor(st.st_dev),
-        "inode": st.st_ino,
+def identity(path):
+    item = os.lstat(path)
+    return {
+        "st_dev": item.st_dev,
+        "device_major": os.major(item.st_dev),
+        "device_minor": os.minor(item.st_dev),
+        "inode": item.st_ino,
     }
-    best = None
-    try:
-        with open("/proc/self/mountinfo", "r", encoding="utf-8") as handle:
-            for line in handle:
-                fields = line.rstrip("\n").split()
-                if "-" not in fields or len(fields) < 10:
-                    continue
-                dash = fields.index("-")
-                mount_point = fields[4].replace("\\040", " ")
-                if path == mount_point or path.startswith(mount_point.rstrip("/") + "/"):
-                    if best is None or len(mount_point) > len(best[0]):
-                        best = (mount_point, fields[dash + 1], fields[dash + 2])
-    except OSError:
-        pass
-    if best is not None:
-        identity.update({"mount_point": best[0], "filesystem": best[1], "mount_source": best[2]})
-    return identity
 
 try:
-    lst = os.lstat(workspace)
-    if not stat.S_ISDIR(lst.st_mode) or stat.S_ISLNK(lst.st_mode):
-        raise RuntimeError("configured workspace is not a real directory")
-    if os.path.realpath(workspace) != workspace:
-        raise RuntimeError("configured workspace path resolves elsewhere")
-    result["mount"] = mount_identity(workspace)
-    before = os.statvfs(workspace)
-    free_bytes = before.f_bavail * before.f_frsize
-    free_inodes = before.f_favail
-    result["capacity"] = {"free_bytes": free_bytes, "free_inodes": free_inodes}
-    required_bytes = min_free_bytes + reserve_bytes
-    result["checks"]["byte_floor"] = free_bytes >= required_bytes
+    workspace_stat = os.lstat(workspace)
+    temp_stat = os.stat(temp_volume)
+    if (
+        not stat.S_ISDIR(workspace_stat.st_mode)
+        or stat.S_ISLNK(workspace_stat.st_mode)
+        or not stat.S_ISDIR(temp_stat.st_mode)
+    ):
+        raise RuntimeError("configured capacity path is not a real directory")
+    workspace_vfs = os.statvfs(workspace)
+    temp_vfs = os.statvfs(temp_volume)
+    free_bytes = workspace_vfs.f_bavail * workspace_vfs.f_frsize
+    free_inodes = workspace_vfs.f_favail
+    temp_free_bytes = temp_vfs.f_bavail * temp_vfs.f_frsize
+    temp_free_inodes = temp_vfs.f_favail
+    result["mount"] = identity(workspace_stat and workspace)
+    result["temp_mount"] = identity(temp_volume)
+    result["capacity"] = {
+        "free_bytes": free_bytes,
+        "free_inodes": free_inodes,
+        "temp_free_bytes": temp_free_bytes,
+        "temp_free_inodes": temp_free_inodes,
+    }
+    result["checks"]["byte_floor"] = free_bytes >= min_free_bytes + output_bound_bytes
     result["checks"]["inode_floor"] = free_inodes >= min_free_inodes
+    result["checks"]["workspace_identity"] = True
+    result["checks"]["temp_volume"] = temp_free_bytes >= output_bound_bytes and temp_free_inodes > 0
+    result["checks"]["output_bound"] = free_bytes >= output_bound_bytes
     if not result["checks"]["byte_floor"]:
         result["errors"].append("prelaunch_free_bytes_below_reserve")
     if not result["checks"]["inode_floor"]:
         result["errors"].append("prelaunch_free_inodes_below_reserve")
-    if result["errors"]:
-        raise RuntimeError("capacity floor failed")
+    if not result["checks"]["temp_volume"]:
+        result["errors"].append("prelaunch_temp_volume_below_reserve")
+except (OSError, RuntimeError, ValueError) as exc:
+    result["errors"].append(str(exc) or type(exc).__name__)
 
-    probe_dir = tempfile.mkdtemp(prefix=".arnold-prelaunch-", dir=workspace)
-    reserve_path = os.path.join(probe_dir, "receipt.reserve")
-    fd = os.open(reserve_path, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600)
-    try:
-        if reserve_bytes:
-            if hasattr(os, "posix_fallocate"):
-                os.posix_fallocate(fd, 0, reserve_bytes)
-            else:
-                remaining = reserve_bytes
-                block = b"\0" * min(1024 * 1024, reserve_bytes)
-                while remaining:
-                    written = os.write(fd, block[:remaining])
-                    if written <= 0:
-                        raise RuntimeError("receipt reserve write made no progress")
-                    remaining -= written
-                os.lseek(fd, 0, os.SEEK_SET)
-        os.write(fd, b"arnold-prelaunch\n")
-        os.fsync(fd)
-    finally:
-        os.close(fd)
-    result["checks"]["reserve_fsync"] = True
-
-    db_path = os.path.join(probe_dir, "probe.sqlite3")
-    connection = sqlite3.connect(db_path)
-    try:
-        journal = connection.execute("PRAGMA journal_mode=WAL").fetchone()[0]
-        connection.execute("PRAGMA synchronous=FULL")
-        connection.execute("CREATE TABLE receipt (id INTEGER PRIMARY KEY, payload TEXT NOT NULL)")
-        connection.execute("INSERT INTO receipt(payload) VALUES (?)", ("prelaunch",))
-        connection.commit()
-        integrity = connection.execute("PRAGMA integrity_check").fetchone()[0]
-        checkpoint = connection.execute("PRAGMA wal_checkpoint(FULL)").fetchone()
-    finally:
-        connection.close()
-    if str(journal).lower() != "wal" or integrity != "ok" or not checkpoint or checkpoint[0] != 0:
-        raise RuntimeError("sqlite WAL durability probe failed")
-    db_fd = os.open(db_path, os.O_RDONLY)
-    try:
-        os.fsync(db_fd)
-    finally:
-        os.close(db_fd)
-    result["checks"]["sqlite_wal"] = True
-
-    receipt_tmp = os.path.join(probe_dir, "receipt.json.tmp")
-    receipt_path = os.path.join(probe_dir, "receipt.json")
-    receipt_fd = os.open(receipt_tmp, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-    try:
-        os.write(receipt_fd, b'{"status":"durable"}\n')
-        os.fsync(receipt_fd)
-    finally:
-        os.close(receipt_fd)
-    os.replace(receipt_tmp, receipt_path)
-    dir_fd = os.open(probe_dir, os.O_RDONLY | os.O_DIRECTORY)
-    try:
-        os.fsync(dir_fd)
-    finally:
-        os.close(dir_fd)
-    result["checks"]["receipt_atomic_fsync"] = True
-except Exception as exc:
-    message = str(exc)
-    if message and message not in result["errors"] and message != "capacity floor failed":
-        result["errors"].append(message)
-finally:
-    if probe_dir is not None:
-        try:
-            shutil.rmtree(probe_dir)
-            workspace_fd = os.open(workspace, os.O_RDONLY | os.O_DIRECTORY)
-            try:
-                os.fsync(workspace_fd)
-            finally:
-                os.close(workspace_fd)
-            result["checks"]["cleanup"] = True
-        except Exception as exc:
-            result["checks"]["cleanup"] = False
-            result["errors"].append("probe_cleanup_failed: " + str(exc))
-
-required_checks = ("byte_floor", "inode_floor", "reserve_fsync", "sqlite_wal", "receipt_atomic_fsync", "cleanup")
+required_checks = ("byte_floor", "inode_floor", "workspace_identity", "temp_volume", "output_bound")
 result["status"] = "go" if not result["errors"] and all(result["checks"].get(key) is True for key in required_checks) else "no-go"
 result["verdict"] = "GO" if result["status"] == "go" else "NO-GO"
 print(json.dumps(result, sort_keys=True))
@@ -466,6 +386,7 @@ def workspace_prelaunch_command(
     min_free_bytes: int,
     min_free_inodes: int,
     receipt_reserve_bytes: int,
+    temp_volume: str = "/tmp",
 ) -> str:
     workspace = validate_workspace_dir(workspace_dir)
     values = (min_free_bytes, min_free_inodes, receipt_reserve_bytes)
@@ -486,6 +407,7 @@ def workspace_prelaunch_command(
             str(min_free_bytes),
             str(min_free_inodes),
             str(receipt_reserve_bytes),
+            validate_workspace_dir(temp_volume),
         ]
     )
 
@@ -725,9 +647,11 @@ def _valid_mount_identity(value: Any) -> bool:
 def _valid_capacity(value: Any) -> bool:
     return (
         isinstance(value, dict)
-        and set(value) == {"free_bytes", "free_inodes"}
+        and set(value) == {"free_bytes", "free_inodes", "temp_free_bytes", "temp_free_inodes"}
         and _nonnegative_integer(value.get("free_bytes"))
         and _nonnegative_integer(value.get("free_inodes"))
+        and _nonnegative_integer(value.get("temp_free_bytes"))
+        and _nonnegative_integer(value.get("temp_free_inodes"))
     )
 
 
@@ -822,7 +746,7 @@ def parse_workspace_prelaunch_result(
         return invalid("workspace prelaunch errors were malformed")
     if not _valid_checks(payload.get("checks"), complete=False):
         return invalid("workspace prelaunch checks were malformed")
-    if not _valid_mount_identity(payload.get("mount")):
+    if not _valid_mount_identity(payload.get("mount")) or not _valid_mount_identity(payload.get("temp_mount")):
         return invalid("workspace prelaunch mount identity was malformed")
     if not _valid_capacity(payload.get("capacity")):
         return invalid("workspace prelaunch capacity was malformed")

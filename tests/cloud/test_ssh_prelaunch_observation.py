@@ -148,7 +148,7 @@ def _capacity_payload(
     receipt_reserve_bytes: int = 0,
 ) -> dict[str, object]:
     return {
-        "schema": "arnold.cloud.ssh_workspace_prelaunch.v1",
+        "schema": "arnold.cloud.ssh_workspace_prelaunch.v2",
         "workspace": workspace,
         "thresholds": {
             "min_free_bytes": min_free_bytes,
@@ -160,10 +160,9 @@ def _capacity_payload(
         "checks": {
             "byte_floor": True,
             "inode_floor": True,
-            "reserve_fsync": True,
-            "sqlite_wal": True,
-            "receipt_atomic_fsync": True,
-            "cleanup": True,
+            "workspace_identity": True,
+            "temp_volume": True,
+            "output_bound": True,
         },
         "errors": [],
         "mount": {
@@ -172,9 +171,17 @@ def _capacity_payload(
             "device_minor": 1,
             "inode": 2,
         },
+        "temp_mount": {
+            "st_dev": 1,
+            "device_major": 0,
+            "device_minor": 1,
+            "inode": 3,
+        },
         "capacity": {
             "free_bytes": min_free_bytes + receipt_reserve_bytes + 1,
             "free_inodes": min_free_inodes + 1,
+            "temp_free_bytes": receipt_reserve_bytes + 1,
+            "temp_free_inodes": 2,
         },
     }
 
@@ -488,11 +495,10 @@ def test_actual_workspace_probe_fsyncs_wal_receipt_and_cleans_up(
     assert payload["verdict"] == "GO", payload
     assert payload["checks"] == {
         "byte_floor": True,
-        "cleanup": True,
         "inode_floor": True,
-        "receipt_atomic_fsync": True,
-        "reserve_fsync": True,
-        "sqlite_wal": True,
+        "output_bound": True,
+        "temp_volume": True,
+        "workspace_identity": True,
     }
     assert list(tmp_path.glob(".arnold-prelaunch-*")) == []
 
@@ -530,14 +536,14 @@ def test_actual_workspace_probe_capacity_shortfall_is_no_go_and_cleans_up(
     "error",
     [
         "prelaunch_free_inodes_below_reserve",
-        "sqlite WAL durability probe failed",
-        "probe_cleanup_failed",
+        "prelaunch_temp_volume_below_reserve",
+        "capacity_observation_unproven",
     ],
 )
 def test_capacity_and_durability_failures_remain_typed_no_go(error: str) -> None:
     raw = json.dumps(
         {
-            "schema": "arnold.cloud.ssh_workspace_prelaunch.v1",
+                "schema": "arnold.cloud.ssh_workspace_prelaunch.v2",
             "workspace": "/opt/megaplan-cloud/workspace",
             "thresholds": {
                 "min_free_bytes": 0,
@@ -546,7 +552,13 @@ def test_capacity_and_durability_failures_remain_typed_no_go(error: str) -> None
             },
             "status": "no-go",
             "verdict": "NO-GO",
-            "checks": {"cleanup": error != "probe_cleanup_failed"},
+                "checks": {
+                    "byte_floor": True,
+                    "inode_floor": error != "prelaunch_free_inodes_below_reserve",
+                    "workspace_identity": True,
+                    "temp_volume": error != "prelaunch_temp_volume_below_reserve",
+                    "output_bound": error != "capacity_observation_unproven",
+                },
             "errors": [error],
             "mount": {
                 "st_dev": 1,
@@ -554,7 +566,18 @@ def test_capacity_and_durability_failures_remain_typed_no_go(error: str) -> None
                 "device_minor": 1,
                 "inode": 2,
             },
-            "capacity": {"free_bytes": 3, "free_inodes": 4},
+                "temp_mount": {
+                    "st_dev": 1,
+                    "device_major": 0,
+                    "device_minor": 1,
+                    "inode": 3,
+                },
+                "capacity": {
+                    "free_bytes": 3,
+                    "free_inodes": 4,
+                    "temp_free_bytes": 3,
+                    "temp_free_inodes": 4,
+                },
         }
     )
 
@@ -625,9 +648,9 @@ def test_malformed_or_contradictory_capacity_go_is_unknown_no_go(case: str) -> N
     elif case == "malformed_mount":
         payload["mount"]["st_dev"] = "1"
     elif case == "false_check":
-        payload["checks"]["cleanup"] = False
+        payload["checks"]["output_bound"] = False
     elif case == "missing_check":
-        del payload["checks"]["sqlite_wal"]
+        del payload["checks"]["output_bound"]
     elif case == "nonempty_errors":
         payload["errors"] = ["failed"]
     elif case == "insufficient_reported_capacity":
@@ -728,7 +751,7 @@ def test_provider_capacity_observation_uses_only_fixed_inspect_and_probe(
         lambda: str(tmp_path),
     )
     capacity = {
-        "schema": "arnold.cloud.ssh_workspace_prelaunch.v1",
+        "schema": "arnold.cloud.ssh_workspace_prelaunch.v2",
         "workspace": "/opt/megaplan-cloud/workspace",
         "thresholds": {
             "min_free_bytes": 1_073_741_824,
@@ -740,10 +763,9 @@ def test_provider_capacity_observation_uses_only_fixed_inspect_and_probe(
         "checks": {
             "byte_floor": True,
             "inode_floor": True,
-            "reserve_fsync": True,
-            "sqlite_wal": True,
-            "receipt_atomic_fsync": True,
-            "cleanup": True,
+            "workspace_identity": True,
+            "temp_volume": True,
+            "output_bound": True,
         },
         "errors": [],
         "mount": {
@@ -752,9 +774,17 @@ def test_provider_capacity_observation_uses_only_fixed_inspect_and_probe(
             "device_minor": 1,
             "inode": 2,
         },
+        "temp_mount": {
+            "st_dev": 1,
+            "device_major": 0,
+            "device_minor": 1,
+            "inode": 3,
+        },
         "capacity": {
             "free_bytes": 2_147_483_648,
             "free_inodes": 20_000,
+            "temp_free_bytes": 2_147_483_648,
+            "temp_free_inodes": 20_000,
         },
     }
 
