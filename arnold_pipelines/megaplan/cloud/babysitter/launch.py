@@ -660,6 +660,36 @@ class ManagedLaunchUnresolved(RuntimeError):
         super().__init__("managed launch remains unresolved")
 
 
+def canonical_launch_custody_view(
+    store: Any,
+    operation_id: str,
+    *,
+    observe: Any = None,
+) -> dict[str, Any]:
+    """Read the canonical launch view used by babysitter custody paths.
+
+    This helper intentionally has no receipt/marker/WBC writer and no launch
+    callback.  Babysitter status inspection must remain a projection of the
+    durable OperationRun authority, including unresolved ``PENDING`` custody.
+    """
+
+    from arnold.runtime.durable_ops import inspect_launch
+
+    inspection = inspect_launch(operation_id, store=store, observe=observe)
+    return {
+        "operation_id": operation_id,
+        "result": inspection.result.value,
+        "reason": inspection.reason.value,
+        "envelope": inspection.envelope.to_json() if inspection.envelope else None,
+        "operation_state": inspection.operation.state.value if inspection.operation else None,
+        "event_types": [event.event_type for event in inspection.events],
+        "resource_ids": [resource.id for resource in inspection.resources],
+        "observation": dict(inspection.observation)
+        if inspection.observation is not None
+        else None,
+    }
+
+
 def _automatic_dispatch_preflight(ctx: dict[str, Any], spec: ManagedCommandSpec):
     """Return an observation-only managed-door preflight.
 

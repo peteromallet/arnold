@@ -9,7 +9,11 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Literal, Sequence
 
-from arnold.runtime.durable_ops import ResourceType, TypedResource
+from arnold.runtime.durable_ops import (
+    ResourceType,
+    TypedResource,
+    inspect_launch,
+)
 
 from agentbox.adapters import list_operation_adapters
 from agentbox.operations import (
@@ -24,6 +28,41 @@ from agentbox.worktrees import branch_name
 
 
 LogStream = Literal["stdout", "stderr", "all"]
+
+
+def launch_custody_view(
+    config: Any,
+    operation_id: str,
+    *,
+    observe: Any = None,
+) -> dict[str, Any]:
+    """Return the canonical launch custody projection without ticking state.
+
+    Unlike ``status_view`` this path never invokes an operation adapter.  It
+    reads the existing OperationRun, launch events, and typed resources and
+    optionally delegates one non-mutating process/session observation to the
+    durable-ops audit operation.
+    """
+
+    inspection = inspect_launch(
+        operation_id,
+        store=open_operation_store(config),
+        observe=observe,
+    )
+    return redact_payload(
+        {
+            "operation_id": operation_id,
+            "result": inspection.result.value,
+            "reason": inspection.reason.value,
+            "envelope": inspection.envelope.to_json() if inspection.envelope else None,
+            "operation": jsonable(inspection.operation),
+            "events": [jsonable(event) for event in inspection.events],
+            "resources": [jsonable(resource) for resource in inspection.resources],
+            "observation": jsonable(dict(inspection.observation))
+            if inspection.observation is not None
+            else None,
+        }
+    )
 
 
 def status_view(config: Any, operation_id: str | None = None) -> dict[str, Any] | list[dict[str, Any]]:
@@ -308,6 +347,7 @@ __all__ = [
     "log_path",
     "logs_view",
     "operation_status",
+    "launch_custody_view",
     "print_log_entries",
     "process_session_resource",
     "resource_session_name",

@@ -15,7 +15,10 @@ from enum import Enum
 from types import MappingProxyType
 from typing import Any, Callable, Mapping
 
+from .events import OperationEvent
+from .operation import OperationRun, OperationState
 from .typed_resources import JSONValue, ensure_json_safe
+from .typed_resources import ResourceType, TypedResource
 
 __all__ = [
     "LAUNCH_ENVELOPE_VERSION",
@@ -28,6 +31,7 @@ __all__ = [
     "LaunchOutcome",
     "LaunchDispatchRejected",
     "LaunchTransactionResult",
+    "LaunchInspection",
     "LaunchReason",
     "LaunchResult",
     "canonical_launch_envelope",
@@ -35,6 +39,8 @@ __all__ = [
     "launch_envelope_digest",
     "launch_once",
     "launch_transaction",
+    "inspect_launch",
+    "reconcile_launch",
 ]
 
 
@@ -125,6 +131,12 @@ class LaunchReason(str, Enum):
     DISPATCH_ACCEPTED = "dispatch_accepted"
     DISPATCH_REJECTED = "dispatch_rejected"
     DISPATCH_UNCERTAIN = "dispatch_uncertain"
+    NOT_ADMITTED = "not_admitted"
+    INSPECTION_UNAVAILABLE = "inspection_unavailable"
+    INSPECTION_INCOMPLETE = "inspection_incomplete"
+    IDENTITY_CONFLICT = "identity_conflict"
+    PROCESS_NOT_LIVE = "process_not_live"
+    NOT_PENDING = "not_pending"
 
 
 def _freeze_json(value: Any, *, field_name: str) -> JSONValue:
@@ -289,6 +301,31 @@ class LaunchTransactionResult:
         return getattr(self.store_result, "operation", None)
 
 
+@dataclass(frozen=True)
+class LaunchInspection:
+    """Read-only custody projection for one admitted launch.
+
+    This value deliberately contains observations only.  It has no callback,
+    store writer, provider, or retry capability, so callers cannot accidentally
+    turn an audit into a launch or repair operation.
+    """
+
+    outcome: LaunchOutcome
+    envelope: LaunchEnvelope | None = None
+    operation: OperationRun | None = None
+    events: tuple[OperationEvent, ...] = ()
+    resources: tuple[TypedResource, ...] = ()
+    observation: Mapping[str, Any] | None = None
+
+    @property
+    def result(self) -> LaunchResult:
+        return self.outcome.result
+
+    @property
+    def reason(self) -> LaunchReason:
+        return self.outcome.reason
+
+
 def _identity_matches(envelope: LaunchEnvelope, observation: Mapping[str, Any]) -> bool:
     """Require every identity fact and liveness before accepting a process."""
 
@@ -393,6 +430,394 @@ def launch_transaction(
     if accepted.result is not LaunchResult.ACCEPTED:
         return LaunchTransactionResult(LaunchOutcome(accepted.result, accepted.reason), accepted, observation)
     return LaunchTransactionResult(LaunchOutcome(LaunchResult.ACCEPTED, accepted.reason), accepted, observation)
+
+
+def _custody_outcome(
+    result: LaunchResult,
+    reason: LaunchReason,
+) -> LaunchOutcome:
+    return LaunchOutcome(result, reason)
+
+
+def _operation_id_for_custody(
+    envelope_or_operation: LaunchEnvelope | Mapping[str, Any] | str,
+) -> tuple[str, LaunchEnvelope | None, LaunchOutcome | None]:
+    """Normalize the read-only operation selector without touching a store."""
+
+    if isinstance(envelope_or_operation, str):
+        if not envelope_or_operation:
+            return "", None, _custody_outcome(LaunchResult.REJECTED, LaunchReason.MALFORMED)
+        return envelope_or_operation, None, None
+    try:
+        envelope = (
+            envelope_or_operation
+            if isinstance(envelope_or_operation, LaunchEnvelope)
+            else LaunchEnvelope.from_json(envelope_or_operation)
+        )
+    except UnknownLaunchEnvelopeVersion:
+        return "", None, _custody_outcome(LaunchResult.REJECTED, LaunchReason.UNKNOWN_VERSION)
+    except (LaunchEnvelopeError, TypeError, ValueError, KeyError):
+        return "", None, _custody_outcome(LaunchResult.REJECTED, LaunchReason.MALFORMED)
+    return envelope.operation_id, envelope, None
+
+
+def _admission_envelope(events: tuple[OperationEvent, ...]) -> LaunchEnvelope | None:
+    for event in events:
+        if event.event_type != "launch.admitted":
+            continue
+        payload = event.payload
+        raw = payload.get("envelope")
+        if not isinstance(raw, Mapping):
+            return None
+        try:
+            envelope = LaunchEnvelope.from_json(raw)
+        except (LaunchEnvelopeError, TypeError, ValueError, KeyError):
+            return None
+        if (
+            event.id != f"launch-admission:{envelope.operation_id}:{envelope.request_id}"
+            or event.operation_id != envelope.operation_id
+            or payload.get("version") != envelope.version
+            or payload.get("request_id") != envelope.request_id
+            or payload.get("envelope_digest") != envelope.digest
+        ):
+            return None
+        return envelope
+    return None
+
+
+def _accepted_facts_match(
+    envelope: LaunchEnvelope,
+    operation: OperationRun,
+    events: tuple[OperationEvent, ...],
+    resources: tuple[TypedResource, ...],
+) -> bool:
+    """Validate the already-persisted accepted tuple without writing."""
+
+    accepted_events = [event for event in events if event.event_type == "launch.accepted"]
+    process_resources = [
+        resource
+        for resource in resources
+        if resource.resource_type is ResourceType.PROCESS_SESSION
+    ]
+    if len(accepted_events) != 1 or len(process_resources) != 1:
+        return False
+    event = accepted_events[0]
+    resource = process_resources[0]
+    payload = event.payload
+    process_identity = resource.details.get("process_session_identity")
+    return (
+        operation.state is OperationState.RUNNING
+        and event.operation_id == envelope.operation_id
+        and event.id == f"launch-acceptance:{envelope.operation_id}:{envelope.request_id}"
+        and event.event_type == "launch.accepted"
+        and payload.get("version") == envelope.version
+        and payload.get("request_id") == envelope.request_id
+        and payload.get("envelope_digest") == envelope.digest
+        and payload.get("process_resource_id") == resource.id
+        and resource.operation_id == envelope.operation_id
+        and resource.id == f"launch-process-session:{envelope.operation_id}:{envelope.request_id}"
+        and isinstance(process_identity, str)
+        and bool(process_identity)
+        and payload.get("process_session_identity") == process_identity
+        and resource.details.get("launch_operation_id") == envelope.operation_id
+        and resource.details.get("launch_request_id") == envelope.request_id
+        and resource.details.get("launch_envelope_digest") == envelope.digest
+        and resource.details.get("owner") == payload.get("owner")
+        and isinstance(payload.get("owner"), str)
+        and bool(payload.get("owner"))
+    )
+
+
+def _invoke_observer(
+    observer: Callable[..., Mapping[str, Any]],
+    resource: TypedResource | None,
+    envelope: LaunchEnvelope,
+) -> Mapping[str, Any]:
+    """Call the existing two-argument observer shape without dispatch power."""
+
+    value = observer(resource, envelope)
+    if not isinstance(value, Mapping):
+        raise ValueError("launch custody observer must return a mapping")
+    return value
+
+
+def _invoke_resource_factory(
+    factory: Callable[..., TypedResource] | None,
+    observation: Mapping[str, Any],
+    envelope: LaunchEnvelope,
+) -> TypedResource:
+    if factory is not None:
+        resource = factory(None, observation, envelope)
+        if not isinstance(resource, TypedResource):
+            raise TypeError("launch custody resource factory must return a TypedResource")
+        return resource
+
+    identity = observation.get("process_session_identity")
+    session_name = observation.get("session_name")
+    if not isinstance(identity, str) or not identity:
+        raise ValueError("exact process/session identity is unavailable")
+    name = session_name if isinstance(session_name, str) and session_name else identity
+    return TypedResource(
+        id=f"launch-process-session:{envelope.operation_id}:{envelope.request_id}",
+        operation_id=envelope.operation_id,
+        resource_type=ResourceType.PROCESS_SESSION,
+        name=name,
+        details=dict(observation),
+    )
+
+
+def _observation_outcome(
+    envelope: LaunchEnvelope,
+    observation: Mapping[str, Any],
+    resources: tuple[TypedResource, ...],
+) -> LaunchOutcome:
+    """Classify an optional exact adapter observation without accepting it."""
+
+    identity = observation.get("process_session_identity")
+    expected_identity = envelope.launch_spec.get("process_session_identity")
+    if not isinstance(identity, str) or not identity:
+        return _custody_outcome(LaunchResult.UNKNOWN, LaunchReason.INSPECTION_INCOMPLETE)
+    if isinstance(expected_identity, str) and expected_identity and identity != expected_identity:
+        return _custody_outcome(LaunchResult.CONFLICT, LaunchReason.IDENTITY_CONFLICT)
+    expected_session = envelope.launch_spec.get("expected_session_name")
+    observed_session = observation.get("session_name")
+    if isinstance(expected_session, str) and expected_session and observed_session != expected_session:
+        return _custody_outcome(LaunchResult.CONFLICT, LaunchReason.IDENTITY_CONFLICT)
+    if observation.get("operation_id") != envelope.operation_id:
+        return _custody_outcome(LaunchResult.CONFLICT, LaunchReason.IDENTITY_CONFLICT)
+    if observation.get("request_id") != envelope.request_id:
+        return _custody_outcome(LaunchResult.CONFLICT, LaunchReason.IDENTITY_CONFLICT)
+    if observation.get("envelope_digest") != envelope.digest:
+        return _custody_outcome(LaunchResult.CONFLICT, LaunchReason.IDENTITY_CONFLICT)
+    if observation.get("liveness") != "running":
+        return _custody_outcome(LaunchResult.UNKNOWN, LaunchReason.PROCESS_NOT_LIVE)
+    return _custody_outcome(LaunchResult.UNKNOWN, LaunchReason.DISPATCH_UNCERTAIN)
+
+
+def inspect_launch(
+    envelope_or_operation: LaunchEnvelope | Mapping[str, Any] | str | None = None,
+    *,
+    store: Any,
+    observe: Callable[..., Mapping[str, Any]] | None = None,
+    operation_id: str | None = None,
+) -> LaunchInspection:
+    """Read canonical launch custody without any mutation or dispatch.
+
+    ``observe`` is an optional adapter query only; it receives the persisted
+    process resource (or ``None``) and the admitted envelope.  It cannot be
+    used to write the store, create evidence, refresh WBC state, or launch.
+    """
+
+    if envelope_or_operation is None:
+        envelope_or_operation = operation_id or ""
+    operation_id, requested, early = _operation_id_for_custody(envelope_or_operation)
+    if early is not None:
+        return LaunchInspection(early)
+    try:
+        operation = store.load_operation_run(operation_id)
+        events = tuple(store.list_operation_events(operation_id))
+        resources = tuple(store.list_typed_resources(operation_id))
+    except KeyError:
+        return LaunchInspection(
+            _custody_outcome(LaunchResult.REJECTED, LaunchReason.NOT_ADMITTED),
+            requested,
+        )
+    except Exception:
+        return LaunchInspection(
+            _custody_outcome(LaunchResult.UNKNOWN, LaunchReason.INSPECTION_UNAVAILABLE)
+        )
+    admitted = _admission_envelope(events)
+    if admitted is None:
+        # A missing operation is a known no-effect rejection.  Existing
+        # operation data without an admissed envelope is incomplete custody.
+        reason = (
+            LaunchReason.NOT_ADMITTED
+            if operation is None and not events
+            else LaunchReason.INSPECTION_INCOMPLETE
+        )
+        result = (
+            LaunchResult.REJECTED
+            if operation is None and not events
+            else LaunchResult.UNKNOWN
+        )
+        return LaunchInspection(
+            _custody_outcome(result, reason), requested, operation, events, resources
+        )
+    if requested is not None and (
+        requested.operation_id != admitted.operation_id
+        or requested.request_id != admitted.request_id
+        or requested.digest != admitted.digest
+    ):
+        return LaunchInspection(
+            _custody_outcome(LaunchResult.CONFLICT, LaunchReason.REQUEST_CONFLICT),
+            admitted,
+            operation,
+            events,
+            resources,
+        )
+    observation: Mapping[str, Any] | None = None
+    if observe is not None:
+        process_resource = next(
+            (
+                resource
+                for resource in resources
+                if resource.resource_type is ResourceType.PROCESS_SESSION
+            ),
+            None,
+        )
+        try:
+            observation = dict(_invoke_observer(observe, process_resource, admitted))
+        except LaunchDispatchRejected:
+            return LaunchInspection(
+                _custody_outcome(LaunchResult.REJECTED, LaunchReason.DISPATCH_REJECTED),
+                admitted,
+                operation,
+                events,
+                resources,
+            )
+        except Exception:
+            return LaunchInspection(
+                _custody_outcome(LaunchResult.UNKNOWN, LaunchReason.INSPECTION_UNAVAILABLE),
+                admitted,
+                operation,
+                events,
+                resources,
+            )
+    if operation.state is OperationState.RUNNING:
+        if not _accepted_facts_match(admitted, operation, events, resources):
+            outcome = _custody_outcome(LaunchResult.CONFLICT, LaunchReason.IDENTITY_CONFLICT)
+        elif observation is not None:
+            outcome = _observation_outcome(admitted, observation, resources)
+            if outcome.result is LaunchResult.UNKNOWN and outcome.reason is LaunchReason.DISPATCH_UNCERTAIN:
+                outcome = _custody_outcome(LaunchResult.ACCEPTED, LaunchReason.REPLAY)
+        else:
+            outcome = _custody_outcome(LaunchResult.ACCEPTED, LaunchReason.REPLAY)
+    elif operation.state is OperationState.PENDING:
+        if any(event.event_type == "launch.accepted" for event in events) or any(
+            resource.resource_type is ResourceType.PROCESS_SESSION for resource in resources
+        ):
+            outcome = _custody_outcome(LaunchResult.UNKNOWN, LaunchReason.INSPECTION_INCOMPLETE)
+        elif observation is not None:
+            outcome = _observation_outcome(admitted, observation, resources)
+        else:
+            outcome = _custody_outcome(LaunchResult.UNKNOWN, LaunchReason.DISPATCH_UNCERTAIN)
+    else:
+        outcome = _custody_outcome(LaunchResult.CONFLICT, LaunchReason.NOT_PENDING)
+    return LaunchInspection(outcome, admitted, operation, events, resources, observation)
+
+
+def reconcile_launch(
+    envelope_or_operation: LaunchEnvelope | Mapping[str, Any] | str | None = None,
+    *,
+    store: Any,
+    observe: Callable[..., Mapping[str, Any]] | None,
+    resource_factory: Callable[..., TypedResource] | None = None,
+    owner: str | None = None,
+    operation_id: str | None = None,
+) -> LaunchInspection:
+    """Reconcile one admitted ``PENDING`` launch without a physical retry.
+
+    The only write this operation can perform is the existing idempotent
+    ``accept_launch`` composite write, after an exact identity query proves
+    operation/request/envelope/process-session/liveness agreement.  There is
+    intentionally no dispatch callback and no relaunch path.
+    """
+
+    if envelope_or_operation is None:
+        envelope_or_operation = operation_id or ""
+    inspection = inspect_launch(envelope_or_operation, store=store)
+    if inspection.result is not LaunchResult.UNKNOWN or inspection.envelope is None:
+        return inspection
+    if inspection.operation is None or inspection.operation.state is not OperationState.PENDING:
+        return LaunchInspection(
+            _custody_outcome(LaunchResult.CONFLICT, LaunchReason.NOT_PENDING),
+            inspection.envelope,
+            inspection.operation,
+            inspection.events,
+            inspection.resources,
+        )
+    if observe is None:
+        return LaunchInspection(
+            _custody_outcome(LaunchResult.UNKNOWN, LaunchReason.INSPECTION_UNAVAILABLE),
+            inspection.envelope,
+            inspection.operation,
+            inspection.events,
+            inspection.resources,
+        )
+    process_resource = next(
+        (
+            resource
+            for resource in inspection.resources
+            if resource.resource_type is ResourceType.PROCESS_SESSION
+        ),
+        None,
+    )
+    try:
+        observation = dict(_invoke_observer(observe, process_resource, inspection.envelope))
+    except LaunchDispatchRejected:
+        return LaunchInspection(
+            _custody_outcome(LaunchResult.REJECTED, LaunchReason.DISPATCH_REJECTED),
+            inspection.envelope,
+            inspection.operation,
+            inspection.events,
+            inspection.resources,
+        )
+    except Exception:
+        return LaunchInspection(
+            _custody_outcome(LaunchResult.UNKNOWN, LaunchReason.INSPECTION_UNAVAILABLE),
+            inspection.envelope,
+            inspection.operation,
+            inspection.events,
+            inspection.resources,
+        )
+    identity_outcome = _observation_outcome(inspection.envelope, observation, inspection.resources)
+    if identity_outcome.reason is LaunchReason.PROCESS_NOT_LIVE:
+        return LaunchInspection(identity_outcome, inspection.envelope, inspection.operation, inspection.events, inspection.resources, observation)
+    if identity_outcome.result is LaunchResult.CONFLICT:
+        return LaunchInspection(identity_outcome, inspection.envelope, inspection.operation, inspection.events, inspection.resources, observation)
+    if identity_outcome.reason is not LaunchReason.DISPATCH_UNCERTAIN:
+        return LaunchInspection(identity_outcome, inspection.envelope, inspection.operation, inspection.events, inspection.resources, observation)
+    try:
+        resource = _invoke_resource_factory(resource_factory, observation, inspection.envelope)
+        accepted = store.accept_launch(
+            inspection.envelope,
+            process_resource=resource,
+            owner=owner or inspection.envelope.venue,
+            owner_evidence={
+                "operation_id": inspection.envelope.operation_id,
+                "request_id": inspection.envelope.request_id,
+                "envelope_digest": inspection.envelope.digest,
+                "process_session_identity": observation["process_session_identity"],
+                "liveness": observation["liveness"],
+            },
+        )
+    except Exception:
+        return LaunchInspection(
+            _custody_outcome(LaunchResult.UNKNOWN, LaunchReason.INSPECTION_UNAVAILABLE),
+            inspection.envelope,
+            inspection.operation,
+            inspection.events,
+            inspection.resources,
+            observation,
+        )
+    if accepted.result is LaunchResult.ACCEPTED:
+        refreshed = inspect_launch(inspection.envelope, store=store)
+        return LaunchInspection(
+            LaunchOutcome(LaunchResult.ACCEPTED, accepted.reason),
+            refreshed.envelope,
+            refreshed.operation,
+            refreshed.events,
+            refreshed.resources,
+            observation,
+        )
+    return LaunchInspection(
+        LaunchOutcome(accepted.result, accepted.reason),
+        inspection.envelope,
+        accepted.operation,
+        inspection.events,
+        inspection.resources,
+        observation,
+    )
 
 
 def canonical_launch_envelope(envelope: LaunchEnvelope | Mapping[str, Any]) -> str:

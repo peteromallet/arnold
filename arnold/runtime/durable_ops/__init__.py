@@ -18,6 +18,7 @@ from .launch import (
     LaunchEnvelope,
     LaunchEnvelopeError,
     LaunchDispatchRejected,
+    LaunchInspection,
     LaunchMethodResult,
     LaunchOutcome,
     LaunchReason,
@@ -29,6 +30,8 @@ from .launch import (
     launch_envelope_digest,
     launch_once,
     launch_transaction,
+    inspect_launch,
+    reconcile_launch,
 )
 from .launch_preflight import (
     PREFLIGHT_SCHEMA,
@@ -107,6 +110,7 @@ __all__ = [
     "LaunchEnvelope",
     "LaunchEnvelopeError",
     "LaunchDispatchRejected",
+    "LaunchInspection",
     "LaunchMethodResult",
     "LaunchOutcome",
     "LaunchReason",
@@ -132,6 +136,8 @@ __all__ = [
     "launch_envelope_digest",
     "launch_once",
     "launch_transaction",
+    "inspect_launch",
+    "reconcile_launch",
     "observation_only_preflight",
     "preflight_launch",
     "read_only_capacity_observation",
