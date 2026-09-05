@@ -142,18 +142,13 @@ def _kill_tree(
         if identity_raw:
             worker = json.loads(identity_raw) if isinstance(identity_raw, str) else dict(identity_raw)
         else:
-            projected = ledger.projection()
-            reservation = next((v for v in projected.get("reservations", {}).values() if v.get("admission_receipt_id") == context_ref.admission_receipt_id), None)
-            marker = reservation.get("accepted_launch_marker") if reservation else None
-            worker = marker.get("worker_identity") if isinstance(marker, dict) else None
-            if not isinstance(worker, dict):
-                raise ValueError("accepted launch marker lacks worker identity")
+            # A physical worker identity must be supplied by the canonical
+            # launch response.  Never recover it from an IncidentLedger
+            # launch marker or synthesize it from a PID.
+            raise ValueError("canonical worker identity is missing")
         process_start = str(env.get("ARNOLD_WORKER_PROCESS_START_IDENTITY") or "")
         if not process_start:
-            projected = ledger.projection()
-            reservation = next((v for v in projected.get("reservations", {}).values() if v.get("admission_receipt_id") == context_ref.admission_receipt_id), None)
-            marker = reservation.get("accepted_launch_marker") if reservation else None
-            process_start = str(marker.get("victim_process_start_identity") or "") if isinstance(marker, dict) else ""
+            raise ValueError("canonical worker process identity is missing")
         context = WorkerSignalContext.from_ref(
             context_ref, worker_identity=worker,
             victim_pid=pid,

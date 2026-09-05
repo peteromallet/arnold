@@ -358,10 +358,11 @@ def certify_managed_worker_launch(
     process_start_identity: str,
     started_at: str,
 ) -> bool:
-    """Persist the accepted launch marker for an admission-backed child.
+    """Verify canonical accepted identity for an admission-backed child.
 
-    The marker is the bridge between a managed process and the WBC reservation;
-    without it the signal door must reject the process as an uncertified worker.
+    Launch acceptance is committed by ``launch_transaction``.  This managed
+    adapter is intentionally read-only: it no longer writes or reads an
+    IncidentLedger accepted-launch marker.
     """
     raw_context = manifest.get("worker_execution_context")
     if raw_context is None:
@@ -374,41 +375,18 @@ def certify_managed_worker_launch(
             if isinstance(raw_context, Mapping)
             else resolve_worker_execution_context({"ARNOLD_WORKER_EXECUTION_CONTEXT": raw_context})
         )
-        ledger = IncidentLedger(Path(ref.ledger_root))
-        projection = ledger.projection()
-        reservation = next(
-            (item for item in projection.get("reservations", {}).values()
-             if item.get("admission_receipt_id") == ref.admission_receipt_id),
-            None,
-        )
-        if reservation is None:
+        from arnold.runtime.durable_ops import FileBackedDurableOpsStore
+        store_root = Path(os.environ.get("ARNOLD_OPS_STORE_ROOT") or Path(ref.ledger_root) / "ops")
+        operation = FileBackedDurableOpsStore(store_root).load_operation_run(ref.logical_dispatch_id)
+        if getattr(operation.state, "value", operation.state) != "running":
             return False
-        marker = reservation.get("accepted_launch_marker")
-        if marker is not None:
-            return (
-                marker.get("worker_identity") == dict(worker_identity)
-                and marker.get("victim_process_start_identity") == process_start_identity
-            )
-        ledger.append_controlled_adapter_state(
-            reservation_event_id=str(reservation["event_id"]),
-            admission_receipt_id=ref.admission_receipt_id,
-            physical_door_id=ref.physical_door_id,
-            launch_state_identity="accepted",
-            phase=ref.phase,
-            selected_spec=ref.selected_spec,
-            primary_spec=ref.selected_spec,
-            logical_dispatch_id=ref.logical_dispatch_id,
-            worker_identity=dict(worker_identity),
-            victim_process_start_identity=process_start_identity,
-            started_at=started_at,
-            operation_evidence={
-                "managed_manifest": str(manifest_path),
-                "victim_pid": pid,
-                "victim_process_start_identity": process_start_identity,
-            },
-            actor="managed-agent-launch",
+        resources = FileBackedDurableOpsStore(store_root).list_typed_resources(ref.logical_dispatch_id)
+        return any(
+            resource.resource_type.value == "process_session"
+            and resource.details.get("worker_identity") == dict(worker_identity)
+            and resource.details.get("worker_identity", {}).get("process_start_identity") == process_start_identity
+            for resource in resources
         )
-        return True
     except (OSError, TypeError, ValueError, SignalDispositionError, KeyError, json.JSONDecodeError):
         return False
 

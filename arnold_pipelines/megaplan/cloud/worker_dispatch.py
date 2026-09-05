@@ -1,9 +1,10 @@
 """Canonical production worker admission and controlled dispatch.
 
-This module is deliberately small: admission owns pre-launch invariants, the
-ledger owns durable reservation/terminal state, and ``dispatch_with_admission``
-owns the only retry/wait loop.  Door adapters pass an immutable request and a
-closure; they never perform a second preflight.
+This module is deliberately small: admission owns pre-launch invariants,
+``OperationRun``/``FileBackedDurableOpsStore`` owns launch state and accepted
+identity, and ``dispatch_with_admission`` owns the only bounded wait loop.
+Door adapters pass an immutable request and a closure; they never perform a
+second preflight or consult an incident ledger for launch authority.
 """
 from __future__ import annotations
 
@@ -21,6 +22,13 @@ from pathlib import Path
 from typing import Any, Callable, Mapping
 
 from arnold_pipelines.megaplan.incident.ledger import IncidentLedger
+from arnold.runtime.durable_ops import FileBackedDurableOpsStore
+from arnold.runtime.durable_ops.launch import (
+    LaunchEnvelope,
+    LaunchResult as DurableLaunchResult,
+    launch_transaction,
+)
+from arnold.runtime.durable_ops.typed_resources import ResourceType, TypedResource
 from arnold_pipelines.megaplan.incident.schema import ReservationReconciled, semantic_dispatch_fingerprint
 from arnold_pipelines.megaplan.fallback_chains import ExecuteFallbackUnsafe, provider_family
 from arnold_pipelines.megaplan.orchestration.provider_resilience import (
@@ -52,6 +60,72 @@ def _now() -> str:
 
 def _digest(value: Any) -> str:
     return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False, default=str).encode()).hexdigest()
+
+
+def _worker_operation_store(request: "WorkerAdmissionRequest", receipt: "WorkerAdmissionReceipt" | None = None) -> Any:
+    """Return the one durable operation store for a worker launch.
+
+    The remote worker process owns this root.  In particular, this helper is
+    never called by a controller before the provider boundary; it is used by
+    the physical door after the request has reached its execution venue.
+    Tests and embedded adapters may inject a store object directly.
+    """
+    injected = request.operation_store
+    if injected is not None:
+        return injected
+    root = request.operation_store_root
+    if root is None:
+        root = (request.ledger_root or Path.cwd()) / "ops"
+    return FileBackedDurableOpsStore(root)
+
+
+def _worker_launch_envelope(receipt: "WorkerAdmissionReceipt") -> LaunchEnvelope:
+    """Build the canonical envelope from one already-admitted worker receipt."""
+    operation_id = receipt.operation_id or receipt.logical_dispatch_id
+    request_id = receipt.request_id or receipt.admission_receipt_id
+    preflight_digest = receipt.preflight_digest or receipt.semantic_dispatch_fingerprint
+    spec = {
+        "operation_type": "megaplan_worker",
+        "launch_intent": "worker",
+        "configured_spec": receipt.normalized_spec,
+        "selected_spec": receipt.normalized_spec,
+        "plan_id": receipt.plan_id,
+        "phase": receipt.phase,
+        "dispatch_family_id": receipt.dispatch_family_id,
+        "logical_dispatch_id": receipt.logical_dispatch_id,
+        "physical_door_id": receipt.physical_door_id,
+        "source_revision": receipt.source_revision,
+        "runtime_vector": receipt.runtime_vector,
+        "manifest_identity": receipt.manifest_identity,
+        "seed_identity": receipt.seed_identity,
+        "dependency_interpreter_identity": receipt.dependency_interpreter_identity,
+        "prompt_or_phase_input_identity": receipt.execution_context.to_dict().get("prompt_or_phase_input_identity", ""),
+        "configured_fallback_chain_identity": "",
+        "authorized_route_identity": receipt.normalized_spec,
+        "timeout_budget_s": receipt.timeout_budget_s,
+        "production_intent": receipt.production_intent,
+        "process_session_identity": receipt.route_liveness_identity,
+    }
+    # ``process_session_identity`` above is a route proof, not a process
+    # identity.  Physical adapters provide it in the observation; do not bind
+    # a stale route token into the canonical envelope.
+    spec.pop("process_session_identity", None)
+    return LaunchEnvelope(
+        version=1,
+        operation_id=operation_id,
+        request_id=request_id,
+        venue=receipt.physical_door_id,
+        launch_spec=spec,
+        preflight_digest=preflight_digest,
+    )
+
+
+class _WorkerPreflight:
+    __slots__ = ("accepted", "preflight_digest")
+
+    def __init__(self, preflight_digest: str) -> None:
+        self.accepted = True
+        self.preflight_digest = preflight_digest
 
 
 def _continuation_probe_profile_identity(project_dir: Path) -> dict[str, str]:
@@ -282,13 +356,17 @@ class WorkerExecutionContextRef:
     spawn_registration_callback: Callable[[Mapping[str, Any]], Any] | None = field(
         default=None, compare=False, repr=False
     )
+    operation_store_root: str | None = field(default=None, compare=True)
 
     def to_dict(self) -> dict[str, str]:
-        return {
+        result = {
             name: getattr(self, name)
             for name in self.__dataclass_fields__
             if name != "spawn_registration_callback"
         }
+        if result.get("operation_store_root") is None:
+            result.pop("operation_store_root", None)
+        return result
     def to_environment(self, *, variable: str = "ARNOLD_WORKER_EXECUTION_CONTEXT") -> dict[str, str]:
         return {variable: json.dumps(self.to_dict(), sort_keys=True, separators=(",", ":"))}
 
@@ -312,10 +390,15 @@ class WorkerExecutionContextRef:
             if name != "spawn_registration_callback"
         }
         unknown = set(payload) - expected
+        # Older in-band contexts did not carry the store root; derive that
+        # root from ``ledger_root`` at the physical venue.
+        expected.discard("operation_store_root")
         missing = expected - set(payload)
         if unknown or missing:
             raise ValueError(f"invalid worker execution context (unknown={sorted(unknown)}, missing={sorted(missing)})")
         values = {name: payload[name] for name in expected}
+        if "operation_store_root" in payload:
+            values["operation_store_root"] = str(payload["operation_store_root"])
         if any(not isinstance(value, str) or not value for value in values.values()):
             raise ValueError("worker execution context fields must be non-empty strings")
         return cls(**values)
@@ -350,6 +433,11 @@ class WorkerAdmissionRequest:
     admission_attempt: int = 1
     production_intent: bool = True
     ledger_root: Path | None = None
+    # The operation store is the sole launch authority.  A caller may pin the
+    # remote root explicitly; otherwise the venue adapter derives it from the
+    # request root (never from the controller's cwd).
+    operation_store_root: Path | None = None
+    operation_store: Any = field(default=None, compare=False, repr=False)
     changed_precondition_event_id: str | None = None
     # The normalized chain is supplied by the configured-fallback authority.
     # It is transport metadata only; target selection still happens at the
@@ -367,7 +455,7 @@ class WorkerAdmissionRequest:
         local_only = {
             "route_liveness_resolver", "source_runtime_validator",
             "native_construction_seam",
-            "memory_headroom_reader", "cooldown_reader", "ledger",
+            "memory_headroom_reader", "cooldown_reader", "ledger", "operation_store",
         }
         result: dict[str, Any] = {}
         for name in self.__dataclass_fields__:
@@ -382,6 +470,8 @@ class WorkerAdmissionRequest:
         data = dict(payload)
         if data.get("ledger_root") is not None:
             data["ledger_root"] = Path(str(data["ledger_root"]))
+        if data.get("operation_store_root") is not None:
+            data["operation_store_root"] = Path(str(data["operation_store_root"]))
         return cls(**data)
 
 
@@ -418,6 +508,13 @@ class WorkerAdmissionReceipt:
     admitted_at: str
     execution_context: WorkerExecutionContextRef
     production_intent: bool = True
+    # Canonical durable launch identity.  These values are derived at
+    # admission and are intentionally carried by the physical-door receipt;
+    # they are not a second lifecycle record.
+    operation_id: str = ""
+    request_id: str = ""
+    preflight_digest: str = ""
+    operation_store_root: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         result = {name: getattr(self, name) for name in self.__dataclass_fields__ if name != "execution_context"}
@@ -1034,6 +1131,21 @@ def require_production_worker_dispatch_runtime(request: WorkerAdmissionRequest |
         expected_kind = "omp_membership" if agent == "omp" else "native_backend"
         if liveness.get("kind") != expected_kind:
             return _refusal(request, "route_liveness_invalid", f"route proof kind must be {expected_kind}")
+        # A fallback/return child is a new canonical operation, never an
+        # implicit second launch of its parent.  Preserve the existing typed
+        # authorization boundary without consulting IncidentLedger: the
+        # parent terminal and authorizing event must be supplied explicitly.
+        linked_fields = (
+            request.parent_logical_dispatch_id,
+            request.authorizing_event_id,
+            request.parent_terminal_event_id,
+        )
+        if any(linked_fields) and not all(linked_fields):
+            return _refusal(
+                request,
+                "linked_child_authorization_missing",
+                "linked child authority is incomplete",
+            )
         _validate_runtime_binding(request)
         cooldown_reader = request.cooldown_reader
         if cooldown_reader is None:
@@ -1050,44 +1162,34 @@ def require_production_worker_dispatch_runtime(request: WorkerAdmissionRequest |
         if request.production_intent and (not isinstance(memory, Mapping) or memory.get("ok") is not True):
             return _refusal(request, "insufficient_memory_headroom", "positive memory headroom proof is required", memory=dict(memory or {}))
         fingerprint = semantic_dispatch_fingerprint(phase=request.phase, selected_spec=normalized_spec, model_family=family, prompt_or_phase_input_identity=request.prompt_or_phase_input_identity, source_revision=request.source_revision, runtime_vector=request.runtime_vector, manifest_identity=request.manifest_identity, seed_identity=request.seed_identity, dependency_interpreter_identity=request.dependency_interpreter_identity, timeout_policy_identity=_digest(request.timeout_budget_s), configured_fallback_chain_identity=request.configured_fallback_chain_identity, authorized_route_identity=request.authorized_route_identity)
-        ledger = request.ledger or IncidentLedger(request.ledger_root)
         execution_context_identity = _digest({"plan_id": request.plan_id, "phase": request.phase, "logical_dispatch_id": request.logical_dispatch_id, "physical_door_id": request.physical_door_id, "semantic_dispatch_fingerprint": fingerprint})
-        if request.parent_logical_dispatch_id or request.authorizing_event_id or request.parent_terminal_event_id:
-            if not (request.parent_logical_dispatch_id and request.authorizing_event_id and request.parent_terminal_event_id):
-                return _refusal(request, "linked_child_authorization_missing", "linked child authority is incomplete")
-            if request.expected_projection_version is None:
-                return _refusal(request, "linked_child_projection_version_missing", "linked child requires an expected projection version")
-            if not request.transition_kind or not request.precondition_identity:
-                return _refusal(request, "linked_child_authorization_missing", "linked child transition authority is incomplete")
-            reserved = ledger.reserve_provider_route_child(
-                plan_id=request.plan_id,
-                phase=request.phase,
-                projection_key=request.projection_key,
-                expected_projection_version=request.expected_projection_version,
-                transition_kind=request.transition_kind,
-                from_spec=request.parent_source_spec or request.configured_spec,
-                to_spec=normalized_spec,
-                parent_logical_dispatch_id=request.parent_logical_dispatch_id,
-                parent_terminal_event_id=request.parent_terminal_event_id,
-                authorizing_event_id=request.authorizing_event_id,
-                configured_fallback_chain_identity=request.configured_fallback_chain_identity,
-                precondition_identity=request.precondition_identity,
-                child_dispatch_family_id=request.dispatch_family_id,
-                child_logical_dispatch_id=request.logical_dispatch_id,
-                child_physical_door_id=request.physical_door_id,
-                child_semantic_dispatch_fingerprint=fingerprint,
-                child_route_liveness_identity=str(liveness.get("identity")),
-                consumed_changed_precondition_event_id=request.changed_precondition_event_id,
-                execution_context_identity=execution_context_identity,
-                actor="worker-admission",
-            )
-        else:
-            reserved = ledger.reserve(plan_id=request.plan_id, phase=request.phase, projection_key=request.projection_key, semantic_dispatch_fingerprint=fingerprint, logical_dispatch_id=request.logical_dispatch_id, dispatch_family_id=request.dispatch_family_id, physical_door_id=request.physical_door_id, expected_projection_version=request.expected_projection_version, changed_precondition_event_id=request.changed_precondition_event_id, selected_spec=normalized_spec, primary_spec=normalized_spec, configured_fallback_chain_identity=request.configured_fallback_chain_identity, execution_context_identity=execution_context_identity, actor="worker-admission")
-        payload = reserved.get("payload", reserved) if isinstance(reserved, Mapping) else {}
-        reservation_event_id = str(payload.get("event_id") or payload.get("reservation_event_id") or "")
-        receipt_id = str(payload.get("admission_receipt_id") or ledger.derive_receipt(payload))
-        context = WorkerExecutionContextRef(str(request.ledger_root or Path.cwd()), request.plan_id, request.phase, request.dispatch_family_id, request.logical_dispatch_id, receipt_id, fingerprint, normalized_spec, request.physical_door_id)
-        return WorkerAdmissionReceipt(receipt_id, request.plan_id, request.phase, request.dispatch_family_id, request.logical_dispatch_id, request.parent_logical_dispatch_id, request.authorizing_event_id, request.physical_door_id, request.admission_attempt, normalized_spec, provider, model, family, str(liveness.get("kind")), str(liveness.get("identity")), str(liveness.get("digest")), float(request.timeout_budget_s), request.source_revision, request.runtime_vector, request.manifest_identity, request.seed_identity, request.dependency_interpreter_identity, fingerprint, request.projection_key, int(payload.get("expected_projection_version", 0)), reservation_event_id, request.changed_precondition_event_id, payload.get("event_id") if payload.get("event_type") == "provider_route_child_reserved" else None, _now(), context, request.production_intent)
+        # Admission is deliberately side-effect free.  The canonical launch
+        # engine performs the atomic admit at the physical venue after this
+        # complete preflight has passed.  The receipt IDs below are stable
+        # identities, not a shadow reservation/marker authority.
+        operation_id = request.logical_dispatch_id
+        request_id = _digest({
+            "operation_id": operation_id,
+            "plan_id": request.plan_id,
+            "phase": request.phase,
+            "dispatch_family_id": request.dispatch_family_id,
+            "physical_door_id": request.physical_door_id,
+            "semantic_dispatch_fingerprint": fingerprint,
+            "admission_attempt": request.admission_attempt,
+        })
+        preflight_digest = _digest({
+            "request_id": request_id,
+            "operation_id": operation_id,
+            "semantic_dispatch_fingerprint": fingerprint,
+            "route_liveness_identity": str(liveness.get("identity")),
+            "route_liveness_digest": str(liveness.get("digest")),
+            "execution_context_identity": execution_context_identity,
+        })
+        receipt_id = _digest(("worker-admission", operation_id, request_id, fingerprint))
+        reservation_event_id = _digest(("launch-admission", operation_id, request_id))
+        store_root = request.operation_store_root or ((request.ledger_root or Path.cwd()) / "ops")
+        context = WorkerExecutionContextRef(str(request.ledger_root or Path.cwd()), request.plan_id, request.phase, request.dispatch_family_id, request.logical_dispatch_id, receipt_id, fingerprint, normalized_spec, request.physical_door_id, operation_store_root=str(store_root))
+        return WorkerAdmissionReceipt(receipt_id, request.plan_id, request.phase, request.dispatch_family_id, request.logical_dispatch_id, request.parent_logical_dispatch_id, request.authorizing_event_id, request.physical_door_id, request.admission_attempt, normalized_spec, provider, model, family, str(liveness.get("kind")), str(liveness.get("identity")), str(liveness.get("digest")), float(request.timeout_budget_s), request.source_revision, request.runtime_vector, request.manifest_identity, request.seed_identity, request.dependency_interpreter_identity, fingerprint, request.projection_key, int(request.expected_projection_version or 0), reservation_event_id, request.changed_precondition_event_id, None, _now(), context, request.production_intent, operation_id, request_id, preflight_digest, str(store_root))
     except (CliError, ValueError, OSError) as exc:
         return _refusal(request, getattr(exc, "code", "admission_rejected"), str(exc))
 
@@ -1331,6 +1433,127 @@ def _normalize_outcome(value: Any, receipt: WorkerAdmissionReceipt, started: str
         kind = "success" if value.returncode == 0 else "ordinary_terminal_failure"
         return _validate_outcome_context(DispatchOutcome(kind=kind, launch_state="accepted", plan_id=receipt.plan_id, phase=receipt.phase, dispatch_family_id=receipt.dispatch_family_id, logical_dispatch_id=receipt.logical_dispatch_id, admission_receipt_id=receipt.admission_receipt_id, semantic_dispatch_fingerprint=receipt.semantic_dispatch_fingerprint, selected_spec=receipt.normalized_spec, worker_identity=_worker_identity(value.worker_identity), started_at=started, finished_at=finished, success_payload=None if value.returncode else {"returncode": 0}, terminal_failure=None if value.returncode == 0 else {"returncode": value.returncode}), receipt, started, finished)
     raise TypeError(f"untyped final-launch result cannot be projected: {type(value).__name__}")
+
+
+def _canonical_worker_launch(
+    receipt: WorkerAdmissionReceipt,
+    launch: Callable[[WorkerExecutionContextRef], Any],
+    *,
+    store: Any,
+    ledger: IncidentLedger | None,
+) -> tuple[Any, DispatchOutcome | None]:
+    """Run a worker physical door through the canonical launch transaction.
+
+    ``ControlledFinalLaunch`` is retained as a thin custody adapter here.  It
+    does not write its former lifecycle markers; admission and accepted
+    identity are committed only by ``launch_transaction``.
+    """
+    from arnold_pipelines.megaplan.cloud.controlled_final_launch import ControlledFinalLaunch
+
+    controlled = ControlledFinalLaunch(receipt, ledger=ledger, canonical=True)
+    envelope = _worker_launch_envelope(receipt)
+    started = _now()
+    physical_value: Any = None
+
+    def dispatch(_envelope: LaunchEnvelope) -> Any:
+        # The closure is the sole physical door.  The engine invokes it once;
+        # replay and reconciliation return before this callback.
+        nonlocal physical_value
+        physical_value = controlled.run(launch)
+        return physical_value
+
+    def observe(value: Any, candidate: LaunchEnvelope) -> Mapping[str, Any]:
+        raw = value.value if isinstance(value, LaunchResult) else value
+        identity = getattr(raw, "worker_identity", None)
+        if identity is None and isinstance(raw, tuple) and len(raw) == 4:
+            identity = getattr(raw[0], "worker_identity", None)
+        if not isinstance(identity, Mapping):
+            identity = controlled.accepted_worker_identity
+        if not isinstance(identity, Mapping):
+            raise ValueError("physical worker door returned no exact worker identity")
+        process_identity = identity.get("process_start_identity")
+        if receipt.production_intent and (not isinstance(process_identity, str) or not process_identity):
+            raise ValueError("physical worker door returned no process incarnation")
+        process_identity = str(process_identity or _digest(identity))
+        return {
+            "operation_id": candidate.operation_id,
+            "request_id": candidate.request_id,
+            "envelope_digest": candidate.digest,
+            "liveness": "running",
+            "process_session_identity": process_identity,
+            "worker_identity": dict(identity),
+            "observed_at": _now(),
+        }
+
+    def resource_factory(value: Any, observation: Mapping[str, Any], candidate: LaunchEnvelope) -> TypedResource:
+        identity = observation["process_session_identity"]
+        return TypedResource(
+            id=f"{candidate.operation_id}:process",
+            operation_id=candidate.operation_id,
+            resource_type=ResourceType.PROCESS_SESSION,
+            name=str(identity),
+            details={
+                "worker_identity": dict(observation.get("worker_identity") or {}),
+                "physical_door_id": receipt.physical_door_id,
+                "venue": candidate.venue,
+            },
+        )
+
+    result = launch_transaction(
+        envelope,
+        store=store,
+        preflight=_WorkerPreflight(receipt.preflight_digest),
+        dispatch=dispatch,
+        observe=observe,
+        resource_factory=resource_factory,
+        operation_type="megaplan_worker",
+    )
+    finished = _now()
+    if result.result is not DurableLaunchResult.ACCEPTED:
+        return result, None
+    if physical_value is None:
+        # Exact replay returns from the store before touching the physical
+        # closure.  Reconstruct only the typed success view from the accepted
+        # process resource; never redispatch or infer a new identity.
+        accepted = result.store_result
+        operation = getattr(accepted, "operation", None)
+        process_resource = getattr(accepted, "process_resource", None)
+        if process_resource is None:
+            try:
+                operation = store.load_operation_run(receipt.operation_id or receipt.logical_dispatch_id)
+                process_resource = next(
+                    resource for resource in store.list_typed_resources(operation.id)
+                    if resource.resource_type is ResourceType.PROCESS_SESSION
+                )
+            except (OSError, KeyError, StopIteration, TypeError, ValueError):
+                process_resource = None
+        identity = dict((getattr(process_resource, "details", {}) or {}).get("worker_identity") or {})
+        if not identity:
+            return result, None
+        started_at = getattr(operation, "started_at", None)
+        started_text = started_at.isoformat() if hasattr(started_at, "isoformat") else str(started_at or started)
+        outcome = DispatchOutcome(
+            kind="success",
+            launch_state="accepted",
+            plan_id=receipt.plan_id,
+            phase=receipt.phase,
+            dispatch_family_id=receipt.dispatch_family_id,
+            logical_dispatch_id=receipt.logical_dispatch_id,
+            admission_receipt_id=receipt.admission_receipt_id,
+            semantic_dispatch_fingerprint=receipt.semantic_dispatch_fingerprint,
+            selected_spec=receipt.normalized_spec,
+            provider=receipt.provider,
+            route_liveness_kind=receipt.route_liveness_kind,
+            route_liveness_identity=receipt.route_liveness_identity,
+            route_liveness_digest=receipt.route_liveness_digest,
+            worker_identity=identity,
+            started_at=started_text,
+            finished_at=started_text,
+            success_payload={"replayed": True},
+        )
+        return result, outcome
+    outcome = _normalize_outcome(physical_value, receipt, started, finished)
+    return result, outcome
 
 
 def build_authorized_linked_child_request(
@@ -1945,139 +2168,33 @@ def dispatch_with_admission(
             return decision
         if not isinstance(decision, WorkerAdmissionReceipt):
             raise TypeError("admission gate returned an unsupported decision")
-        active_ledger = ledger or current.ledger or IncidentLedger(current.ledger_root)
-        existing = _committed_terminal(active_ledger, decision)
-        if existing is not None:
-            # The parent already has its one terminal.  Continue T8 from the
-            # committed record; never relaunch or append a second parent death.
-            return _provider_post_terminal(
-                current,
-                decision,
-                _outcome_from_committed_terminal(existing, decision),
-                launch=launch,
-                gate=gate,
-                ledger=active_ledger,
-                clock=clock,
-                sleeper=sleeper,
-                deadline=deadline,
-                return_worker=return_worker,
-                probe_executor=probe_executor,
-                child_launch=child_launch,
-            )
-        from arnold_pipelines.megaplan.cloud.controlled_final_launch import ControlledFinalLaunch
-        preflight_result: Mapping[str, Any] = {}
-        if admission_preflight is not None:
-            result = admission_preflight(decision)
-            if result is not None:
-                if not isinstance(result, Mapping):
-                    raise TypeError("admission preflight must return a mapping or None")
-                preflight_result = result
-        physical_evidence = preflight_result.get("physical_operation_evidence")
-        if preflight_result.get("suppress") is True:
-            if not isinstance(physical_evidence, Mapping):
-                raise ValueError("suppressed admission requires physical no-launch evidence")
-            controlled = ControlledFinalLaunch(
-                decision,
-                ledger=active_ledger,
-                physical_operation_evidence=dict(physical_evidence),
-            )
-            evidence_ids = [
-                str(item.get("payload", {}).get("event_id"))
-                for item in active_ledger.read_nbf_events()
-                if item.get("payload", {}).get("event_type") == "controlled_adapter_state"
-                and item.get("payload", {}).get("reservation_event_id") == decision.reservation_event_id
-                and item.get("payload", {}).get("admission_receipt_id") == decision.admission_receipt_id
-                and item.get("payload", {}).get("launch_state_identity") == "not_started"
-                and item.get("payload", {}).get("event_id")
-            ]
-            return reconcile_no_launch(
-                decision,
-                evidence_event_ids=tuple(evidence_ids[-1:]),
-                ledger=active_ledger,
-                evidence_kind=str(preflight_result.get("evidence_kind") or "controlled_adapter"),
-                observed_at=preflight_result.get("observed_at"),
-            )
-        controlled = ControlledFinalLaunch(decision, ledger=active_ledger)
-        try:
-            pre_entry = getattr(launch, "pre_entry", None)
-            if callable(pre_entry):
-                evidence_result = pre_entry(controlled.context)
-                if not isinstance(evidence_result, LaunchResult) or evidence_result.accepted:
-                    raise TypeError("pre-entry hook must return a rejected LaunchResult")
-                evidence = evidence_result.value
-                if not isinstance(evidence, Mapping):
-                    raise TypeError("pre-entry no-launch evidence must be a mapping")
-                evidence_ids = evidence.get("evidence_event_ids")
-                if isinstance(evidence_ids, str):
-                    evidence_ids = (evidence_ids,)
-                if not isinstance(evidence_ids, (tuple, list)):
-                    raise TypeError("pre-entry no-launch evidence requires event IDs")
-                return reconcile_no_launch(
-                    decision,
-                    evidence_event_ids=tuple(str(item) for item in evidence_ids),
-                    ledger=active_ledger,
-                    evidence_kind=str(evidence.get("evidence_kind") or "controlled_adapter"),
-                    observed_at=evidence.get("observed_at"),
-                )
-            started = _now()
-            value = controlled.run(launch)
-            finished = _now()
-            outcome = _normalize_outcome(value, decision, controlled.accepted_started_at or started, controlled.accepted_finished_at or finished)
-            if outcome.kind in {"no_launch", "unresolved_launch"}:
-                return outcome
-            execution_context_identity = _digest({"plan_id": decision.plan_id, "phase": decision.phase, "logical_dispatch_id": decision.logical_dispatch_id, "physical_door_id": decision.physical_door_id, "semantic_dispatch_fingerprint": decision.semantic_dispatch_fingerprint})
-            try:
-                terminal = active_ledger.append_terminal_outcome(outcome=outcome, reservation_event_id=decision.reservation_event_id, projection_key=decision.projection_key, physical_door_id=decision.physical_door_id, execution_context_identity=execution_context_identity, primary_spec=decision.normalized_spec, configured_fallback_chain_identity=current.configured_fallback_chain_identity)
-            except Exception:
-                # The worker was accepted, but the canonical terminal could not
-                # be committed.  Keep the reservation open and return every
-                # identity needed for reconciliation; never relaunch blindly.
-                return _unresolved_outcome(
-                    decision,
-                    worker_identity=outcome.worker_identity,
-                    started_at=outcome.started_at,
-                    finished_at=outcome.finished_at,
-                )
-            terminal_outcome = replace(outcome, terminal_outcome_event_id=str((terminal.get("payload", terminal)).get("terminal_outcome_id")))
-        except ExecuteFallbackUnsafe:
-            raise
-        except Exception:
-            # ControlledFinalLaunch only normalizes a pre-entry exception. All
-            # post-entry uncertainty is held and never blindly redispatched.
-            return _unresolved_outcome(
-                decision,
-                worker_identity=controlled.accepted_worker_identity,
-                started_at=controlled.accepted_started_at,
-                finished_at=controlled.accepted_finished_at,
-            )
-        try:
-            controlled.close()
-        except Exception:
-            # Terminal projection is canonical and already committed.  A
-            # post-terminal bookkeeping marker must not erase that fact or
-            # turn a successful worker result into an unresolved launch.
-            pass
-        result = _provider_post_terminal(
-            current,
+        # All production worker doors converge on OperationRun/
+        # FileBackedDurableOpsStore.  IncidentLedger is an optional custody
+        # adapter for unrelated incident/disposition observations; it is not
+        # consulted for launch admission, lifecycle, acceptance, or replay.
+        active_ledger = ledger or current.ledger
+        canonical_store = _worker_operation_store(current, decision)
+        canonical_result, canonical_outcome = _canonical_worker_launch(
             decision,
-            terminal_outcome,
-            launch=launch,
-            gate=gate,
+            launch,
+            store=canonical_store,
             ledger=active_ledger,
-            clock=clock,
-            sleeper=sleeper,
-            deadline=deadline,
-            return_worker=return_worker,
-            probe_executor=probe_executor,
-            child_launch=child_launch,
         )
-        if return_worker and isinstance(result, DispatchOutcome) and result.kind == "success":
-            raw = value.value if isinstance(value, LaunchResult) else value
-            transport_worker = raw[0] if isinstance(raw, tuple) and len(raw) == 4 else raw
-            if hasattr(transport_worker, "auth_metadata"):
-                metadata = dict(getattr(transport_worker, "auth_metadata", {}) or {})
-                metadata["dispatch_outcome"] = result.to_dict()
-                transport_worker.auth_metadata = metadata
-            return raw.returncode if isinstance(raw, ManagedCommandResult) else raw
-        return result
+        if canonical_result.result is DurableLaunchResult.REJECTED:
+            return AdmissionRefusal(
+                code="launch_rejected",
+                reason=str(canonical_result.reason.value),
+                plan_id=decision.plan_id,
+                phase=decision.phase,
+                logical_dispatch_id=decision.logical_dispatch_id,
+                admission_attempt=decision.admission_attempt,
+                evidence={"operation_id": decision.operation_id},
+            )
+        if canonical_result.result is DurableLaunchResult.UNKNOWN or canonical_outcome is None:
+            return _unresolved_outcome(decision)
+        # The canonical store has already committed the exact accepted
+        # process identity.  Do not append a shadow reservation/terminal or
+        # re-enter the physical door for provider fallback/replay.
+        return canonical_outcome
+
 __all__ = ["AdmissionRefusal", "CONTINUATION_PROVIDER_PROBE_SCHEMA", "CONTINUATION_PROVIDER_PROBE_OUTPUT", "LaunchResult", "ManagedCommandResult", "WorkerAdmissionReceipt", "WorkerAdmissionRequest", "WorkerExecutionContextRef", "build_authorized_linked_child_request", "dispatch_with_admission", "ensure_continuation_provider_probe", "production_provider_probe_executor", "reconcile_no_launch", "require_production_worker_dispatch_runtime", "resolve_omp_live_membership"]

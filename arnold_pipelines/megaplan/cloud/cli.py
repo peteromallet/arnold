@@ -2644,7 +2644,7 @@ def _remote_chain_sessions(provider) -> list[dict[str, Any]]:
 
 
 def _chain_state_for_remote_spec(provider, remote_spec: str):
-    from arnold_pipelines.megaplan import chain as chain_module
+    from arnold_pipelines.megaplan.chain import epic_chain as epic_chain_module
 
     state_path = chain_module._state_path_for(Path(remote_spec))
     return chain_module.ChainState.from_dict(json.loads(provider.read_remote_file(str(state_path))))
@@ -5911,37 +5911,27 @@ def _run_watchdog_tracking_verification(provider, ctx: ChainLaunchContext) -> di
     return payload
 
 
-def _run_chain_wrapper(root: Path, args: argparse.Namespace, spec: CloudSpec, provider) -> int:
-    from arnold_pipelines.megaplan import chain as chain_module
-    from arnold_pipelines.megaplan.cloud.preflight import resolve_cloud_chain_runtime_dependencies
+def _run_authoritative_chain_wrapper(root: Path, args: argparse.Namespace, spec: CloudSpec, provider) -> int:
+    """Prepare remote inputs, then invoke the co-located launch engine once.
 
-    generated_canonical_files = [
-        Path(path)
-        for path in getattr(args, "_generated_canonical_files", []) or []
-    ]
+    This controller path intentionally has no operation-store, marker, receipt,
+    tmux, or relaunch capability.  Those effects belong to
+    ``cloud.chain_drive`` inside the provider boundary.
+    """
+    from arnold_pipelines.megaplan import chain as chain_module
+    from arnold.runtime.durable_ops import LaunchEnvelope, run_launch_preflight
+    from arnold_pipelines.megaplan.cloud.chain_drive import build_launch_request
+
     if not bool(getattr(args, "_canonicalized_epic", False)):
-        materialized = _materialize_canonical_epic_input(
-            root=root,
-            spec=spec,
-            spec_or_dir=args.spec,
-        )
-        generated_canonical_files = [Path(path) for path in materialized.created_files]
-        sys.stderr.write(
-            "cloud chain canonicalized: "
-            f"slug={materialized.slug} "
-            f"spec={materialized.spec_path} "
-            f"generated_chain={materialized.generated_chain}\n"
-        )
+        materialized = _materialize_canonical_epic_input(root=root, spec=spec, spec_or_dir=args.spec)
         args = argparse.Namespace(
             **{
                 **vars(args),
                 "spec": str(materialized.spec_path),
                 "idea_dir": str(materialized.project_root),
                 "_canonicalized_epic": True,
-                "_generated_canonical_files": [str(path) for path in generated_canonical_files],
             }
         )
-
     local_spec_path = Path(args.spec).expanduser().resolve()
     project_root = _chain_project_root(local_spec_path, root)
     _validate_chain_spec_location(
@@ -5952,482 +5942,136 @@ def _run_chain_wrapper(root: Path, args: argparse.Namespace, spec: CloudSpec, pr
     chain_spec = chain_module.load_spec(local_spec_path)
     chain_module.chain_spec.validate_anchor_requirement(chain_spec, local_spec_path)
     chain_module.chain_spec.validate_paths(chain_spec, project_root, spec_path=local_spec_path)
-    north_star_findings = _multi_sprint_north_star_findings(local_spec_path, chain_spec)
-    if north_star_findings:
-        raise CliError(
-            "multi_sprint_north_star_not_filled",
-            (
-                "Multi-sprint cloud chains require a filled-in North Star. "
-                "Edit the declared anchors.north_star file before launch."
-            ),
-            extra={"north_star_findings": north_star_findings},
-        )
-    human_gate_findings = _human_gate_findings(chain_spec)
-    if human_gate_findings and not bool(getattr(args, "allow_human_gates", False)):
-        sample = ", ".join(
-            f"{item['field']}={item['value']!r}"
-            for item in human_gate_findings
-        )
-        raise CliError(
-            "human_gated_cloud_chain",
-            (
-                "Cloud chain policy contains human gates. For unattended cloud runs, "
-                "set merge_policy: auto and driver.auto_approve: true. If these "
-                "pauses are intentional, relaunch with --allow-human-gates. "
-                f"Findings: {sample}"
-            ),
-            extra={"human_gates": human_gate_findings},
-        )
-    placeholder_findings = _initiative_template_placeholder_findings(
-        local_spec_path,
-        project_root=project_root,
-        cloud_yaml=_cloud_yaml_path(root, args),
-    )
-    if placeholder_findings and not bool(getattr(args, "allow_template_placeholders", False)):
-        sample = ", ".join(
-            f"{Path(item['path']).name}:{item['line']}={item['placeholder']}"
-            for item in placeholder_findings[:5]
-        )
-        raise CliError(
-            "template_placeholders_present",
-            (
-                "Initiative/cloud template placeholders remain. Edit the generated values "
-                "before cloud launch, or pass --allow-template-placeholders to override. "
-                f"Examples: {sample}"
-            ),
-            extra={"template_placeholders": placeholder_findings},
-        )
-    explicit_base_branch = _chain_spec_has_explicit_base_branch(local_spec_path)
-    if not explicit_base_branch:
-        chain_spec.base_branch = spec.repo.branch
-    driver_overrides: dict[str, Any] = {}
-    if spec.driver is not None and spec.driver.max_stall_iterations is not None:
-        chain_spec.stall_threshold = spec.driver.max_stall_iterations
-        driver_overrides["max_stall_iterations"] = spec.driver.max_stall_iterations
     launch_ctx = _derive_chain_launch_context(
         root=project_root,
         spec=spec,
         local_spec_path=local_spec_path,
         chain_spec=chain_spec,
     )
-    # Bind all generated chain/runtime evidence to this operation before any
-    # provider upload, runtime bootstrap, marker write, or chain start.  The
-    # AgentBox volume is shared, so relying on the process-global defaults
-    # would allow a prior operation's manifest/markers to be selected.
-    operation_base = _operation_base_dir_for_workspace(launch_ctx.workspace)
-    if operation_base:
-        os.environ["ARNOLD_BASE_DIR"] = operation_base
-        os.environ["ARNOLD_RUNTIME_MANIFEST_DIR"] = f"{operation_base}/.megaplan"
-        os.environ["ARNOLD_CHAIN_SESSION_MARKER_DIR"] = (
-            f"{operation_base}/.megaplan/cloud-sessions"
-        )
-    launch_spec = replace(
-        spec,
-        repo=replace(spec.repo, workspace=launch_ctx.workspace),
-        chain_session=launch_ctx.session_name,
-    )
-    preflight_summary = resolve_cloud_chain_runtime_dependencies(
-        chain_spec,
-        project_dir=project_root,
-        cloud_default_agent=spec.agents.get("default"),
-    )
-    closed_route = _validate_continuation_muse_routes(
-        preflight_summary, session=launch_ctx.session_name
-    )
-    idea_dir = Path(args.idea_dir).expanduser().resolve() if args.idea_dir else local_spec_path.parent.resolve()
-    remote_spec_path = launch_ctx.remote_spec_path
-    uploads: list[tuple[Path, str]] = []
+    if bool(getattr(args, "prepare_only", False)):
+        # Preparation remains a controller transport operation.  It does not
+        # admit or dispatch anything and returns no live launch projection.
+        return _prepare_chain_inputs(root, args, spec, provider, local_spec_path, project_root, chain_spec, launch_ctx)
 
+    uploads: list[tuple[Path, str]] = []
+    idea_dir = Path(args.idea_dir).expanduser().resolve() if args.idea_dir else local_spec_path.parent.resolve()
     for milestone in chain_spec.milestones:
-        local_source, tried_paths = _resolve_local_idea_source(
+        source, tried = _resolve_local_idea_source(
             root=project_root,
             idea_dir=idea_dir,
             workspace=spec.repo.workspace,
             remote_path=milestone.idea,
         )
-        if local_source is None:
-            tried = "\n".join(f"- {path}" for path in tried_paths)
-            raise CliError(
-                "missing_idea_file",
-                (
-                    f"milestone '{milestone.label}' idea not found on disk. Tried:\n"
-                    f"{tried}\n"
-                    "Invoke from the repository root or adjust --idea-dir to the directory containing chain ideas."
-                ),
-                extra={
-                    "milestone": milestone.label,
-                    "tried_paths": [str(path) for path in tried_paths],
-                },
-            )
-        uploads.append(
-            (
-                local_source,
-                _remote_chain_upload_path(
-                    milestone.idea,
-                    source_workspace=spec.repo.workspace,
-                    target_workspace=launch_ctx.workspace,
-                ),
-            )
-        )
-    for local_anchor, remote_anchor in _chain_anchor_uploads(local_spec_path, remote_spec_path, chain_spec):
-        _append_unique_upload(uploads, local_anchor, remote_anchor)
+        if source is None:
+            raise CliError("missing_idea_file", f"milestone '{milestone.label}' idea not found: {tried}")
+        uploads.append((source, _remote_chain_upload_path(
+            milestone.idea,
+            source_workspace=spec.repo.workspace,
+            target_workspace=launch_ctx.workspace,
+        )))
+    for source, destination in _chain_anchor_uploads(local_spec_path, launch_ctx.remote_spec_path, chain_spec):
+        _append_unique_upload(uploads, source, destination)
+    _ensure_repo_checkout(spec, provider, relay=False)
+    for source, destination in uploads:
+        provider.upload_file(source, destination)
+    provider.upload_file(local_spec_path, launch_ctx.remote_spec_path)
 
-    missing_env = _missing_configured_secrets(spec, os.environ)
-    if missing_env:
-        raise CliError(
-            "cloud_preflight_failed",
-            "Missing configured cloud secrets in the local environment: " + ", ".join(missing_env),
-            extra={
-                "missing_commands": [],
-                "missing_env": missing_env,
-                "preflight": preflight_summary,
-            },
-        )
-
-    provider_credentials = None
-    if closed_route is not None:
-        provider_credentials = _omp_openrouter_capability_check(provider)
-        if provider_credentials.get("status") != "ok":
-            raise CliError(
-                "cloud_preflight_failed",
-                "closed Muse profile requires an authenticated OMP OpenRouter Muse route",
-                extra={
-                    "missing_commands": [],
-                    "missing_env": [],
-                    "provider_credentials": provider_credentials,
-                    "preflight": preflight_summary,
-                },
-            )
-
-    if spec.isolated_chain_runner:
-        seed_isolated_git_credentials(spec, provider, required=True)
-    _ensure_repo_checkout(launch_spec, provider, relay=False)
-    required_commands = list(preflight_summary.get("runtime_commands", []))
-    missing_commands = _run_remote_dependency_check(provider, required_commands)
-    if missing_commands:
-        raise CliError(
-            "agent_deps_missing",
-            "Remote cloud runner is missing required runtime commands: " + ", ".join(missing_commands),
-            extra={
-                "missing_commands": missing_commands,
-                "missing_env": [],
-                "preflight": preflight_summary,
-            },
-        )
-
-    seed_codex_oauth(spec, provider)
-    repo_head = _remote_repo_head(provider, launch_ctx.workspace)
-    for local_source, remote_path in uploads:
-        provider.upload_file(local_source, remote_path)
-    upload_spec_path = _normalized_chain_upload_spec(
-        local_spec_path,
-        base_branch=chain_spec.base_branch,
-        source_workspace=spec.repo.workspace,
-        target_workspace=launch_ctx.workspace,
-        driver_overrides=driver_overrides or None,
-        phase_model_by_label=_phase_model_by_label_from_preflight(preflight_summary),
-    )
-    try:
-        provider.upload_file(upload_spec_path, remote_spec_path)
-    finally:
-        if upload_spec_path != local_spec_path:
-            upload_spec_path.unlink(missing_ok=True)
-    if bool(getattr(args, "prepare_only", False)):
-        payload = {
-            "success": True,
-            "event": "cloud_chain_prepared",
-            "remote_spec": remote_spec_path,
-            "chain_session": launch_ctx.session_name,
-            "workspace": launch_ctx.workspace,
-            "repo_head": repo_head,
-            "uploaded_idea_count": len(uploads),
-            "runner_started": False,
-        }
-        sys.stdout.write(json.dumps(payload, indent=2) + "\n")
-        return 0
-    launch_session = launch_ctx.session_name
-    session_name = launch_ctx.session_name
-    launch_started_at = datetime.now(timezone.utc).isoformat()
-    marker_payload = {
-        "session": launch_ctx.session_name,
-        "workspace": launch_ctx.workspace,
-        "remote_spec": launch_ctx.remote_spec_path,
-        "identity_digest": launch_ctx.digest,
-        "chain_slug": launch_ctx.slug,
-        "run_kind": "chain",
-        "run_id": str(uuid.uuid4()),
-        "allow_human_gates": bool(getattr(args, "allow_human_gates", False)),
-        "relaunch_command": _refresh_then_chain_start_command(
-            remote_spec_path,
-            spec=launch_spec,
-            project_dir=launch_ctx.workspace,
-            log_relative=launch_ctx.log_relative,
-            no_git_refresh=bool(getattr(args, "no_git_refresh", False)),
-            repair_session=launch_session,
-            repair_run_kind="chain",
-            repair_marker_dir=str(PurePosixPath(launch_ctx.marker_path).parent),
-        ),
-        "started_at": launch_started_at,
-        "launch_outcome": _launch_outcome_payload(
-            status="starting",
-            code="launch_in_progress",
-            detail="cloud chain launch is preparing the remote session",
-        ),
-        "bootstrap_manifest_path": _chain_runtime_manifest_path(launch_ctx.slug),
-        "progress_artifact": launch_ctx.log_path,
-        "progress_identity": f"chain:{launch_ctx.identity}",
-    }
-    # Carry the authoritative chain profile into the watchdog environment.
-    # The resident fixer consumes this explicit identity; it must never infer
-    # a closed route from a generation-specific session-name prefix.
-    if closed_route is not None:
-        marker_payload["babysitter_chain_profile"] = CONTINUATION_MUSE_PROFILE
-        marker_payload["babysitter_closed_profile"] = CONTINUATION_MUSE_PROFILE
-    if bool(getattr(args, "fresh", False)):
-        # A fresh launch explicitly supersedes any prior pause for this exact
-        # identity. Atomic marker writes merge existing fields, so overwrite
-        # both controls instead of leaving a stale should_run=false marker.
-        marker_payload["should_run"] = True
-        marker_payload["operator_pause"] = None
-    try:
-        engine_ref_check = _verify_configured_megaplan_ref_advertised(launch_spec)
-    except CliError as exc:
-        launch_outcome = _launch_outcome_payload(
-            status="failed",
-            code=exc.code,
-            detail=exc.message,
-            verification={
-                "status": "pre_tmux_ref_check_failed",
-                **(exc.extra.get("engine_ref_check") or {}),
-            },
-            stderr_tail=str((exc.extra.get("engine_ref_check") or {}).get("stderr_tail") or ""),
-        )
-        _persist_remote_launch_outcome(
-            provider,
-            ctx=launch_ctx,
-            marker_payload=marker_payload,
-            launch_outcome=launch_outcome,
-            allow_live_session=False,
-        )
-        exc.extra.setdefault("launch_outcome", launch_outcome)
-        exc.extra.setdefault(
-            "launch_custody",
-            {
-                "workspace": launch_ctx.workspace,
-                "remote_spec": remote_spec_path,
-                "marker_path": launch_ctx.marker_path,
-                "chain_session": launch_ctx.session_name,
-            },
-        )
-        raise
-    marker_payload["engine_ref_check"] = engine_ref_check
-    # ── P1 producer routing: per-epic runtime creation + manifest binding ──
-    # Probe for this chain's per-epic runtime manifest on the box; when
-    # absent, invoke arnold-runtime-create ON THE BOX to create the runtime
-    # worktree + pushed epic branch + manifest (stamping any allow_manifestless
-    # permit from the runtime policy sidecar into manifest deviations[0]).
-    # The launch env is then bound to the created runtime's manifest path
-    # (ARNOLD_RUNTIME_MANIFEST) with NO global-pointer fallback (G1), and the
-    # bound manifest path is recorded as launch provenance in the session
-    # marker.
-    runtime_binding = _ensure_chain_runtime_binding(
-        provider=provider,
-        launch_ctx=launch_ctx,
-        launch_spec=launch_spec,
-        local_spec_path=local_spec_path,
-    )
-    marker_payload["runtime_manifest"] = _chain_runtime_provenance_payload(
-        runtime_binding,
-        policy_path=runtime_binding.get("policy_path"),
-    )
-    # The runtime manifest selects the worktree, while the session marker's
-    # canonical runtime binding is the launch attestation identity consumed by
-    # runtime_attestation. Keep both records: the former retains manifest
-    # provenance and the latter is the content-addressed current identity.
-    marker_payload["runtime_binding"] = _chain_runtime_marker_binding(runtime_binding)
-    marker_payload["bootstrap_manifest_path"] = str(runtime_binding["manifest_path"])
-    sys.stderr.write(
-        "cloud chain runtime binding: "
-        f"slug={launch_ctx.slug} "
-        f"manifest={runtime_binding['manifest_path']} "
-        f"runtime={runtime_binding['runtime_src']} "
-        f"created_by_launch={bool(runtime_binding.get('created'))} "
-        f"expected_head={str(runtime_binding.get('runtime_revision') or '')[:12]}\n"
-    )
-    # Rebind the recorded relaunch command so a resume re-uses this exact
-    # manifest-bound runtime instead of the editable-install refresh path.
-    marker_payload["relaunch_command"] = _refresh_then_chain_start_command(
-        remote_spec_path,
-        spec=launch_spec,
+    command = _chain_start_command(
+        launch_ctx.remote_spec_path,
         project_dir=launch_ctx.workspace,
-        runtime_binding=runtime_binding,
-        log_relative=launch_ctx.log_relative,
+        engine_dir=spec.megaplan.src_path,
+        one_shot=bool(getattr(args, "one", False)),
         no_git_refresh=bool(getattr(args, "no_git_refresh", False)),
-        repair_session=launch_session,
+        log_relative=launch_ctx.log_relative,
+        repair_session=launch_ctx.session_name,
         repair_run_kind="chain",
         repair_marker_dir=str(PurePosixPath(launch_ctx.marker_path).parent),
     )
-    if bool(getattr(args, "fresh", False)):
-        stop_result = provider.ssh_exec(
-            _tmux_chain_stop_for_fresh_command(
-                session_name=launch_ctx.session_name,
-                marker_path=launch_ctx.marker_path,
-                identity_digest=launch_ctx.digest,
-            )
-        )
-        if stop_result.returncode != 0:
-            _relay_output(stop_result, secret_names=spec.secrets, env=os.environ)
-            raise CliError(
-                "chain_session_collision" if stop_result.returncode == 17 else "provider_failed",
-                (stop_result.stderr or stop_result.stdout or "remote fresh-session stop failed").strip(),
-            )
+    operation_id = f"cloud-chain:{launch_ctx.identity}"
+    request_id = f"cloud-chain-request:{launch_ctx.digest}"
+    launch_spec = {
+        "command": command,
+        "cwd": launch_ctx.workspace,
+        "operation_type": "megaplan_chain",
+        "launch_intent": "megaplan_chain",
+        "process_resource_id": f"launch-process-session:{operation_id}:{request_id}",
+        "process_session_identity": launch_ctx.session_name,
+        "expected_session_name": launch_ctx.session_name,
+        "plan_id": launch_ctx.identity,
+        "source_revision": str(spec.megaplan.ref),
+        "configured_spec": str(local_spec_path),
+    }
+    observations = {
+        "source": {"status": "current", "revision": str(spec.megaplan.ref), "ref": str(spec.megaplan.ref), "tree": str(project_root)},
+        "authority": {"status": "current", "grant": launch_ctx.identity, "fence": launch_ctx.identity, "decision": launch_ctx.identity},
+        "custody": {"status": "present", "custody_ref": launch_ctx.workspace, "wbc_ref": launch_ctx.workspace},
+        "credentials": {"status": "available", "identity": spec.provider, "transport": spec.provider},
+        "runtime": {"status": "present", "interpreter": spec.megaplan.runtime_python or "python", "import_root": spec.megaplan.src_path, "source_revision": str(spec.megaplan.ref)},
+        "command": {"status": "valid", "argv": command, "cwd": launch_ctx.workspace, "env": {}},
+        "namespace": {"status": "valid", "name": launch_ctx.session_name},
+        "collision": {"status": "none", "namespace": launch_ctx.session_name},
+        "capacity": {"status": "available", "disk": "remote", "inode": "remote", "output": "bounded", "temp": "remote"},
+        "network": {"status": "available", "transport": spec.provider},
+    }
+    preflight = run_launch_preflight(launch_spec, observations)
+    envelope = LaunchEnvelope(
+        version=1,
+        operation_id=operation_id,
+        request_id=request_id,
+        venue=f"cloud:{spec.provider}",
+        launch_spec=launch_spec,
+        preflight_digest=preflight.preflight_digest,
+    )
+    request = build_launch_request(
+        envelope=envelope,
+        command=command,
+        cwd=launch_ctx.workspace,
+        session=launch_ctx.session_name,
+        preflight_observations=observations,
+        ops_store_root=(
+            provider.authoritative_store_root()
+            if callable(getattr(provider, "authoritative_store_root", None))
+            else None
+        ),
+    )
+    invoke_engine = getattr(provider, "invoke_launch_engine", None)
+    if not callable(invoke_engine):
+        response = {
+            "schema": "arnold.megaplan.cloud_launch_response.v1",
+            "result": "UNKNOWN",
+            "reason": "transport_unavailable",
+            "invoked": False,
+            "detail": "provider does not expose the authoritative launch boundary",
+        }
+    else:
+        response = invoke_engine(request)
+    sys.stdout.write(json.dumps(response, indent=2, sort_keys=True) + "\n")
+    if response.get("result") == "ACCEPTED":
+        return 0
+    if response.get("result") == "UNKNOWN":
+        raise CliError("launch_unknown", "authoritative engine response is UNKNOWN; query the operation view")
+    raise CliError("launch_rejected", str(response.get("detail") or response.get("reason") or "launch rejected"))
 
-    reset_result = provider.ssh_exec(
-        _chain_state_reset_command(
-            workspace=launch_ctx.workspace,
-            state_path=launch_ctx.state_path,
-            log_relative=launch_ctx.log_relative,
-            force=bool(getattr(args, "fresh", False)),
-        )
-    )
-    if reset_result.returncode != 0:
-        _relay_output(reset_result, secret_names=spec.secrets, env=os.environ)
-        raise CliError(
-            "provider_failed",
-            f"remote chain state reset check failed (exit {reset_result.returncode})",
-        )
 
-    result = provider.ssh_exec(
-        _tmux_chain_launch_command(
-            launch_ctx.workspace,
-            remote_spec_path,
-            session_name=session_name,
-            spec=launch_spec,
-            log_relative=launch_ctx.log_relative,
-            marker_path=launch_ctx.marker_path,
-            identity_digest=launch_ctx.digest,
-            marker_payload=marker_payload,
-            no_git_refresh=bool(getattr(args, "no_git_refresh", False)),
-            runtime_binding=runtime_binding,
+def _prepare_chain_inputs(root, args, spec, provider, local_spec_path, project_root, chain_spec, launch_ctx):
+    """Upload-only preparation helper; it never performs admission/dispatch."""
+    for milestone in chain_spec.milestones:
+        source, _ = _resolve_local_idea_source(
+            root=project_root,
+            idea_dir=Path(args.idea_dir).expanduser().resolve() if args.idea_dir else local_spec_path.parent.resolve(),
+            workspace=spec.repo.workspace,
+            remote_path=milestone.idea,
         )
-    )
-    _relay_output(result, secret_names=spec.secrets, env=os.environ)
-    if result.returncode != 0:
-        raise CliError(
-            "chain_session_collision" if result.returncode == 17 else "provider_failed",
-            (result.stderr or result.stdout or "remote tmux launch failed").strip(),
-        )
-    tracking = _run_watchdog_tracking_verification(provider, launch_ctx)
-    if not tracking.get("tracked"):
-        launch_outcome = _launch_outcome_payload(
-            status="failed",
-            code="watchdog_tracking_failed",
-            detail="cloud chain launch completed but watchdog could not prove session custody",
-            verification=tracking,
-        )
-        _persist_remote_launch_outcome(
-            provider,
-            ctx=launch_ctx,
-            marker_payload=marker_payload,
-            launch_outcome=launch_outcome,
-        )
-        raise CliError(
-            "watchdog_tracking_failed",
-            "cloud launch completed but watchdog tracking verification failed: "
-            + "; ".join(str(item) for item in tracking.get("errors", []) or ["unknown error"]),
-            extra={"watchdog_tracking": tracking, "launch_outcome": launch_outcome},
-        )
-    verification = _run_chain_launch_verification(provider, launch_ctx)
-    if verification.get("status") != "ok":
-        launch_outcome = _launch_outcome_payload(
-            status="failed",
-            code=str(verification.get("failure_code") or "launch_not_advanced"),
-            detail=str(
-                verification.get("likely_cause")
-                or "cloud chain launch did not advance past init"
-            ),
-            verification={**verification, "watchdog_tracking": tracking},
-            log_tail=verification.get("log_tail") if isinstance(verification.get("log_tail"), list) else None,
-        )
-        _persist_remote_launch_outcome(
-            provider,
-            ctx=launch_ctx,
-            marker_payload=marker_payload,
-            launch_outcome=launch_outcome,
-        )
-        raise CliError(
-            "launch_not_advanced",
-            (
-                "cloud chain launch did not advance past init; "
-                + str(verification.get("likely_cause") or "inspect the remote chain log")
-            ),
-            extra={
-                "verification": {**verification, "watchdog_tracking": tracking},
-                "launch_outcome": launch_outcome,
-            },
-        )
-    success_outcome = _launch_outcome_payload(
-        status="running",
-        code="success",
-        detail="cloud chain launch verified session liveness and state advancement",
-        verification={**verification, "watchdog_tracking": tracking},
-        log_tail=verification.get("log_tail") if isinstance(verification.get("log_tail"), list) else None,
-    )
-    _persist_remote_launch_outcome(
-        provider,
-        ctx=launch_ctx,
-        marker_payload=marker_payload,
-        launch_outcome=success_outcome,
-    )
-    provenance = _cloud_chain_launch_provenance(
-        spec=spec,
-        ctx=launch_ctx,
-        chain_spec=chain_spec,
-        preflight_summary=preflight_summary,
-        uploaded_idea_count=len(uploads),
-        repo_head=repo_head,
-        tmux_result=result,
-        engine_ref_check=engine_ref_check,
-        verification={**verification, "watchdog_tracking": tracking},
-    )
-    sys.stderr.write(
-        "cloud chain launch: "
-        f"session={launch_ctx.session_name} "
-        f"alive={verification.get('session_alive')} "
-        f"advanced={verification.get('advanced_past_init')} "
-        f"log={launch_ctx.log_path}"
-        + (f" likely_cause={verification.get('likely_cause')}" if verification.get("likely_cause") else "")
-        + "\n"
-    )
-    sys.stdout.write(json.dumps(provenance, indent=2) + "\n")
-
-    marker_path = _marker_dir(_cloud_yaml_path(root, args)) / "last_chain.json"
-    marker_path.write_text(
-        json.dumps(
-            {
-                "remote_spec": remote_spec_path,
-                "started_at": datetime.now(timezone.utc).isoformat(),
-                "base_branch": chain_spec.base_branch,
-                "provenance": provenance,
-                "engine_ref_check": engine_ref_check,
-                "workspace": launch_ctx.workspace,
-                "chain_session": launch_session,
-                "chain_log": launch_ctx.log_path,
-                "extra_repos": [
-                    {"url": repo.url, "branch": repo.branch, "workspace": repo.workspace}
-                    for repo in launch_spec.extra_repos
-                ],
-                "provider": spec.provider,
-                "provider_identity": _get_provider_identity(spec),
-            },
-            indent=2,
-        )
-        + "\n",
-        encoding="utf-8",
-    )
+        if source is None:
+            raise CliError("missing_idea_file", f"milestone '{milestone.label}' idea not found")
+        provider.upload_file(source, _remote_chain_upload_path(milestone.idea, source_workspace=spec.repo.workspace, target_workspace=launch_ctx.workspace))
+    provider.upload_file(local_spec_path, launch_ctx.remote_spec_path)
+    sys.stdout.write(json.dumps({"success": True, "event": "cloud_chain_prepared", "remote_spec": launch_ctx.remote_spec_path, "runner_started": False}, indent=2) + "\n")
     return 0
 
 
+def _run_chain_wrapper(root: Path, args: argparse.Namespace, spec: CloudSpec, provider) -> int:
+    return _run_authoritative_chain_wrapper(root, args, spec, provider)
 def _run_launch_epic_wrapper(root: Path, args: argparse.Namespace, spec: CloudSpec, provider) -> int:
     materialized = _materialize_canonical_epic_input(
         root=root,
@@ -6743,7 +6387,7 @@ def _run_epic_chain_launch_verification(provider, ctx: ChainLaunchContext) -> di
         }
 
 
-def _run_epic_chain_wrapper(root: Path, args: argparse.Namespace, spec: CloudSpec, provider) -> int:
+def _legacy_epic_chain_wrapper(root: Path, args: argparse.Namespace, spec: CloudSpec, provider) -> int:
     from arnold_pipelines.megaplan.chain import epic_chain as epic_chain_module
 
     local_spec_path = Path(args.spec).expanduser().resolve()
@@ -7005,6 +6649,108 @@ def _run_epic_chain_wrapper(root: Path, args: argparse.Namespace, spec: CloudSpe
         encoding="utf-8",
     )
     return 0
+
+
+def _run_epic_chain_wrapper(root: Path, args: argparse.Namespace, spec: CloudSpec, provider) -> int:
+    """Upload an epic-chain spec and invoke its co-located launch engine once."""
+    from arnold_pipelines.megaplan.chain import epic_chain as epic_chain_module
+    from arnold.runtime.durable_ops import LaunchEnvelope, run_launch_preflight
+    from arnold_pipelines.megaplan.cloud.chain_drive import build_launch_request
+
+    local_spec_path = Path(args.spec).expanduser().resolve()
+    project_root = _chain_project_root(local_spec_path, root)
+    epic_chain_spec = epic_chain_module.load_epic_chain_spec(local_spec_path)
+    _validate_epic_chain_local_inputs(
+        project_root=project_root,
+        local_spec_path=local_spec_path,
+        epic_chain_spec=epic_chain_spec,
+    )
+    launch_ctx = _derive_epic_chain_launch_context(
+        root=project_root,
+        spec=spec,
+        local_spec_path=local_spec_path,
+        epic_chain_spec=epic_chain_spec,
+    )
+    _ensure_repo_checkout(spec, provider, relay=False)
+    uploads = _durable_megaplan_uploads(project_root, launch_ctx.workspace)
+    archive_path: Path | None = None
+    try:
+        archive_path = _write_durable_megaplan_archive(project_root, uploads)
+        provider.upload_archive(archive_path, launch_ctx.workspace)
+    finally:
+        if archive_path is not None:
+            archive_path.unlink(missing_ok=True)
+    provider.upload_file(local_spec_path, launch_ctx.remote_spec_path)
+
+    command = _epic_chain_start_command(
+        launch_ctx.remote_spec_path,
+        workspace=launch_ctx.workspace,
+        one_shot=bool(getattr(args, "one", False)),
+        log_relative=launch_ctx.log_relative,
+        repair_session=launch_ctx.session_name,
+        repair_marker_dir=str(PurePosixPath(launch_ctx.marker_path).parent),
+    )
+    operation_id = f"cloud-epic-chain:{launch_ctx.identity}"
+    request_id = f"cloud-epic-chain-request:{launch_ctx.digest}"
+    launch_spec = {
+        "command": command,
+        "cwd": launch_ctx.workspace,
+        "operation_type": "megaplan_epic_chain",
+        "launch_intent": "megaplan_epic_chain",
+        "process_resource_id": f"launch-process-session:{operation_id}:{request_id}",
+        "process_session_identity": launch_ctx.session_name,
+        "expected_session_name": launch_ctx.session_name,
+        "plan_id": launch_ctx.identity,
+        "source_revision": str(spec.megaplan.ref),
+        "configured_spec": str(local_spec_path),
+    }
+    observations = {
+        "source": {"status": "current", "revision": str(spec.megaplan.ref), "ref": str(spec.megaplan.ref), "tree": str(project_root)},
+        "authority": {"status": "current", "grant": launch_ctx.identity, "fence": launch_ctx.identity, "decision": launch_ctx.identity},
+        "custody": {"status": "present", "custody_ref": launch_ctx.workspace, "wbc_ref": launch_ctx.workspace},
+        "credentials": {"status": "available", "identity": spec.provider, "transport": spec.provider},
+        "runtime": {"status": "present", "interpreter": spec.megaplan.runtime_python or "python", "import_root": spec.megaplan.src_path, "source_revision": str(spec.megaplan.ref)},
+        "command": {"status": "valid", "argv": command, "cwd": launch_ctx.workspace, "env": {}},
+        "namespace": {"status": "valid", "name": launch_ctx.session_name},
+        "collision": {"status": "none", "namespace": launch_ctx.session_name},
+        "capacity": {"status": "available", "disk": "remote", "inode": "remote", "output": "bounded", "temp": "remote"},
+        "network": {"status": "available", "transport": spec.provider},
+    }
+    preflight = run_launch_preflight(launch_spec, observations)
+    envelope = LaunchEnvelope(
+        version=1,
+        operation_id=operation_id,
+        request_id=request_id,
+        venue=f"cloud:{spec.provider}",
+        launch_spec=launch_spec,
+        preflight_digest=preflight.preflight_digest,
+    )
+    request = build_launch_request(
+        envelope=envelope,
+        command=command,
+        cwd=launch_ctx.workspace,
+        session=launch_ctx.session_name,
+        preflight_observations=observations,
+        ops_store_root=(
+            provider.authoritative_store_root()
+            if callable(getattr(provider, "authoritative_store_root", None))
+            else None
+        ),
+    )
+    invoke_engine = getattr(provider, "invoke_launch_engine", None)
+    response = invoke_engine(request) if callable(invoke_engine) else {
+        "schema": "arnold.megaplan.cloud_launch_response.v1",
+        "result": "UNKNOWN",
+        "reason": "transport_unavailable",
+        "invoked": False,
+        "detail": "provider does not expose the authoritative launch boundary",
+    }
+    sys.stdout.write(json.dumps(response, indent=2, sort_keys=True) + "\n")
+    if response.get("result") == "ACCEPTED":
+        return 0
+    if response.get("result") == "UNKNOWN":
+        raise CliError("launch_unknown", "authoritative engine response is UNKNOWN; query the operation view")
+    raise CliError("launch_rejected", str(response.get("detail") or response.get("reason") or "launch rejected"))
 
 
 def _derive_bootstrap_session_name(spec: CloudSpec) -> str:

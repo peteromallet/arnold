@@ -335,28 +335,12 @@ def pause_session(
         session=session,
         authority=result["authority"],
     )
-    # Re-read under the canonical marker cutover lock.  Automatic babysitter
-    # admission uses this same door for its final reservation CAS, so a pause
-    # either wins before a reservation or observes/preserves an already
-    # claimed launch; it must never overwrite an unrelated marker update.
+    # Re-read under the marker cutover lock only for operator pause state.  A
+    # marker is not launch authority; OperationRun owns launch admission and
+    # accepted identity, so pausing never creates or cancels a launch
+    # reservation projection.
     with marker_runtime_cutover_lock(marker_path):
         current_marker, current_sha256 = _load_marker(marker_path)
-        reservation = current_marker.get("babysitter_launch_reservation")
-        if isinstance(reservation, dict):
-            status = str(reservation.get("status") or "")
-            if status == "authorized":
-                cancelled = dict(reservation)
-                cancelled.update(
-                    {
-                        "status": "cancelled",
-                        "cancelled_at": datetime.now(timezone.utc).isoformat(),
-                        "cancelled_by": actor,
-                        "cancellation_reason": reason.strip() or "operator requested pause",
-                    }
-                )
-                current_marker["babysitter_launch_reservation"] = cancelled
-            elif status not in {"claimed", "cancelled", "completed"}:
-                raise RuntimeError("session marker contains an unknown babysitter launch reservation")
         current_marker["operator_pause"] = result["authority"]
         current_marker["should_run"] = False
         _write_marker_locked(marker_path, current_marker, expected_sha256=current_sha256)

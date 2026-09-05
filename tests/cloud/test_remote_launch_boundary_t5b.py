@@ -1,8 +1,7 @@
-"""Canonical cloud engine replay and identity tests."""
-
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 
 from agentbox.config import AgentBoxConfig
 from agentbox.tmux import SessionStatus
@@ -10,8 +9,7 @@ from arnold.runtime.durable_ops import LaunchEnvelope, run_launch_preflight
 from arnold_pipelines.megaplan.cloud import chain_drive
 
 
-def _request(tmp_path: Path):
-    session = "chain"
+def _request(tmp_path: Path, *, session: str = "chain"):
     spec = {
         "command": "echo chain",
         "cwd": str(tmp_path),
@@ -40,22 +38,21 @@ def _request(tmp_path: Path):
         runs_root=tmp_path / "runs",
         locks_root=tmp_path / "locks",
     )
-    request = chain_drive.build_launch_request(
+    return config, chain_drive.build_launch_request(
         envelope=envelope,
         command="echo chain",
         cwd=str(tmp_path),
         session=session,
         preflight_observations=observations,
         ops_store_root=str(config.ops_store_root),
-    )
-    return config, request, envelope
+    ), envelope
 
 
-def test_exact_replay_returns_authority_without_redispatch(tmp_path: Path, monkeypatch) -> None:
+def test_remote_engine_replay_never_redispatches(tmp_path, monkeypatch):
     config, request, envelope = _request(tmp_path)
-    dispatches: list[object] = []
+    calls: list[object] = []
     monkeypatch.setattr(chain_drive, "load_agentbox_config", lambda: config)
-    monkeypatch.setattr(chain_drive, "run_tmux", lambda argv: dispatches.append(argv))
+    monkeypatch.setattr(chain_drive, "run_tmux", lambda argv: calls.append(argv))
     monkeypatch.setattr(
         chain_drive,
         "inspect_session",
@@ -70,23 +67,41 @@ def test_exact_replay_returns_authority_without_redispatch(tmp_path: Path, monke
             identity_available=True,
         ),
     )
+
     first = chain_drive.execute_authoritative_launch(request)
-    replay = chain_drive.execute_authoritative_launch(request)
+    second = chain_drive.execute_authoritative_launch(request)
+
     assert first["result"] == "ACCEPTED"
-    assert replay["reason"] == "replay"
-    assert len(dispatches) == 1
+    assert second["reason"] == "replay"
+    assert len(calls) == 1
 
 
-def test_identity_query_loss_is_unknown_without_replacement(tmp_path: Path, monkeypatch) -> None:
+def test_remote_engine_preflight_rejects_before_store_admission(tmp_path, monkeypatch):
     config, request, _ = _request(tmp_path)
-    dispatches: list[object] = []
+    request["preflight_observations"]["credentials"]["status"] = "unavailable"
     monkeypatch.setattr(chain_drive, "load_agentbox_config", lambda: config)
-    monkeypatch.setattr(chain_drive, "run_tmux", lambda argv: dispatches.append(argv))
+    monkeypatch.setattr(chain_drive, "run_tmux", lambda argv: (_ for _ in ()).throw(AssertionError("dispatch")))
+
+    result = chain_drive.execute_authoritative_launch(request)
+
+    assert result["result"] == "REJECTED"
+    assert result["reason"] == "preflight_rejected"
+    assert not (config.ops_store_root / "operation_runs.json").exists()
+
+
+def test_identity_query_loss_is_unknown_without_replacement(tmp_path, monkeypatch):
+    config, request, _ = _request(tmp_path)
+    calls: list[object] = []
+    monkeypatch.setattr(chain_drive, "load_agentbox_config", lambda: config)
+    monkeypatch.setattr(chain_drive, "run_tmux", lambda argv: calls.append(argv))
     monkeypatch.setattr(
         chain_drive,
         "inspect_session",
         lambda name, expected_identity=None: SessionStatus(name, "unavailable", True),
     )
+
     result = chain_drive.execute_authoritative_launch(request)
+
     assert result["result"] == "UNKNOWN"
-    assert len(dispatches) == 1
+    assert result["reason"] == "dispatch_uncertain"
+    assert len(calls) == 1

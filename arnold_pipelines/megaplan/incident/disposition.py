@@ -59,6 +59,7 @@ class WorkerSignalContext:
     physical_door_id: str = "default-door"
     execution_context_identity: str = ""
     started_at: str | None = None
+    operation_store_root: str | None = None
 
     @classmethod
     def from_ref(cls, ref: Any, *, worker_identity: dict[str, Any], victim_pid: int,
@@ -80,7 +81,8 @@ class WorkerSignalContext:
         return cls(**{field: getattr(ref, field) for field in fields},
                    worker_identity=dict(worker_identity), victim_pid=victim_pid,
                    victim_process_start_identity=victim_process_start_identity,
-                   started_at=started_at)
+                   started_at=started_at,
+                   operation_store_root=str(getattr(ref, "operation_store_root", "") or "") or None)
 
 
 @dataclass(frozen=True)
@@ -257,6 +259,35 @@ def _signal_name(disposition: Any) -> str:
     return getattr(value, "value", getattr(value, "name", str(value)))
 
 
+def _canonical_worker_acceptance(context: WorkerSignalContext) -> dict[str, Any] | None:
+    """Read accepted identity from OperationRun, never an incident marker."""
+    try:
+        from pathlib import Path
+        from arnold.runtime.durable_ops import FileBackedDurableOpsStore
+
+        root = Path(
+            context.operation_store_root
+            or os.environ.get("ARNOLD_OPS_STORE_ROOT")
+            or Path.cwd() / "ops"
+        )
+        store = FileBackedDurableOpsStore(root)
+        run = store.load_operation_run(context.logical_dispatch_id)
+        if getattr(run.state, "value", run.state) != "running":
+            return None
+        for resource in store.list_typed_resources(context.logical_dispatch_id):
+            identity = dict(resource.details).get("worker_identity")
+            if (
+                resource.resource_type.value == "process_session"
+                and isinstance(identity, dict)
+                and identity == context.worker_identity
+                and identity.get("process_start_identity") == context.victim_process_start_identity
+            ):
+                return {"operation_id": run.id, "worker_identity": identity, "resource_id": resource.id}
+    except (OSError, KeyError, TypeError, ValueError):
+        return None
+    return None
+
+
 # Descriptive aliases used by signal-site adapters; all names point to the
 # same authority and do not create additional persistence or policy doors.
 signal_after_record = record_before_signal
@@ -342,6 +373,7 @@ def signal_worker(
     if final_signal is not True:
         raise SignalDispositionError("single-stage worker signal requires final_signal=True")
     projection = ledger.projection()
+    canonical_acceptance = _canonical_worker_acceptance(context)
     reservation = next(
         (value for value in projection.get("reservations", {}).values()
          if value.get("admission_receipt_id") == context.admission_receipt_id),
@@ -357,25 +389,17 @@ def signal_worker(
         receipt=context.admission_receipt_id, signal=signal_label,
         ladder_step=ladder_step,
     )
-    if reservation is None:
-        raise SignalDispositionError("worker receipt is not an active ledger reservation")
-    if reservation.get("closed"):
+    if reservation is None and canonical_acceptance is None:
+        raise SignalDispositionError("worker launch is not canonically accepted")
+    if reservation is not None and reservation.get("closed"):
         prior = projection.get("dispositions", {}).get(replay_id)
         if prior is not None:
             return {"payload": prior}
         raise SignalDispositionError("worker receipt is not an active ledger reservation")
-    for name in ("plan_id", "phase", "dispatch_family_id", "logical_dispatch_id", "selected_spec", "semantic_dispatch_fingerprint"):
-        if reservation.get(name) != getattr(context, name):
-            raise SignalDispositionError(f"worker receipt context mismatch: {name}")
-    marker = reservation.get("accepted_launch_marker")
-    if not isinstance(marker, dict) or marker.get("admission_receipt_id") != context.admission_receipt_id:
-        raise SignalDispositionError("worker signal requires an accepted launch marker")
-    if marker.get("worker_identity") != context.worker_identity:
-        raise SignalDispositionError("worker signal identity does not match accepted launch")
-    if not marker.get("victim_process_start_identity"):
-        raise SignalDispositionError("accepted launch lacks persisted process incarnation")
-    if marker.get("victim_process_start_identity") != context.victim_process_start_identity:
-        raise SignalDispositionError("worker process incarnation does not match accepted launch")
+    if reservation is not None:
+        for name in ("plan_id", "phase", "dispatch_family_id", "logical_dispatch_id", "selected_spec", "semantic_dispatch_fingerprint"):
+            if reservation.get(name) != getattr(context, name):
+                raise SignalDispositionError(f"worker receipt context mismatch: {name}")
     # A liveness/start-identity preflight is intentionally injectable for
     # supervisors and tests.  A failed preflight is an observation, never a
     # delivered worker disposition and never a signal attempt.
@@ -435,8 +459,9 @@ def signal_worker(
         ladder_step=ladder_step,
         confirmation_event_id=confirmation_event_id,
     )
+    marker = {"started_at": context.started_at}
     invoke = signal_fn or (lambda: os.kill(context.victim_pid, number))
-    if terminal_outcome is None:
+    if terminal_outcome is None and reservation is not None:
         from arnold_pipelines.megaplan.orchestration.phase_result import DispatchOutcome
         terminal_outcome = DispatchOutcome(
             kind="worker_disposition", launch_state="accepted",
@@ -449,7 +474,7 @@ def signal_worker(
             finished_at=marker.get("finished_at") or disposition.observed_at,
             disposition_id=disposition.disposition_id,
         )
-    if terminal_kwargs is None:
+    if terminal_kwargs is None and reservation is not None:
         terminal_kwargs = {
             "reservation_event_id": reservation.get("event_id"),
             "projection_key": reservation.get("projection_key"),
@@ -470,8 +495,8 @@ def signal_worker(
 
     return record_before_signal(
         ledger, disposition, invoke,
-        terminal_outcome=terminal_outcome,
-        terminal_kwargs=terminal_kwargs,
+        terminal_outcome=terminal_outcome if reservation is not None else None,
+        terminal_kwargs=terminal_kwargs if reservation is not None else None,
         preflight=final_identity_preflight,
     )
 
@@ -519,7 +544,7 @@ def _worker_observation(context: WorkerSignalContext, *, reason: str, observed: 
 
 
 def _ladder_terminal(ledger: IncidentLedger, context: WorkerSignalContext, disposition: WorkerDisposition, marker: dict[str, Any], reservation: dict[str, Any]) -> dict[str, Any]:
-    """Append the one worker-disposition terminal linked to *disposition*."""
+    """Project a terminal only for legacy reservations; canonical launches stay in OperationRun."""
     from arnold_pipelines.megaplan.orchestration.phase_result import DispatchOutcome
     outcome = DispatchOutcome(
         kind="worker_disposition", launch_state="accepted", plan_id=context.plan_id,
@@ -532,6 +557,8 @@ def _ladder_terminal(ledger: IncidentLedger, context: WorkerSignalContext, dispo
         finished_at=marker.get("finished_at") or disposition.observed_at,
         disposition_id=disposition.disposition_id,
     )
+    if not reservation:
+        return outcome.to_dict()
     terminal = ledger.append_terminal_outcome(
         outcome=outcome, reservation_event_id=reservation.get("event_id"),
         projection_key=reservation.get("projection_key"),
@@ -594,19 +621,21 @@ def signal_worker_ladder(
     Missing or invalid proof returns ``confirmation_pending`` without signal.
     """
     projection = ledger.projection()
+    canonical_acceptance = _canonical_worker_acceptance(context)
     reservation = next((r for r in projection.get("reservations", {}).values() if r.get("admission_receipt_id") == context.admission_receipt_id), None)
-    if not reservation:
-        raise SignalDispositionError("worker receipt is not an active ledger reservation")
-    if reservation.get("closed"):
+    if not reservation and canonical_acceptance is None:
+        raise SignalDispositionError("worker launch is not canonically accepted")
+    marker = {"started_at": context.started_at}
+    if reservation is not None and reservation.get("closed"):
         existing = [d for d in projection.get("dispositions", {}).values() if d.get("admission_receipt_id") == context.admission_receipt_id]
         terminal = next((t for t in projection.get("terminals", {}).values() if t.get("reservation_event_id") == reservation.get("event_id")), None)
         if terminal is not None:
             state = "already_dead" if any(d.get("ladder_step") == "term" for d in existing) and not any(d.get("ladder_step") == "kill" for d in existing) else "killed"
             return WorkerLadderResult(state, term_disposition=next((d for d in existing if d.get("ladder_step") == "term"), None), kill_disposition=next((d for d in existing if d.get("ladder_step") == "kill"), None), terminal_outcome=terminal)
         raise SignalDispositionError("worker receipt is not an active ledger reservation")
-    marker = reservation.get("accepted_launch_marker")
-    if not isinstance(marker, dict) or marker.get("worker_identity") != context.worker_identity or marker.get("victim_process_start_identity") != context.victim_process_start_identity:
-        raise SignalDispositionError("accepted launch identity is incomplete or mismatched")
+    # Exact worker identity and process incarnation are read from the
+    # canonical process-session resource above.  No IncidentLedger marker is
+    # consulted or accepted as launch authority.
     sustained = {"wedge", "stall", "idle", "timeout", "cgroup_oom"}
     # ``confirmation_event_id`` remains a compatibility alias for the TERM
     # proof only.  Escalation always needs a distinct later proof.

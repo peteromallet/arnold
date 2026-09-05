@@ -25,18 +25,26 @@ class LaunchStateRecord:
 class ControlledFinalLaunch:
     """The only primitive exposed to a production final-launch closure.
 
-    The adapter writes ``not_started`` before exposing the closure, changes to
-    ``entered`` immediately before calling it, and writes ``accepted`` as soon
-    as the closure returns an accepted worker value.  Exceptions after entry
-    are deliberately propagated so the shared seam can return an unresolved
-    reservation instead of guessing that no process was created.
+    The legacy adapter can project its historical custody sequence, but the
+    canonical adapter is read-only: ``launch_transaction`` writes admission,
+    accepted identity, and lifecycle state in the co-located operation store.
+    Exceptions after entry are returned as typed uncertainty so the shared
+    seam never guesses that no process was created.
     """
 
-    def __init__(self, receipt: WorkerAdmissionReceipt, *, ledger: IncidentLedger | None = None, actor: str = "controlled-final-launch", physical_operation_evidence: dict[str, Any] | None = None) -> None:
+    def __init__(self, receipt: WorkerAdmissionReceipt, *, ledger: IncidentLedger | None = None, actor: str = "controlled-final-launch", physical_operation_evidence: dict[str, Any] | None = None, canonical: bool = False) -> None:
         self.receipt = receipt
-        self.ledger = ledger or IncidentLedger(Path(receipt.execution_context.ledger_root))
+        # Canonical launches use OperationRun/FileBackedDurableOpsStore for
+        # admission, acceptance, and lifecycle.  The IncidentLedger remains
+        # available only to legacy custody/disposition paths; do not even
+        # construct it for the canonical adapter when no unrelated custody
+        # caller supplied one.
+        self.ledger = ledger if ledger is not None else (
+            None if canonical else IncidentLedger(Path(receipt.execution_context.ledger_root))
+        )
         self.actor = actor
         self.physical_operation_evidence = physical_operation_evidence
+        self.canonical = canonical
         self._called = False
         self._state = "not_started"
         self.accepted_started_at: str | None = None
@@ -60,6 +68,11 @@ class ControlledFinalLaunch:
         self._permanent_hold_outcome: Any = None
         # Reopen is a full-history validation boundary.  Never select a
         # strongest marker from a contradictory persisted sequence.
+        if self.canonical:
+            # The durable operation store owns admission/lifecycle/acceptance
+            # for migrated launches.  IncidentLedger remains available only
+            # to the signal/disposition custody adapter.
+            return
         self.ledger.projection()
         matching = [
             record.get("payload", {})
@@ -151,6 +164,24 @@ class ControlledFinalLaunch:
     def permanent_hold_outcome(self) -> Any:
         """The stable typed unresolved outcome for a legacy hold, if any."""
         return self._permanent_hold_outcome
+
+    def _canonical_process_identity(self) -> dict[str, Any] | None:
+        """Read exact accepted worker identity from OperationRun resources."""
+        try:
+            from arnold.runtime.durable_ops import FileBackedDurableOpsStore
+            root = Path(self.receipt.operation_store_root or self.context.operation_store_root or Path(self.context.ledger_root) / "ops")
+            store = FileBackedDurableOpsStore(root)
+            operation_id = self.receipt.operation_id or self.receipt.logical_dispatch_id
+            run = store.load_operation_run(operation_id)
+            if getattr(run.state, "value", run.state) != "running":
+                return None
+            for resource in store.list_typed_resources(operation_id):
+                identity = dict(resource.details).get("worker_identity")
+                if resource.resource_type.value == "process_session" and isinstance(identity, dict):
+                    return identity
+        except (OSError, KeyError, TypeError, ValueError):
+            return None
+        return None
 
     def _raise_permanent_hold(self) -> None:
         from arnold_pipelines.megaplan.types import CliError
@@ -506,6 +537,8 @@ class ControlledFinalLaunch:
         created here; an available parent handle is only reaped after the
         durable terminal append.
         """
+        if self.canonical:
+            return {"state": "unresolved", "reason": "canonical launch custody requires operation-store reconciliation"}
         from arnold_pipelines.megaplan.incident.disposition import record_disposition
         from arnold_pipelines.megaplan.incident.schema import ObservedProcessDeath
         from arnold_pipelines.megaplan.orchestration.phase_result import DispatchOutcome
@@ -540,8 +573,8 @@ class ControlledFinalLaunch:
             r for r in projection["reservations"].values()
             if r.get("event_id") == handoff["reservation_event_id"]
         )
-        marker = reservation.get("accepted_launch_marker") or {}
-        if not marker:
+        canonical_identity = self._canonical_process_identity()
+        if not canonical_identity:
             # Before the closure returns there is no accepted-launch marker,
             # hence no lawful worker terminal attribution.  Preserve custody
             # as a durable hold for an operator/restart reconciler; do not
@@ -587,9 +620,9 @@ class ControlledFinalLaunch:
             admission_receipt_id=handoff["admission_receipt_id"],
             semantic_dispatch_fingerprint=handoff["semantic_dispatch_fingerprint"],
             selected_spec=handoff["selected_spec"],
-            worker_identity=handoff["worker_identity"],
-            started_at=marker.get("started_at") or handoff.get("started_at") or observed_at,
-            finished_at=marker.get("finished_at") or finished_at,
+            worker_identity=canonical_identity,
+            started_at=handoff.get("started_at") or observed_at,
+            finished_at=finished_at,
             terminal_failure={"code": "observed_dead_unknown", "observation_id": observation_id, "reason": "spawned child died during cleanup custody"},
         )
         terminal = self.ledger.append_terminal_outcome(
@@ -700,6 +733,12 @@ class ControlledFinalLaunch:
         )
         from arnold_pipelines.megaplan.watchdog.worker_identity import read_process_start_identity
 
+        if self.canonical:
+            # A timeout is an observation/custody concern.  This adapter does
+            # not reopen the old ledger signal/terminal authority; a typed
+            # operation-store reconciliation must own any later action.
+            return {"state": "unresolved", "reason": "canonical timeout requires operation-store reconciliation"}
+
         registration = self.registered_child
         identity = self.registered_worker_identity
         start_identity = (identity or {}).get("process_start_identity") if isinstance(identity, dict) else None
@@ -727,9 +766,9 @@ class ControlledFinalLaunch:
             )
             if not isinstance(reservation, dict):
                 return {"state": "unresolved", "reason": "worker receipt is not an active ledger reservation"}
-            marker = reservation.get("accepted_launch_marker")
-            if not isinstance(marker, dict) or marker.get("worker_identity") != context.worker_identity:
-                return {"state": "unresolved", "reason": "accepted launch identity is incomplete or mismatched"}
+            canonical_identity = self._canonical_process_identity()
+            if not isinstance(canonical_identity, dict) or canonical_identity != context.worker_identity:
+                return {"state": "unresolved", "reason": "canonical launch identity is incomplete or mismatched"}
 
             def existing_terminal(disposition_id: str) -> dict[str, Any] | None:
                 return next(
@@ -851,10 +890,8 @@ class ControlledFinalLaunch:
                     semantic_dispatch_fingerprint=context.semantic_dispatch_fingerprint,
                     selected_spec=context.selected_spec,
                     worker_identity=context.worker_identity,
-                    started_at=marker.get("started_at") or context.started_at or observed_at,
-                    # Accepted-launch markers are authoritative for this
-                    # terminal's timing identity, including pre-dead replay.
-                    finished_at=marker.get("finished_at") or observed_at,
+                    started_at=context.started_at or observed_at,
+                    finished_at=observed_at,
                     terminal_failure={
                         "code": "observed_dead_unknown",
                         "observation_id": observation_id,
@@ -944,6 +981,15 @@ class ControlledFinalLaunch:
             raise RuntimeError("controlled final launch accepted out of order")
         if state == "closed" and self._state != "accepted":
             raise RuntimeError("controlled final launch closed out of order")
+        self._state = state
+        if self.canonical:
+            return {
+                "event_type": "canonical_operation_state",
+                "launch_state_identity": state,
+                "operation_id": self.receipt.operation_id,
+                "request_id": self.receipt.request_id,
+                "admission_receipt_id": self.receipt.admission_receipt_id,
+            }
         event = self.ledger.append_controlled_adapter_state(
             reservation_event_id=self.receipt.reservation_event_id,
             admission_receipt_id=self.receipt.admission_receipt_id,
@@ -962,7 +1008,6 @@ class ControlledFinalLaunch:
             ),
             actor=self.actor,
         )
-        self._state = state
         return event
 
     def run(self, launch: Callable[[WorkerExecutionContextRef], Any]) -> Any:
@@ -997,6 +1042,11 @@ class ControlledFinalLaunch:
         unresolved = self._unresolved_result(value)
         if unresolved is not None:
             unresolved = self._validate_unresolved_context(unresolved)
+            if self.canonical:
+                # The operation store owns canonical uncertainty and
+                # reconciliation.  Do not consult or append IncidentLedger
+                # custody projections here.
+                return unresolved
             # An unresolved launch is a valid typed custody result, not an
             # accepted worker result.  Preserve the durable handoff identity
             # when the callback already transferred cleanup custody.

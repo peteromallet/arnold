@@ -86,12 +86,11 @@ def test_resume_injects_managed_repair_route_into_tmux_session(
     assert sleeps == [operator_control._POST_LAUNCH_GRACE_SECONDS]
 
 
-@pytest.mark.parametrize("reservation_status, expected_status", [("authorized", "cancelled"), ("claimed", "claimed")])
-def test_pause_marker_door_cancels_only_preclaim_reservation(
+@pytest.mark.parametrize("reservation_status", ["authorized", "claimed"])
+def test_pause_marker_door_does_not_mutate_launch_reservation_projection(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     reservation_status: str,
-    expected_status: str,
 ) -> None:
     workspace = tmp_path / "workspace"
     marker_path = tmp_path / ".megaplan" / "cloud-sessions" / "demo.json"
@@ -127,7 +126,9 @@ def test_pause_marker_door_cancels_only_preclaim_reservation(
     )
     marker = json.loads(marker_path.read_text(encoding="utf-8"))
     assert marker["should_run"] is False
-    assert marker["babysitter_launch_reservation"]["status"] == expected_status
+    # Marker pause state is operator custody only; canonical launch authority
+    # lives in OperationRun and is never cancelled or accepted here.
+    assert marker["babysitter_launch_reservation"]["status"] == reservation_status
 
 
 def test_resume_no_push_preserves_dirty_milestone_checkout(

@@ -201,103 +201,17 @@ PY
 _check_acceptance_gate "$SPEC" "$PROJECT_DIR"
 
 # G10 (no ambient-python launch): the ambient `python -P -m arnold_pipelines.megaplan chain start` launch form is REMOVED — the chain start below runs under the generation interpreter ($GEN_INTERPRETER, resolved + verified above) with worktree-first PYTHONPATH and frozen dependencies from the immutable generation.
-LEASE_FILE="$PROJECT_DIR/.megaplan/.chain-drive-lease"
-CGROUP_ROOT="${ARNOLD_CHAIN_CGROUP_ROOT:-/sys/fs/cgroup}"
-BACKOFF_SECONDS="${ARNOLD_CHAIN_REDRIVE_BACKOFF_SECONDS:-30}"
-MIN_REDRIVE_HEADROOM=$((1024 * 1024 * 1024))
-
-# Keep the lease lock in the wrapper process.  The PID text is diagnostic;
-# flock is the atomic authority, so simultaneous watchdog/manual launches
-# cannot both pass and stale text left by SIGKILL cannot wedge a successor.
-mkdir -p "$PROJECT_DIR/.megaplan"
-exec 9>>"$LEASE_FILE"
-if ! flock -n 9; then
-    lease_pid="$(head -n 1 "$LEASE_FILE" 2>/dev/null || true)"
-    echo "[arnold-chain] chain drive lease held by pid ${lease_pid:-unknown}; another drive owns the chain"
-    exit 0
+LAUNCH_REQUEST_B64="${ARNOLD_CHAIN_LAUNCH_REQUEST_B64:-}"
+if [[ -z "$LAUNCH_REQUEST_B64" ]]; then
+    echo "[arnold-chain] authoritative launch request missing; controller must invoke the co-located engine" >&2
+    exit 78
 fi
-: >"$LEASE_FILE"
-printf '%s\n' "$$" >&9
 
-_oom_kill_count() {
-    awk '$1 == "oom_kill" { print $2; found=1; exit } END { if (!found) exit 1 }' \
-        "$CGROUP_ROOT/memory.events" 2>/dev/null
-}
-
-_memory_headroom() {
-    local current maximum
-    current="$(<"$CGROUP_ROOT/memory.current")" || return 1
-    maximum="$(<"$CGROUP_ROOT/memory.max")" || return 1
-    [[ "$current" =~ ^[0-9]+$ && "$maximum" =~ ^[0-9]+$ ]] || return 1
-    (( maximum >= current )) || return 1
-    printf '%s\n' "$((maximum - current))"
-}
-
-_run_chain_start() {
-    # Reassert immediately before dispatch as well as at wrapper admission;
-    # this closes the gap where a sourced hot env or supervisor hook changes
-    # launch-affecting variables between validation and the child process.
-    if arnold_materialize_launch_boundary "$EXPECTED_SESSION" "$ENGINE_DIR" "$ENGINE_DIR"; then :; else boundary_rc=$?; return "$boundary_rc"; fi
-    # A babysitter-owned chain drive must transfer ownership before the
-    # supervisor returns.  The producer records AgentBox's typed process
-    # resource first, then emits the occurrence-bound receipt consumed by the
-    # babysitter completion gate.  Ordinary non-occurrence chain starts retain
-    # their foreground behavior.
-    if [[ -n "${ARNOLD_CHAIN_OCCURRENCE_DIGEST:-}" ]]; then
-        local receipt_path
-        receipt_path="${ARNOLD_CHAIN_DRIVE_RECEIPT:-$PROJECT_DIR/.megaplan/chain-drive-launch-receipt-${ARNOLD_CHAIN_OCCURRENCE_DIGEST}.json}"
-        local drive_args=(
-            -m arnold_pipelines.megaplan.cloud.chain_drive
-            --session "$EXPECTED_SESSION"
-            --occurrence "$ARNOLD_CHAIN_OCCURRENCE_DIGEST"
-            --plan "$EXPECTED_PLAN_NAME"
-            --project-dir "$PROJECT_DIR"
-            --spec "$SPEC"
-            --engine-dir "$ENGINE_DIR"
-            --interpreter "$GEN_INTERPRETER"
-            --manifest "$PINNED_RUNTIME_MANIFEST"
-            --receipt "$receipt_path"
-            --canonical-log "$PROJECT_DIR/$CANONICAL_LOG"
-        )
-        if [ "$ONE_FLAG" = "--one" ]; then
-            drive_args+=(--one)
-        fi
-        env -u PYTHONHOME PYTHONSAFEPATH=1 PYTHONPATH="$ENGINE_DIR" \
-            "$GEN_INTERPRETER" -P "${drive_args[@]}"
-        return 0
-    fi
-    if [ "$ONE_FLAG" = "--one" ]; then
-        bash -lc "unset ARNOLD_LIVENESS_OWNER_PID ARNOLD_LIVENESS_OWNER_PROCESS_START; cd \"\$0\" && env -u PYTHONHOME PYTHONSAFEPATH=1 PYTHONPATH=\"\$0\" MEGAPLAN_TRUSTED_CONTAINER=1 \"\$3\" -P -m arnold_pipelines.megaplan chain start --spec \"\$1\" --project-dir \"\$2\" --one >> \"\$2/$CANONICAL_LOG\" 2>&1" "$ENGINE_DIR" "$SPEC" "$PROJECT_DIR" "$GEN_INTERPRETER"
-    else
-        bash -lc "unset ARNOLD_LIVENESS_OWNER_PID ARNOLD_LIVENESS_OWNER_PROCESS_START; cd \"\$0\" && env -u PYTHONHOME PYTHONSAFEPATH=1 PYTHONPATH=\"\$0\" MEGAPLAN_TRUSTED_CONTAINER=1 \"\$3\" -P -m arnold_pipelines.megaplan chain start --spec \"\$1\" --project-dir \"\$2\" >> \"\$2/$CANONICAL_LOG\" 2>&1" "$ENGINE_DIR" "$SPEC" "$PROJECT_DIR" "$GEN_INTERPRETER"
-    fi
-}
-
-# A normal signal exit is not enough evidence to redrive.  Retry only when
-# this attempt advanced the cgroup's typed oom_kill counter and the recovered
-# cgroup has at least 1 GiB free.  Three total attempts means two retries.
-for attempt in 1 2 3; do
-    oom_before="$(_oom_kill_count || true)"
-    if _run_chain_start; then
-        exit 0
-    else
-        drive_rc=$?
-    fi
-    (( drive_rc == 137 )) || exit "$drive_rc"
-    (( attempt < 3 )) || exit "$drive_rc"
-    [[ "$ONE_FLAG" != "--one" ]] || exit "$drive_rc"
-
-    oom_after="$(_oom_kill_count || true)"
-    if [[ ! "$oom_before" =~ ^[0-9]+$ || ! "$oom_after" =~ ^[0-9]+$ || "$oom_after" -le "$oom_before" ]]; then
-        echo "[arnold-chain] drive exited $drive_rc without a new cgroup OOM; not redriving" >&2
-        exit "$drive_rc"
-    fi
-    echo "[arnold-chain] cgroup OOM confirmed; waiting ${BACKOFF_SECONDS}s before retry $attempt/2" >&2
-    sleep "$BACKOFF_SECONDS"
-    headroom="$(_memory_headroom || true)"
-    if [[ ! "$headroom" =~ ^[0-9]+$ || "$headroom" -lt "$MIN_REDRIVE_HEADROOM" ]]; then
-        echo "[arnold-chain] cgroup OOM confirmed but post-backoff headroom is below 1 GiB; not redriving" >&2
-        exit "$drive_rc"
-    fi
-    echo "[arnold-chain] cgroup OOM confirmed; redriving (retry $attempt/2)" >&2
-done
+# This wrapper is a validation/transport shim only.  The engine owns the
+# operation store, session creation, identity query, and acceptance commit.
+if ! arnold_materialize_launch_boundary "$EXPECTED_SESSION" "$ENGINE_DIR" "$ENGINE_DIR"; then
+    exit $?
+fi
+exec env -u PYTHONHOME PYTHONSAFEPATH=1 PYTHONPATH="$ENGINE_DIR" \
+    "$GEN_INTERPRETER" -P -m arnold_pipelines.megaplan.cloud.chain_drive \
+    --request-b64 "$LAUNCH_REQUEST_B64"

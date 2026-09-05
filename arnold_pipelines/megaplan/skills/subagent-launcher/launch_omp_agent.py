@@ -507,18 +507,10 @@ def _terminate_timed_out_child(
             if identity_raw:
                 worker = json.loads(identity_raw)
             else:
-                # The accepted controlled-launch marker is the authoritative
-                # identity source when the managed caller cannot know the
-                # child's PID until Popen returns.  Never synthesize identity
-                # from PID/model alone.
-                projection = ledger.projection()
-                reservation = next((v for v in projection.get("reservations", {}).values() if v.get("admission_receipt_id") == context_ref.admission_receipt_id), None)
-                marker = reservation.get("accepted_launch_marker") if reservation else None
-                worker = marker.get("worker_identity") if isinstance(marker, dict) else None
-                if not isinstance(worker, dict):
-                    raise ValueError("accepted launch marker lacks worker identity")
-                if not process_start_identity:
-                    process_start_identity = str(marker.get("victim_process_start_identity") or "")
+                # The child cannot infer launch authority from a marker.  A
+                # missing explicit identity is unresolved and must not be
+                # replaced with a PID/model-shaped surrogate.
+                raise ValueError("canonical worker identity is missing")
             context = WorkerSignalContext.from_ref(
                 context_ref,
                 worker_identity=worker,
@@ -527,7 +519,7 @@ def _terminate_timed_out_child(
             )
         except Exception as exc:
             _eprint(f"[launch_omp_agent] warning: worker context unavailable: {exc}")
-            context = worker = ledger = None
+            context = worker = None
 
     def send_ladder() -> bool:
         if context is not None and ledger is not None:

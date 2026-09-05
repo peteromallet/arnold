@@ -11,7 +11,13 @@ from pathlib import Path
 from arnold_pipelines.megaplan.cloud.spec import CloudSpec, LocalSpec
 from arnold_pipelines.megaplan.types import CliError
 
-from .base import Provider, _logs_follow, _missing_cli_error, _write_redacted_output
+from .base import (
+    Provider,
+    _logs_follow,
+    _missing_cli_error,
+    _write_redacted_output,
+    parse_launch_engine_response,
+)
 
 
 INSTALL_LINK = "Install: https://docs.docker.com/get-docker/"
@@ -24,6 +30,9 @@ class LocalProvider(Provider):
         self._binary = shutil.which("docker")
         if self._binary is None:
             _missing_cli_error("docker", INSTALL_LINK.removeprefix("Install: "))
+
+    def authoritative_store_root(self) -> str:
+        return "/workspace/ops"
 
     def _deploy_dir(self) -> Path:
         from arnold_pipelines.megaplan.cloud.cli import _persistent_deploy_dir
@@ -140,6 +149,30 @@ class LocalProvider(Provider):
             self._compose_argv("exec", "-T", "agent", "bash", "-lc", command),
             surface="ssh_exec",
         )
+
+    def invoke_launch_engine(self, request: dict[str, object]) -> dict[str, object]:
+        """Run the engine inside the agent container beside its store."""
+        from arnold_pipelines.megaplan.cloud.chain_drive import (
+            encode_launch_request,
+            launch_engine_command,
+        )
+        try:
+            result = self._run(
+                self._compose_argv(
+                    "exec", "-T", "agent", "bash", "-lc",
+                    launch_engine_command(encode_launch_request(request)),
+                ),
+                surface="launch_engine",
+            )
+        except Exception as exc:
+            return {
+                "schema": "arnold.megaplan.cloud_launch_response.v1",
+                "result": "UNKNOWN",
+                "reason": "transport_unavailable",
+                "invoked": False,
+                "detail": f"{type(exc).__name__}: {exc}",
+            }
+        return parse_launch_engine_response(result.stdout or "", invoked=True)
 
     def upload_file(self, src: Path, dest: str) -> None:
         payload = base64.b64encode(src.read_bytes()).decode("ascii")

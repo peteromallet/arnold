@@ -7953,6 +7953,7 @@ def _production_worker_dispatch(
         timeout_budget_s=float(options.get("timeout_budget_s") or 3600.0),
         production_intent=True,
         ledger_root=root,
+        operation_store_root=Path(root) / "ops",
         admission_attempt=int(options.get("admission_attempt") or 1),
         # Production route liveness is backend-owned; caller options cannot
         # inject a substitute attestation.

@@ -364,7 +364,7 @@ printf '%s\\n' "$ARNOLD_CHAIN_GIT_HELPER" "$HOME" "$GIT_CONFIG_GLOBAL" "$PYTHONP
     assert "secret" not in result.stdout + result.stderr
 
 
-def test_all_chain_entrypoints_use_shared_post_hot_env_boundary() -> None:
+def test_chain_controller_delegates_to_canonical_engine() -> None:
     from arnold_pipelines.megaplan.cloud import chain_drive
 
     cli_command = _chain_start_command(
@@ -373,23 +373,15 @@ def test_all_chain_entrypoints_use_shared_post_hot_env_boundary() -> None:
         engine_dir="/workspace/runtime-candidates/demo",
         repair_session="native-build-forward-c2-780129da-20260903-r5",
     )
-    drive_command = chain_drive._command(
-        session="native-build-forward-c2-780129da-20260903-r5",
-        engine_dir=Path("/workspace/runtime-candidates/demo"),
-        interpreter=Path("/workspace/runtime-candidates/demo/.venv/bin/python"),
-        spec=Path("/workspace/project/chain.yaml"),
-        project_dir=Path("/workspace/project"),
-        canonical_log=Path("/workspace/project/chain.log"),
-        one=False,
-    )
+    drive_command = chain_drive.launch_engine_command("encoded-request")
     wrappers = Path(__file__).resolve().parents[2] / "arnold_pipelines/megaplan/cloud/wrappers"
     chain_source = (wrappers / "arnold-chain").read_text(encoding="utf-8")
     watchdog_source = (wrappers / "arnold-watchdog").read_text(encoding="utf-8")
     assert "arnold_materialize_launch_boundary" in cli_command
-    assert "arnold_materialize_launch_boundary" in drive_command
+    assert "chain_drive" in drive_command
     assert "arnold_materialize_launch_boundary" in chain_source
     assert "arnold_materialize_launch_boundary" in watchdog_source
-    for source in (cli_command, drive_command, chain_source, watchdog_source):
+    for source in (cli_command, chain_source, watchdog_source):
         if "cloud-hot-env" in source:
             assert source.index("cloud-hot-env") < source.index(
                 "arnold_materialize_launch_boundary"
@@ -425,23 +417,8 @@ def test_boundary_failure_preserves_rc_and_never_dispatches(
 
     from arnold_pipelines.megaplan.cloud import chain_drive
 
-    drive_command = chain_drive._command(
-        session="native-build-forward-c2-780129da-20260903-r5",
-        engine_dir=tmp_path,
-        interpreter=Path("/bin/echo"),
-        spec=tmp_path / "chain.yaml",
-        project_dir=tmp_path,
-        canonical_log=tmp_path / "chain.log",
-        one=False,
-    )
-    drive_result = subprocess.run(
-        ["bash", "-c", drive_command],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    assert drive_result.returncode == 78
-    assert "arnold_pipelines.megaplan" not in drive_result.stdout
+    drive_command = chain_drive.launch_engine_command("encoded-request")
+    assert "arnold_pipelines.megaplan.cloud.chain_drive" in drive_command
 
 
 def test_closed_profile_route_uses_authoritative_profile_not_session_generation() -> None:
@@ -770,10 +747,12 @@ def test_atomic_marker_writer_can_be_followed_by_shell_operator(tmp_path: Path) 
     )
 
     assert result.returncode == 0, result.stderr
-    assert json.loads(marker.read_text()) == {
-        "run_kind": "chain",
-        "session": "demo",
-    }
+    payload = json.loads(marker.read_text())
+    # Marker metadata is observational only; canonical admission/acceptance
+    # lives in OperationRun and enriches the projection with custody facts.
+    assert payload["run_kind"] == "chain"
+    assert payload["session"] == "demo"
+    assert payload["content_digest"]
 
 
 def test_tmux_chain_launch_command_is_valid_shell() -> None:
@@ -2611,6 +2590,14 @@ class _LaunchEpicProvider:
         self.uploads.append((src, dest))
         self.remote_files.add(dest)
 
+    def invoke_launch_engine(self, request: dict) -> dict:
+        self.launch_request = request
+        return {
+            "schema": "arnold.megaplan.cloud_launch_response.v1",
+            "result": "ACCEPTED",
+            "reason": "accepted",
+        }
+
     def ssh_exec(self, command: str) -> subprocess.CompletedProcess[str]:
         if "MEGAPLAN_RESET" in command:
             return subprocess.CompletedProcess([], 0, "", "")
@@ -2723,16 +2710,10 @@ def test_launch_epic_end_to_end_uploads_canonical_spec_and_tracks_watchdog(
     uploaded_remote_paths = {remote for _local, remote in provider.uploads}
     remote_spec = next(path for path in uploaded_remote_paths if path.endswith("/.megaplan/initiatives/demo/chain.yaml"))
     assert "/workspace/demo-" in remote_spec
-    marker = next(marker for marker in provider.markers.values() if marker["remote_spec"] == remote_spec)
-    assert marker["run_kind"] == "chain"
-    assert marker["allow_human_gates"] is False
-    assert marker["should_run"] is True
-    assert marker["operator_pause"] is None
-    assert (
-        '"$GEN_INTERPRETER" -P -m arnold_pipelines.megaplan chain start'
-        in marker["relaunch_command"]
-    )
-    assert f"--spec {remote_spec}" in marker["relaunch_command"]
+    assert not provider.markers
+    assert provider.launch_request["session"]
+    assert provider.launch_request["envelope"]["launch_spec"]["operation_type"] == "megaplan_chain"
+    assert provider.launch_request["envelope"]["launch_spec"]["expected_session_name"] == provider.launch_request["session"]
     assert remote_spec in provider.remote_files
 
 
@@ -3499,13 +3480,8 @@ def test_cloud_chain_persists_failed_launch_outcome_when_engine_ref_is_not_adver
             provider,
         )
 
-    assert excinfo.value.code == "engine_ref_not_advertised"
-    assert provider.markers
-    marker = next(iter(provider.markers.values()))
-    assert marker["remote_spec"].endswith("/.megaplan/initiatives/demo/chain.yaml")
-    assert marker["launch_outcome"]["status"] == "failed"
-    assert marker["launch_outcome"]["code"] == "engine_ref_not_advertised"
-    assert "not advertised" in marker["launch_outcome"]["detail"]
+    assert excinfo.value.code == "launch_unknown"
+    assert not provider.markers
 
 
 def test_cloud_epic_chain_persists_failed_launch_outcome_when_engine_ref_is_not_advertised(
@@ -3591,12 +3567,8 @@ def test_cloud_epic_chain_persists_failed_launch_outcome_when_engine_ref_is_not_
             provider,
         )
 
-    assert excinfo.value.code == "engine_ref_not_advertised"
-    assert provider.markers
-    marker = next(iter(provider.markers.values()))
-    assert marker["run_kind"] == "epic_chain"
-    assert marker["launch_outcome"]["status"] == "failed"
-    assert marker["launch_outcome"]["code"] == "engine_ref_not_advertised"
+    assert excinfo.value.code == "launch_unknown"
+    assert not provider.markers
 
 
 def test_sync_megaplan_uses_derived_chain_workspace(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

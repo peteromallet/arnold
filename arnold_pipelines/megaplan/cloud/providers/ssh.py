@@ -25,7 +25,13 @@ from arnold_pipelines.megaplan.cloud.spec import (
 )
 from arnold_pipelines.megaplan.types import CliError
 
-from .base import Provider, _logs_follow, _missing_cli_error, _write_redacted_output
+from .base import (
+    Provider,
+    _logs_follow,
+    _missing_cli_error,
+    _write_redacted_output,
+    parse_launch_engine_response,
+)
 from .ssh_preflight import (
     capacity_inventory_command,
     classify_container_inspect,
@@ -716,6 +722,9 @@ class SshProvider(Provider):
             _missing_cli_error("ssh", INSTALL_LINK.removeprefix("Install: "))
         if self._scp_binary is None and self._rsync_binary is None:
             _missing_cli_error("scp/rsync", INSTALL_LINK.removeprefix("Install: "))
+
+    def authoritative_store_root(self) -> str:
+        return "/workspace/ops"
 
     def _target(self) -> str:
         if self._validated_user:
@@ -3292,6 +3301,31 @@ class SshProvider(Provider):
                 surface="ssh_exec",
             ),
         )
+
+    def invoke_launch_engine(self, request: dict[str, Any]) -> dict[str, Any]:
+        """Invoke the engine inside the attested remote container.
+
+        The controller never opens the remote operation store.  The command
+        runs in the container that owns ``AgentBoxConfig.ops_store_root`` and
+        returns the engine's typed response unchanged; transport loss is
+        surfaced as ``UNKNOWN`` without a retry.
+        """
+        from arnold_pipelines.megaplan.cloud.chain_drive import (
+            encode_launch_request,
+            launch_engine_command,
+        )
+
+        try:
+            result = self.ssh_exec(launch_engine_command(encode_launch_request(request)))
+        except Exception as exc:
+            return {
+                "schema": "arnold.megaplan.cloud_launch_response.v1",
+                "result": "UNKNOWN",
+                "reason": "transport_unavailable",
+                "invoked": False,
+                "detail": f"{type(exc).__name__}: {exc}",
+            }
+        return parse_launch_engine_response(result.stdout or "", invoked=True)
 
     def upload_file(self, src: Path, dest: str) -> None:
         # Step 13F: upload_file is action-off — gate before any transport or

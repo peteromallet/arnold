@@ -8,6 +8,7 @@ resolution so the CLI can instantiate them on demand.
 from __future__ import annotations
 
 import abc
+import json
 import shlex
 import subprocess
 import sys
@@ -39,6 +40,29 @@ def megaplan_runtime_invocation(spec: CloudSpec) -> str:
             "cloud.megaplan.runtime_python must name the absolute pinned Megaplan interpreter",
         )
     return f"{shlex.quote(runtime_python)} -P -m arnold_pipelines.megaplan"
+
+
+def parse_launch_engine_response(raw: str, *, invoked: bool = True) -> dict[str, Any]:
+    """Parse one strict typed response line from the co-located engine."""
+    lines = [line.strip() for line in raw.splitlines() if line.strip()]
+    try:
+        payload = json.loads(lines[-1] if lines else "{}")
+    except json.JSONDecodeError:
+        return {
+            "schema": "arnold.megaplan.cloud_launch_response.v1",
+            "result": "UNKNOWN",
+            "reason": "malformed_engine_response",
+            "invoked": invoked,
+        }
+    if not isinstance(payload, dict) or payload.get("schema") != "arnold.megaplan.cloud_launch_response.v1":
+        return {
+            "schema": "arnold.megaplan.cloud_launch_response.v1",
+            "result": "UNKNOWN",
+            "reason": "malformed_engine_response",
+            "invoked": invoked,
+        }
+    payload["invoked"] = invoked
+    return payload
 
 
 @dataclass
@@ -122,6 +146,10 @@ def _write_redacted_output(
 class Provider(abc.ABC):
     supports_session = False
 
+    def authoritative_store_root(self) -> str | None:
+        """Configured store path as seen by the engine process, if known."""
+        return None
+
     def _process_adapter_evidence_root(self) -> Path:
         return Path(tempfile.gettempdir()) / "arnold-process-adapter-wbc"
 
@@ -162,6 +190,31 @@ class Provider(abc.ABC):
         source text for words such as ``git push``.
         """
         return self.ssh_exec(command)
+
+    def invoke_launch_engine(self, request: dict[str, Any]) -> dict[str, Any]:
+        """Invoke the co-located authoritative launch engine.
+
+        Providers may override the transport details, but the response is
+        always the engine's typed JSON result.  A transport failure is
+        explicitly ``UNKNOWN`` and is never retried by this boundary.
+        """
+        from arnold_pipelines.megaplan.cloud.chain_drive import (
+            encode_launch_request,
+            launch_engine_command,
+        )
+
+        command = launch_engine_command(encode_launch_request(request))
+        try:
+            result = self.ssh_exec(command)
+        except Exception as exc:
+            return {
+                "schema": "arnold.megaplan.cloud_launch_response.v1",
+                "result": "UNKNOWN",
+                "reason": "transport_unavailable",
+                "invoked": False,
+                "detail": f"{type(exc).__name__}: {exc}",
+            }
+        return parse_launch_engine_response(result.stdout or "", invoked=True)
 
     @abc.abstractmethod
     def upload_file(self, src: Path, dest: str) -> None:

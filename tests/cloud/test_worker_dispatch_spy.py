@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -99,41 +100,43 @@ def _typed_terminal(receipt: WorkerAdmissionReceipt, kind: str) -> DispatchOutco
     return DispatchOutcome(**common)
 
 
-@pytest.mark.parametrize("door", ("native", "omp", "managed"))
-def test_physical_door_transports_typed_terminal_categories(tmp_path: Path, door: str) -> None:
-    for kind in ("success", "ordinary_terminal_failure", "provider_exhausted", "worker_disposition"):
-        root = tmp_path / door / kind
+def test_all_physical_doors_use_operation_store_once(tmp_path: Path) -> None:
+    """Native, OMP, and managed callbacks share one canonical transaction."""
+    for door in ("native", "omp", "managed"):
+        root = tmp_path / door
         ledger = IncidentLedger(root)
-        receipt = require_production_worker_dispatch_runtime(request(root, ledger=ledger))
-        assert isinstance(receipt, WorkerAdmissionReceipt)
-        if kind == "worker_disposition":
-            original = ledger.append_terminal_outcome
-            ledger.append_terminal_outcome = lambda **kwargs: {"payload": {"terminal_outcome_id": "terminal"}}  # type: ignore[method-assign]
-        result = dispatch_with_admission(
-            request(root, ledger=ledger),
-            lambda _context, receipt=receipt, kind=kind: _typed_terminal(receipt, kind),
-            ledger=ledger,
-            gate=lambda _request, receipt=receipt: receipt,
-        )
-        if kind == "provider_exhausted":
-            # T8 consumes the accepted terminal at the shared seam and
-            # transports the first keyed observation as a scheduling hold.
-            assert isinstance(result, SchedulingCondition)
-            assert result.reason == "provider_observation_wait"
-        else:
-            assert isinstance(result, DispatchOutcome)
-            assert result.kind == kind
-        if kind == "worker_disposition":
-            ledger.append_terminal_outcome = original  # type: ignore[method-assign]
+        req = request(root, ledger=ledger, physical_door_id=door)
+        receipt = require_production_worker_dispatch_runtime(req)
+        calls: list[int] = []
+
+        def launch(_context, *, receipt=receipt):
+            calls.append(1)
+            identity = {"host": "host", "pid": 123, "boot_id": "boot", "process_start_identity": f"{door}-start"}
+            from arnold_pipelines.megaplan.cloud.worker_dispatch import LaunchResult, ManagedCommandResult
+            return LaunchResult(True, ManagedCommandResult(0, identity), identity)
+
+        result = dispatch_with_admission(req, launch, ledger=ledger, gate=lambda _request, receipt=receipt: receipt)
+        replay = dispatch_with_admission(req, launch, ledger=ledger, gate=lambda _request, receipt=receipt: receipt)
+        assert isinstance(result, DispatchOutcome) and result.kind == "success"
+        assert isinstance(replay, DispatchOutcome) and replay.kind == "success"
+        assert calls == [1]
+        assert ledger.read_nbf_events() == []
 
 
-def test_native_physical_door_transports_typed_terminal_categories(tmp_path: Path) -> None:
-    test_physical_door_transports_typed_terminal_categories(tmp_path, "native")
+def test_unknown_process_identity_never_retries(tmp_path: Path) -> None:
+    root = tmp_path / "unknown"
+    ledger = IncidentLedger(root)
+    req = request(root, ledger=ledger)
+    receipt = replace(require_production_worker_dispatch_runtime(req), production_intent=True)
+    calls: list[int] = []
 
+    def launch(_context):
+        calls.append(1)
+        identity = {"host": "host", "pid": 123, "boot_id": "boot"}
+        from arnold_pipelines.megaplan.cloud.worker_dispatch import LaunchResult, ManagedCommandResult
+        return LaunchResult(True, ManagedCommandResult(0, identity), identity)
 
-def test_omp_physical_door_transports_typed_terminal_categories(tmp_path: Path) -> None:
-    test_physical_door_transports_typed_terminal_categories(tmp_path, "omp")
-
-
-def test_managed_door_transports_typed_terminal_categories(tmp_path: Path) -> None:
-    test_physical_door_transports_typed_terminal_categories(tmp_path, "managed")
+    result = dispatch_with_admission(req, launch, ledger=ledger, gate=lambda _request: receipt)
+    assert isinstance(result, DispatchOutcome) and result.kind == "unresolved_launch"
+    assert calls == [1]
+    assert ledger.read_nbf_events() == []

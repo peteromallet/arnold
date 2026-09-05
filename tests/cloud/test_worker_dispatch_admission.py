@@ -92,15 +92,18 @@ def test_omp_static_catalog_can_accept_expired_id_but_live_gate_rejects(tmp_path
     assert result.code == "route_liveness_missing"
 
 
-def test_same_fingerprint_cannot_be_evaded_by_new_logical_id(tmp_path: Path) -> None:
+def test_new_logical_id_is_a_distinct_canonical_operation(tmp_path: Path) -> None:
     ledger = IncidentLedger(tmp_path)
     first = require_production_worker_dispatch_runtime(request(tmp_path, ledger=ledger))
     assert isinstance(first, WorkerAdmissionReceipt)
     second = require_production_worker_dispatch_runtime(
         request(tmp_path, logical_dispatch_id="another", ledger=ledger)
     )
-    assert isinstance(second, AdmissionRefusal)
-    assert second.code == "admission_rejected"
+    assert isinstance(second, WorkerAdmissionReceipt)
+    assert second.logical_dispatch_id == "another"
+    # IncidentLedger is not a launch registry; each physical operation is
+    # represented by its own canonical operation identity.
+    assert IncidentLedger(tmp_path).projection()["reservations"] == {}
 
 
 def test_native_proof_recomputes_authoritative_content_generation_and_digest(tmp_path: Path) -> None:
@@ -115,7 +118,9 @@ def test_native_proof_recomputes_authoritative_content_generation_and_digest(tmp
     assert isinstance(result, WorkerAdmissionReceipt)
     assert result.route_liveness_identity == proof["identity"]
     assert result.route_liveness_digest == proof["digest"]
-    assert len(IncidentLedger(tmp_path).projection()["reservations"]) == 1
+    # Admission is observation-only; OperationRun admission is committed by
+    # the physical dispatch transaction, not by this route-proof check.
+    assert IncidentLedger(tmp_path).projection()["reservations"] == {}
 
 
 def test_native_proof_rejects_stale_or_forged_proof_before_reservation(tmp_path: Path) -> None:
