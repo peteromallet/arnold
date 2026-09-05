@@ -28,6 +28,7 @@ from arnold_pipelines.megaplan.cloud.cli import (
     _chain_runtime_provenance_payload,
     _chain_runtime_marker_binding,
     _chain_start_command,
+    _cloud_launch_credentials_observation,
     _epic_chain_start_command,
     _manifest_runtime_activate_command,
     _parse_chain_runtime_binding,
@@ -176,6 +177,25 @@ def _go_prelaunch_capacity() -> dict[str, object]:
     }
 
 
+def test_cloud_credentials_observation_is_route_aware_and_secret_free(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("C2_CONFIGURED_SECRET", "value-not-emitted")
+    configured = replace(_cloud_spec(), secrets=["C2_CONFIGURED_SECRET"])
+    missing_probe = _cloud_launch_credentials_observation(configured, SimpleNamespace())
+    assert missing_probe["status"] == "unknown"
+    assert missing_probe["reason"] == "remote_credential_probe_unavailable"
+    assert "value-not-emitted" not in json.dumps(missing_probe)
+
+    credentialless = _cloud_launch_credentials_observation(_cloud_spec(), SimpleNamespace())
+    assert credentialless == {
+        "status": "not_applicable",
+        "identity": "credentialless_local",
+        "transport": "ssh",
+        "required": [],
+    }
+
+
 def _cloud_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -276,6 +296,10 @@ def test_cloud_chain_accepts_prepare_only() -> None:
 
     assert args.cloud_action == "chain"
     assert args.prepare_only is True
+    epic_args = _cloud_parser().parse_args(
+        ["cloud", "launch-epic", "initiative", "--prepare-only"]
+    )
+    assert epic_args.prepare_only is True
 
 
 def test_chain_start_command_sources_cloud_hot_env_before_launch() -> None:
@@ -2516,6 +2540,90 @@ def test_launch_epic_rejects_missing_north_star(tmp_path: Path) -> None:
     assert "NORTHSTAR.md" in getattr(excinfo.value, "message", str(excinfo.value))
 
 
+def test_launch_epic_rejects_noncanonical_before_materialization_or_filesystem_delta(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    app = tmp_path / "app"
+    brief_dir = app / ".megaplan" / "initiatives" / "incoming"
+    brief_dir.mkdir(parents=True)
+    subprocess.run(["git", "init"], cwd=app, check=True, capture_output=True, text=True)
+    (brief_dir / "NORTHSTAR.md").write_text("North star\n", encoding="utf-8")
+    (brief_dir / "m1.md").write_text("M1\n", encoding="utf-8")
+    before = sorted(
+        (path.relative_to(tmp_path), path.read_bytes())
+        for path in tmp_path.rglob("*")
+        if path.is_file()
+    )
+    monkeypatch.setattr(
+        "arnold_pipelines.megaplan.cloud.cli._materialize_canonical_epic_input",
+        lambda **_kwargs: pytest.fail("rejected launch must not materialize input"),
+    )
+
+    with pytest.raises(CliError) as excinfo:
+        _run_launch_epic_wrapper(
+            tmp_path,
+            argparse.Namespace(
+                spec_or_dir=str(brief_dir),
+                slug=None,
+                fresh=False,
+                no_git_refresh=True,
+                cloud_yaml=str(app / "cloud.yaml"),
+                prepare_only=False,
+            ),
+            _cloud_spec(),
+            SimpleNamespace(),
+        )
+
+    assert excinfo.value.code == "chain_spec_not_canonical"
+    after = sorted(
+        (path.relative_to(tmp_path), path.read_bytes())
+        for path in tmp_path.rglob("*")
+        if path.is_file()
+    )
+    assert after == before
+
+
+def test_chain_rejects_noncanonical_before_materialization_or_filesystem_delta(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    app = tmp_path / "app"
+    brief_dir = app / ".megaplan" / "initiatives" / "incoming"
+    brief_dir.mkdir(parents=True)
+    subprocess.run(["git", "init"], cwd=app, check=True, capture_output=True, text=True)
+    (brief_dir / "NORTHSTAR.md").write_text("North star\n", encoding="utf-8")
+    (brief_dir / "m1.md").write_text("M1\n", encoding="utf-8")
+    before = sorted(
+        (path.relative_to(tmp_path), path.read_bytes())
+        for path in tmp_path.rglob("*")
+        if path.is_file()
+    )
+    monkeypatch.setattr(
+        "arnold_pipelines.megaplan.cloud.cli._materialize_canonical_epic_input",
+        lambda **_kwargs: pytest.fail("rejected launch must not materialize input"),
+    )
+
+    with pytest.raises(CliError) as excinfo:
+        _run_chain_wrapper(
+            tmp_path,
+            argparse.Namespace(
+                spec=str(brief_dir),
+                idea_dir=None,
+                prepare_only=False,
+                allow_loose_chain_spec=False,
+            ),
+            _cloud_spec(),
+            SimpleNamespace(),
+        )
+
+    assert excinfo.value.code == "chain_spec_not_canonical"
+    after = sorted(
+        (path.relative_to(tmp_path), path.read_bytes())
+        for path in tmp_path.rglob("*")
+        if path.is_file()
+    )
+    assert after == before
+
+
 def test_launch_epic_materializes_canonical_layout_from_brief_dir(tmp_path: Path) -> None:
     app = tmp_path / "app"
     brief_dir = app / "incoming" / "research-plan-execute-epic"
@@ -2725,14 +2833,26 @@ def test_launch_epic_end_to_end_uploads_canonical_spec_and_tracks_watchdog(
     monkeypatch.setattr(Path, "home", lambda: tmp_path / "home")
 
     provider = _LaunchEpicProvider()
+    prepare_args = argparse.Namespace(
+        spec_or_dir=str(brief_dir),
+        slug=None,
+        fresh=True,
+        no_git_refresh=True,
+        cloud_yaml=str(app / "cloud.yaml"),
+        prepare_only=True,
+    )
+    assert _run_launch_epic_wrapper(tmp_path, prepare_args, _cloud_spec(), provider) == 0
+    canonical_spec = app / ".megaplan" / "initiatives" / "demo" / "chain.yaml"
+    assert canonical_spec.is_file()
     rc = _run_launch_epic_wrapper(
         tmp_path,
         argparse.Namespace(
-            spec_or_dir=str(brief_dir),
+            spec_or_dir=str(canonical_spec),
             slug=None,
             fresh=True,
             no_git_refresh=True,
             cloud_yaml=str(app / "cloud.yaml"),
+            prepare_only=False,
         ),
         _cloud_spec(),
         provider,

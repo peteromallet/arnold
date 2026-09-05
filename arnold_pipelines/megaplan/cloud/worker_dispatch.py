@@ -41,6 +41,8 @@ from arnold_pipelines.megaplan.orchestration.phase_result import (
     SchedulingCondition,
 )
 from arnold_pipelines.megaplan.types import AgentSpec, CliError, format_agent_spec, parse_agent_spec
+from agentbox.onboarding import detect as agentbox_detect
+from arnold_pipelines.megaplan.runtime import key_pool
 
 SCHEMA_VERSION = 1
 RECEIPT_DERIVATION_VERSION = "1"
@@ -117,6 +119,75 @@ def _worker_launch_envelope(receipt: "WorkerAdmissionReceipt") -> LaunchEnvelope
     )
 
 
+def _worker_credentials_observation(receipt: "WorkerAdmissionReceipt") -> dict[str, Any]:
+    """Prove credentials for the selected worker route without exposing them."""
+    if not str(receipt.provider or "").strip():
+        return {
+            "status": "unknown",
+            "identity": "unidentified_route",
+            "transport": "local",
+            "reason": "admission_route_provider_missing",
+        }
+    route = str(receipt.normalized_spec or "").strip()
+    try:
+        parsed = parse_agent_spec(route)
+    except (TypeError, ValueError):
+        return {"status": "unknown", "identity": "unparseable_route", "transport": "local"}
+    agent = parsed.agent.lower()
+    if agent in {"local", "shell", "process", "managed", "tmux"}:
+        return {
+            "status": "not_applicable",
+            "identity": "credentialless_local",
+            "transport": "local",
+        }
+    provider = agent
+    if agent == "omp":
+        model = str(parsed.model or "")
+        provider = model.split("/", 1)[0].strip().lower()
+    provider = {
+        "codex": "openai-codex",
+        "claude": "anthropic",
+        "shannon": "anthropic",
+    }.get(provider, provider)
+    env_backed = {"deepseek", "openrouter", "xai", "anthropic", "zai", "moonshot", "fireworks"}
+    if agent == "omp" and provider in env_backed:
+        try:
+            wired = bool(key_pool.has_keys(provider))
+        except Exception:
+            wired = False
+        if wired:
+            return {
+                "status": "available",
+                "identity": f"key_pool:{provider}",
+                "transport": "local",
+                "probe": "selected_key_pool",
+            }
+        return {
+            "status": "unknown",
+            "identity": f"key_pool:{provider}",
+            "transport": "local",
+            "reason": "selected_route_credentials_unproven",
+        }
+    try:
+        scan = agentbox_detect.scan_providers()
+        selected = next((item for item in scan.providers if item.id == provider), None)
+    except Exception:
+        selected = None
+    if selected is not None and selected.status == agentbox_detect.READY:
+        return {
+            "status": "available",
+            "identity": f"agentbox:{provider}",
+            "transport": "local",
+            "probe": "agentbox_read_only_scan",
+        }
+    return {
+        "status": "unknown",
+        "identity": provider or "unidentified_route",
+        "transport": "local",
+        "reason": "selected_route_credentials_unproven",
+    }
+
+
 def _worker_launch_preflight(
     receipt: "WorkerAdmissionReceipt", envelope: LaunchEnvelope
 ) -> Any:
@@ -173,9 +244,7 @@ def _worker_launch_preflight(
             "wbc_ref": str(root),
         },
         "credentials": {
-            "status": "available" if receipt.provider else "unknown",
-            "identity": receipt.provider,
-            "transport": "local",
+            **_worker_credentials_observation(receipt),
         },
         "runtime": {
             "status": "ready" if runtime_vector else "unknown",

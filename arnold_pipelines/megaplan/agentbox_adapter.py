@@ -27,7 +27,7 @@ from arnold_pipelines.megaplan.types import CliError
 
 from agentbox.completion import format_completion_dm
 from agentbox.config import AgentBoxConfig
-from agentbox.credentials.backend import list_credentials
+from agentbox.credentials.backend import _record_for
 from agentbox.github import ci_status_for_branch as github_ci_status_for_branch
 from agentbox.host import (
     HostLaunchResult,
@@ -458,16 +458,20 @@ def _check_required_credentials(
     manifest: CredentialManifest,
     environ: Mapping[str, str] | None = None,
 ) -> tuple[bool, str, list[str]]:
-    records = {
-        record.name: record for record in list_credentials(config, environ=environ)
-    }
     missing: list[str] = []
     stale: list[str] = []
 
     for requirement in manifest.credentials:
         if not requirement.required:
             continue
-        record = records.get(requirement.name)
+        # ``list_credentials`` is a user-facing mutating helper: it creates
+        # the credentials directory when absent.  Launch preflight must stay
+        # read-only, so inspect only the named record that this manifest
+        # requires.  ``_record_for`` reads env/meta/path state without mkdir.
+        try:
+            record = _record_for(config, requirement.name, environ)
+        except (KeyError, TypeError, ValueError):
+            record = None
         if record is None or not record.present:
             missing.append(requirement.name)
             continue

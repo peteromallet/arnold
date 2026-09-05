@@ -138,18 +138,18 @@ def test_missing_required_credentials_block_chain_launch_and_return_fix_command(
         command=["echo", "chain"],
     )
     run_paths = ensure_run_dir(agentbox_config, operation_id)
+    credentials_root = Path(agentbox_config.credentials_root)
+    assert not credentials_root.exists()
 
     monkeypatch.setattr(
-        "arnold_pipelines.megaplan.agentbox_adapter.list_credentials",
-        lambda config, environ=None: [
-            SimpleNamespace(
-                name="GITHUB_TOKEN",
-                provider="github",
-                present=False,
-                pushed=False,
-                test_status="untested",
-            )
-        ],
+        "arnold_pipelines.megaplan.agentbox_adapter._record_for",
+        lambda config, name, environ=None: SimpleNamespace(
+            name=name,
+            provider="github",
+            present=False,
+            pushed=False,
+            test_status="untested",
+        ),
     )
     monkeypatch.setattr(
         "arnold_pipelines.megaplan.agentbox_adapter.get_repo",
@@ -170,3 +170,4 @@ def test_missing_required_credentials_block_chain_launch_and_return_fix_command(
     assert "GITHUB_TOKEN" in str(exc)
     assert exc.diagnostics["fix_commands"] == ["agentbox creds push GITHUB_TOKEN"]
     assert exc.diagnostics["phase"] == "credential_preflight"
+    assert not credentials_root.exists()

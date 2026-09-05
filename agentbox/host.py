@@ -366,9 +366,14 @@ def _host_preflight_observations(
         "temp_mount": raw_capacity.get("temp_mount"),
     }
     network = read_only_network_observation(transport="local", host="localhost")
+    # The host door starts a local process and does not select a model/provider
+    # route.  A credentials directory (including an empty one) is not evidence
+    # of a usable credential, so record the explicit credentialless case.  The
+    # Megaplan adapter performs the existing named-record check before entering
+    # this door when its manifest requires a credential.
     credentials = {
-        "status": "available" if config.credentials_root.exists() else "unknown",
-        "identity": str(config.credentials_root),
+        "status": "not_applicable",
+        "identity": "credentialless_local",
         "transport": "local",
     }
     return {

@@ -387,51 +387,58 @@ def resume_session(
             raise RuntimeError("session already has a live runner")
     hold = marker.get(RESUME_HOLD_KEY)
     hold = hold if isinstance(hold, dict) else None
-    if hold is not None:
-        if (
-            hold.get("schema_version") != RESUME_HOLD_SCHEMA
-            or hold.get("active") is not True
-            or hold.get("session") != session
-            or hold.get("spec") != str(spec.resolve(strict=False))
-            or hold.get("workspace") != str(workspace.resolve(strict=False))
-            or not isinstance(hold.get("resume_authority"), dict)
-        ):
-            raise RuntimeError("operator resume hold is invalid or targets another session")
-        result = resume_chain(
+    if hold is not None and (
+        hold.get("schema_version") != RESUME_HOLD_SCHEMA
+        or hold.get("active") is not True
+        or hold.get("session") != session
+        or hold.get("spec") != str(spec.resolve(strict=False))
+        or hold.get("workspace") != str(workspace.resolve(strict=False))
+        or not isinstance(hold.get("resume_authority"), dict)
+    ):
+        raise RuntimeError("operator resume hold is invalid or targets another session")
+
+    def _resume_authority(*, verify_execution_binding: bool) -> dict[str, Any]:
+        """Apply the existing plan/chain CAS at the requested boundary."""
+        if hold is not None:
+            return resume_chain(
+                spec,
+                workspace,
+                actor=actor,
+                verify_execution_binding=verify_execution_binding,
+                expected_resume_authority=hold["resume_authority"],
+            )
+        if marker.get("should_run") is False and not isinstance(marker.get("operator_pause"), dict):
+            # Compatibility for authority-cleared holds created before the
+            # typed marker receipt existed.  Require the complete canonical
+            # marker identity; arbitrary marker-only stops remain fail-closed.
+            marker_session = marker.get("chain_session") or marker.get("session")
+            if (
+                marker_session != session
+                or marker.get("remote_spec") != str(spec.resolve(strict=False))
+                or marker.get("workspace") != str(workspace.resolve(strict=False))
+                or marker.get("retired") is True
+                or marker.get("superseded") is True
+            ):
+                raise RuntimeError("legacy authority-cleared hold lacks exact session custody")
+            return resume_chain(
+                spec,
+                workspace,
+                actor=actor,
+                verify_execution_binding=verify_execution_binding,
+                allow_legacy_authority_cleared_hold=True,
+            )
+        return resume_chain(
             spec,
             workspace,
             actor=actor,
-            verify_execution_binding=start_runner,
-            expected_resume_authority=hold["resume_authority"],
+            verify_execution_binding=verify_execution_binding,
         )
-    elif marker.get("should_run") is False and not isinstance(marker.get("operator_pause"), dict):
-        # Compatibility for authority-cleared holds created before the typed
-        # marker receipt existed.  Require the complete canonical marker
-        # identity; arbitrary marker-only stops remain fail-closed.
-        marker_session = marker.get("chain_session") or marker.get("session")
-        if (
-            marker_session != session
-            or marker.get("remote_spec") != str(spec.resolve(strict=False))
-            or marker.get("workspace") != str(workspace.resolve(strict=False))
-            or marker.get("retired") is True
-            or marker.get("superseded") is True
-        ):
-            raise RuntimeError("legacy authority-cleared hold lacks exact session custody")
-        result = resume_chain(
-            spec,
-            workspace,
-            actor=actor,
-            verify_execution_binding=start_runner,
-            allow_legacy_authority_cleared_hold=True,
-        )
-    else:
-        result = resume_chain(
-            spec,
-            workspace,
-            actor=actor,
-            verify_execution_binding=start_runner,
-        )
+
     if not start_runner:
+        # Authority-only resume retains its existing no-start semantics: it
+        # performs the control-plane CAS and writes only the hold projection;
+        # it does not run physical preflight or dispatch.
+        result = _resume_authority(verify_execution_binding=False)
         marker.pop("operator_pause", None)
         marker["should_run"] = False
         marker[RESUME_HOLD_KEY] = _resume_hold(
@@ -474,6 +481,21 @@ def resume_session(
         "expected_session_name": session,
         "process_session_identity": session,
     }
+    # Use the paused/held authority as an observation.  The actual plan/chain
+    # CAS is deliberately deferred until this complete physical preflight has
+    # been accepted.
+    resume_authority = (
+        hold.get("resume_authority")
+        if hold is not None
+        else marker.get("operator_pause")
+        if isinstance(marker.get("operator_pause"), dict)
+        else actor
+    )
+    resume_authority_ref = (
+        json.dumps(resume_authority, sort_keys=True, separators=(",", ":"))
+        if isinstance(resume_authority, dict)
+        else str(resume_authority)
+    )
     raw_capacity = read_only_capacity_observation(workspace, output_bound_bytes=0, temp_path=workspace)
     capacity = {
         "status": raw_capacity.get("status", "unknown"),
@@ -486,9 +508,9 @@ def resume_session(
     }
     observations = {
         "source": {"status": "current", "revision": str(spec.resolve()), "ref": str(spec.resolve()), "tree": str(spec.resolve())},
-        "authority": {"status": "current", "grant": str(result.get("resume_authority") or actor), "fence": session, "decision": "operator_resume"},
+        "authority": {"status": "current", "grant": resume_authority_ref, "fence": session, "decision": "operator_resume"},
         "custody": {"status": "present", "custody_ref": str(marker_path.resolve()), "wbc_ref": str(store_root.resolve())},
-        "credentials": {"status": "available", "identity": actor, "transport": "local"},
+        "credentials": {"status": "not_applicable", "identity": "credentialless_local", "transport": "local"},
         "runtime": {"status": "ready", "interpreter": sys.executable, "import_root": str(workspace), "source_revision": str(spec.resolve())},
         "command": {"status": "valid", "argv": [launch_command], "cwd": str(workspace), "env": managed_env},
         "namespace": {"status": "valid", "name": session},
@@ -505,6 +527,11 @@ def resume_session(
         launch_spec=launch_spec,
         preflight_digest=preflight.preflight_digest,
     )
+    if not preflight.accepted:
+        # No plan/chain CAS, marker write, store admission, or dispatch may
+        # follow a rejected physical preflight.
+        raise RuntimeError(f"operator resume launch was not accepted: {preflight.reason.value}")
+    result = _resume_authority(verify_execution_binding=True)
     store = FileBackedDurableOpsStore(store_root)
 
     def dispatch(candidate: LaunchEnvelope) -> str:

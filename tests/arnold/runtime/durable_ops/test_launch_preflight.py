@@ -70,6 +70,17 @@ def test_accepted_preflight_digest_is_the_envelope_admission_identity() -> None:
     assert decision.result is LaunchResult.ACCEPTED
 
 
+def test_credentialless_local_preflight_accepts_explicit_not_applicable() -> None:
+    observations = _observations()
+    observations["credentials"] = {
+        "status": "not_applicable",
+        "identity": "credentialless_local",
+        "transport": "local",
+    }
+    report = run_launch_preflight({"command": ["local-process"], "cwd": "/workspace"}, observations)
+    assert report.result is PreflightResult.ACCEPTED
+
+
 def test_missing_or_unknown_prerequisite_rejects_without_effects() -> None:
     observations = _observations()
     observations.pop("wbc", None)

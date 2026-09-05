@@ -89,6 +89,14 @@ _SECTION_GOOD_STATUSES = {
     section: (_GOOD_STATUSES | {"none", "not_found"} if section == "collision" else _GOOD_STATUSES)
     for section in PREFLIGHT_SECTIONS
 }
+# A local physical door may not consume model/provider credentials at all.
+# Keep that fact explicit in the report instead of treating a path or label as
+# proof that credentials exist.  This is intentionally scoped to the
+# credentials section; other prerequisite rows must remain positively proven.
+_SECTION_GOOD_STATUSES["credentials"] = _GOOD_STATUSES | {
+    "not_applicable",
+    "n/a",
+}
 _REQUIRED_FIELD_ALIASES: dict[str, tuple[tuple[str, ...], ...]] = {
     "source": (("revision", "source_revision"), ("ref", "source_ref"), ("tree", "source_tree")),
     "authority": (("grant", "grant_ref", "grant_id"), ("fence", "fence_ref", "fence_id"), ("decision", "decision_ref", "decision_id")),

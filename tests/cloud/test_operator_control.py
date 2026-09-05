@@ -259,6 +259,60 @@ def test_resume_authority_only_does_not_start_runner(
     }
 
 
+def test_resume_start_runner_preflight_rejects_before_cas_or_dispatch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    marker_path = tmp_path / ".megaplan" / "cloud-sessions" / "demo.json"
+    marker_path.parent.mkdir(parents=True)
+    marker = {
+        "session": "demo",
+        "workspace": str(workspace),
+        "run_kind": "chain",
+        "relaunch_command": "python -m demo",
+        "operator_pause": {"active": True},
+        "operation_store_root": str(tmp_path / "ops"),
+    }
+    marker_path.write_text(json.dumps(marker), encoding="utf-8")
+    before = marker_path.read_bytes()
+    resume_calls: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        operator_control,
+        "resume_chain",
+        lambda *args, **kwargs: resume_calls.append(dict(kwargs)) or pytest.fail("CAS must not run"),
+    )
+    rejected = type(
+        "RejectedPreflight",
+        (),
+        {
+            "accepted": False,
+            "reason": type("Reason", (), {"value": "credentials_unavailable"})(),
+            "preflight_digest": "digest",
+        },
+    )()
+    monkeypatch.setattr(operator_control, "run_launch_preflight", lambda *_a, **_k: rejected)
+    monkeypatch.setattr(
+        operator_control.subprocess,
+        "run",
+        lambda argv, **kwargs: subprocess.CompletedProcess(argv, 1 if argv[1] == "has-session" else 0),
+    )
+
+    with pytest.raises(RuntimeError, match="operator resume launch was not accepted"):
+        operator_control.resume_session(
+            spec=tmp_path / "chain.yaml",
+            workspace=workspace,
+            session="demo",
+            marker_path=marker_path,
+            actor="test",
+            start_runner=True,
+        )
+
+    assert resume_calls == []
+    assert marker_path.read_bytes() == before
+    assert not (tmp_path / "ops").exists()
+
+
 def test_resume_fails_closed_when_marker_changes_concurrently(
     tmp_path: Path, monkeypatch
 ) -> None:

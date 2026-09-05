@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -116,3 +117,26 @@ def test_worker_physical_preflight_fails_closed_on_unknown_venue_observations(
     assert {"credentials", "capacity", "network"}.issubset(
         {failure.split(":", 1)[0] for failure in report.failures}
     )
+
+
+def test_worker_provider_label_alone_does_not_prove_credentials(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    request_value = request(tmp_path)
+    receipt = replace(
+        require_production_worker_dispatch_runtime(request_value),
+        production_intent=True,
+        provider="codex",
+    )
+    monkeypatch.setattr(
+        worker_dispatch.agentbox_detect,
+        "scan_providers",
+        lambda: SimpleNamespace(
+            providers=(SimpleNamespace(id="openai-codex", status="missing"),)
+        ),
+    )
+    report = worker_dispatch._worker_launch_preflight(
+        receipt, worker_dispatch._worker_launch_envelope(receipt)
+    )
+    assert report.accepted is False
+    assert any(failure.startswith("credentials:") for failure in report.failures)

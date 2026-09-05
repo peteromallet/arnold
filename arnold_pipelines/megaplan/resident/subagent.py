@@ -24,7 +24,8 @@ from pathlib import Path
 from typing import Any, Literal
 
 from agentbox.redaction import redact_text
-from arnold.agent.contracts import AgentSpec, format_agent_spec
+from arnold.agent.contracts import AgentSpec, format_agent_spec, parse_agent_spec
+from agentbox.onboarding import detect as agentbox_detect
 from arnold.agent.routing import ManagedAgentRoute, resolve_managed_agent_route
 from arnold.runtime.durable_ops import (
     FileBackedDurableOpsStore,
@@ -54,6 +55,7 @@ from arnold_pipelines.megaplan.managed_agent import (
     certify_managed_worker_launch,
     signal_managed_process,
 )
+from arnold_pipelines.megaplan.runtime import key_pool
 from .config import ResidentConfig
 from .git_custody import (
     GitCustodyError,
@@ -3363,6 +3365,67 @@ def _resident_ops_store_root(manifest_path: Path) -> Path:
     return manifest_path.parent.parent / ".durable-ops"
 
 
+def _resident_credentials_observation(manifest: Mapping[str, Any]) -> dict[str, Any]:
+    """Prove the manifest's selected model route without exposing credentials."""
+    backend = str(manifest.get("backend") or "").strip().lower()
+    model = str(manifest.get("model_spec") or manifest.get("model") or "").strip()
+    if backend in {"", "local", "shell", "process", "managed", "tmux", "auto"}:
+        return {
+            "status": "not_applicable",
+            "identity": "credentialless_local",
+            "transport": "local",
+        }
+    if backend == "omp":
+        route = model if model.startswith("omp:") else f"omp:{model}" if model else "omp"
+    else:
+        route = f"{backend}:{model}" if model else backend
+    try:
+        parsed = parse_agent_spec(route)
+    except (TypeError, ValueError):
+        return {"status": "unknown", "identity": "unparseable_route", "transport": "local"}
+    provider = parsed.agent.lower()
+    if provider == "omp":
+        provider = str(parsed.model or "").split("/", 1)[0].strip().lower()
+    provider = {"codex": "openai-codex", "claude": "anthropic", "shannon": "anthropic"}.get(provider, provider)
+    env_backed = {"deepseek", "openrouter", "xai", "anthropic", "zai", "moonshot", "fireworks"}
+    if backend == "omp" and provider in env_backed:
+        try:
+            wired = bool(key_pool.has_keys(provider))
+        except Exception:
+            wired = False
+        if wired:
+            return {
+                "status": "available",
+                "identity": f"key_pool:{provider}",
+                "transport": "local",
+                "probe": "selected_key_pool",
+            }
+        return {
+            "status": "unknown",
+            "identity": f"key_pool:{provider}",
+            "transport": "local",
+            "reason": "selected_route_credentials_unproven",
+        }
+    try:
+        scan = agentbox_detect.scan_providers()
+        selected = next((item for item in scan.providers if item.id == provider), None)
+    except Exception:
+        selected = None
+    if selected is not None and selected.status == agentbox_detect.READY:
+        return {
+            "status": "available",
+            "identity": f"agentbox:{provider}",
+            "transport": "local",
+            "probe": "agentbox_read_only_scan",
+        }
+    return {
+        "status": "unknown",
+        "identity": provider or "unidentified_route",
+        "transport": "local",
+        "reason": "selected_route_credentials_unproven",
+    }
+
+
 def _resident_launch_preflight(
     manifest_path: Path,
     manifest: Mapping[str, Any],
@@ -3439,9 +3502,7 @@ def _resident_launch_preflight(
             "wbc_ref": str(store_root.resolve()),
         },
         "credentials": {
-            "status": "available" if manifest.get("backend") else "unknown",
-            "identity": str(manifest.get("backend") or "resident"),
-            "transport": "local",
+            **_resident_credentials_observation(manifest),
         },
         "runtime": {
             "status": "ready",

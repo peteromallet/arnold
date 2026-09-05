@@ -774,6 +774,11 @@ def _register_cloud_subcommands(cloud_parser: argparse.ArgumentParser) -> None:
         action="store_true",
         help="Pass --no-git-refresh to the remote chain start command",
     )
+    launch_epic_parser.add_argument(
+        "--prepare-only",
+        action="store_true",
+        help="Canonicalize and upload epic inputs without starting a runner.",
+    )
     _add_repo_override_args(launch_epic_parser)
 
     preflight_parser = cloud_sub.add_parser(
@@ -2389,6 +2394,44 @@ def _normalized_chain_upload_spec(
 
 def _missing_configured_secrets(spec: CloudSpec, env: dict[str, str]) -> list[str]:
     return sorted(name for name in spec.secrets if not env.get(name))
+
+
+def _cloud_launch_credentials_observation(spec: CloudSpec, provider: Any) -> dict[str, Any]:
+    """Observe the configured cloud route without exposing credential values.
+
+    A configured secret name is only a requirement declaration.  SSH launches
+    additionally need the existing read-only provider/container probe to be
+    available; provider labels and paths are not credential proof.  Local
+    credentialless doors report an explicit N/A row.
+    """
+    missing = _missing_configured_secrets(spec, os.environ)
+    transport = "ssh" if spec.provider == "ssh" else "docker" if spec.provider == "local" else "local"
+    observation: dict[str, Any] = {
+        "status": "not_applicable" if not spec.secrets else "unknown",
+        "identity": "credentialless_local" if not spec.secrets else "configured_cloud_route",
+        "transport": transport,
+        "required": sorted(spec.secrets),
+    }
+    if not spec.secrets:
+        return observation
+    if missing:
+        observation.update({"status": "unknown", "reason": "missing_configured_secret", "missing": missing})
+        return observation
+    if spec.provider != "ssh":
+        if spec.secrets:
+            observation.update({"status": "available", "identity": "configured_secret", "probe": "local_environment_presence"})
+        return observation
+    # The SSH provider's existing container observation is read-only and is
+    # the route probe used by cloud preflight.  Do not substitute a host/path
+    # label when this proof is unavailable.
+    remote = _provider_container_observation(provider)
+    if remote is None:
+        observation.update({"status": "unknown", "reason": "remote_credential_probe_unavailable"})
+    elif _container_collector_ready(remote):
+        observation.update({"status": "available", "identity": "configured_secret", "probe": "ssh_container_collector"})
+    else:
+        observation.update({"status": "unknown", "reason": "remote_credential_probe_failed"})
+    return observation
 
 
 def _remote_dependency_check_command(commands: list[str]) -> str:
@@ -5914,6 +5957,25 @@ def _run_authoritative_chain_wrapper(root: Path, args: argparse.Namespace, spec:
     from arnold_pipelines.megaplan.cloud.chain_drive import build_launch_request
 
     if not bool(getattr(args, "_canonicalized_epic", False)):
+        # Launch mode must not canonicalize loose input as a side effect of
+        # attempting a launch.  ``--prepare-only`` is the explicit preparation
+        # boundary; an already canonical initiative is safe to inspect and
+        # launch without materialization.
+        source = Path(args.spec).expanduser().resolve()
+        source_spec = source if source.is_file() else source / "chain.yaml"
+        source_root = _chain_project_root(source_spec, root)
+        if not bool(getattr(args, "prepare_only", False)) and not (
+            source_spec.exists() and is_canonical_chain_spec(source_spec, source_root)
+        ):
+            raise CliError(
+                "chain_spec_not_canonical",
+                (
+                    "cloud chain launch requires an already-canonical initiative; "
+                    "run `cloud chain <input> --prepare-only` first to materialize "
+                    "loose input"
+                ),
+                extra={"spec": str(source_spec), "project_root": str(source_root)},
+            )
         materialized = _materialize_canonical_epic_input(root=root, spec=spec, spec_or_dir=args.spec)
         args = argparse.Namespace(
             **{
@@ -5991,7 +6053,7 @@ def _run_authoritative_chain_wrapper(root: Path, args: argparse.Namespace, spec:
         "source": {"status": "current", "revision": str(spec.megaplan.ref), "ref": str(spec.megaplan.ref), "tree": str(project_root)},
         "authority": {"status": "current", "grant": launch_ctx.identity, "fence": launch_ctx.identity, "decision": launch_ctx.identity},
         "custody": {"status": "present", "custody_ref": launch_ctx.workspace, "wbc_ref": launch_ctx.workspace},
-        "credentials": {"status": "available" if not _missing_configured_secrets(spec, os.environ) else "unknown", "identity": spec.provider, "transport": spec.provider},
+        "credentials": _cloud_launch_credentials_observation(spec, provider),
         "runtime": {"status": "present", "interpreter": spec.megaplan.runtime_python or "python", "import_root": spec.megaplan.src_path, "source_revision": str(spec.megaplan.ref)},
         "command": {"status": "valid", "argv": command, "cwd": launch_ctx.workspace, "env": {}},
         "namespace": {"status": "valid", "name": launch_ctx.session_name},
@@ -6065,6 +6127,22 @@ def _prepare_chain_inputs(root, args, spec, provider, local_spec_path, project_r
 def _run_chain_wrapper(root: Path, args: argparse.Namespace, spec: CloudSpec, provider) -> int:
     return _run_authoritative_chain_wrapper(root, args, spec, provider)
 def _run_launch_epic_wrapper(root: Path, args: argparse.Namespace, spec: CloudSpec, provider) -> int:
+    source = Path(args.spec_or_dir).expanduser().resolve()
+    source_spec = source if source.is_file() else source / "chain.yaml"
+    source_root = _chain_project_root(source_spec, root)
+    prepare_only = bool(getattr(args, "prepare_only", False))
+    if not prepare_only and not (
+        source_spec.exists() and is_canonical_chain_spec(source_spec, source_root)
+    ):
+        raise CliError(
+            "chain_spec_not_canonical",
+            (
+                "cloud launch-epic requires an already-canonical initiative; "
+                "run `cloud launch-epic <input> --prepare-only` first to "
+                "materialize loose input"
+            ),
+            extra={"spec": str(source_spec), "project_root": str(source_root)},
+        )
     materialized = _materialize_canonical_epic_input(
         root=root,
         spec=spec,
@@ -6084,6 +6162,7 @@ def _run_launch_epic_wrapper(root: Path, args: argparse.Namespace, spec: CloudSp
             "idea_dir": str(materialized.project_root),
             "_canonicalized_epic": True,
             "_generated_canonical_files": materialized.created_files,
+            "prepare_only": prepare_only,
         }
     )
     return _run_chain_wrapper(root, chain_args, spec, provider)
@@ -6320,7 +6399,7 @@ def _run_epic_chain_wrapper(root: Path, args: argparse.Namespace, spec: CloudSpe
         "source": {"status": "current", "revision": str(spec.megaplan.ref), "ref": str(spec.megaplan.ref), "tree": str(project_root)},
         "authority": {"status": "current", "grant": launch_ctx.identity, "fence": launch_ctx.identity, "decision": launch_ctx.identity},
         "custody": {"status": "present", "custody_ref": launch_ctx.workspace, "wbc_ref": launch_ctx.workspace},
-        "credentials": {"status": "available" if not _missing_configured_secrets(spec, os.environ) else "unknown", "identity": spec.provider, "transport": spec.provider},
+        "credentials": _cloud_launch_credentials_observation(spec, provider),
         "runtime": {"status": "present", "interpreter": spec.megaplan.runtime_python or "python", "import_root": spec.megaplan.src_path, "source_revision": str(spec.megaplan.ref)},
         "command": {"status": "valid", "argv": command, "cwd": launch_ctx.workspace, "env": {}},
         "namespace": {"status": "valid", "name": launch_ctx.session_name},
