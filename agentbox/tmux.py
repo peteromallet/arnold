@@ -44,6 +44,11 @@ class SessionStatus:
     state: str
     exists: bool
     detail: str | None = None
+    operation_id: str | None = None
+    request_id: str | None = None
+    envelope_digest: str | None = None
+    process_session_identity: str | None = None
+    identity_available: bool = False
 
 
 def session_name(operation_id: str) -> str:
@@ -62,18 +67,25 @@ def new_session_argv(
     cwd: Path | str | None = None,
     stdout_path: Path | str | None = None,
     stderr_path: Path | str | None = None,
+    environment: Mapping[str, str] | None = None,
 ) -> list[str]:
     """Build argv for a detached tmux session."""
 
     argv = [TMUX_BIN, "new-session", "-d", "-s", name]
     if cwd is not None:
         argv.extend(["-c", str(cwd)])
+    for key, value in sorted((environment or {}).items()):
+        argv.extend(["-e", f"{key}={value}"])
     argv.append(_command_for_shell(command, stdout_path=stdout_path, stderr_path=stderr_path))
     return argv
 
 
 def has_session_argv(name: str) -> list[str]:
     return [TMUX_BIN, "has-session", "-t", name]
+
+
+def show_environment_argv(name: str) -> list[str]:
+    return [TMUX_BIN, "show-environment", "-t", name]
 
 
 def capture_pane_argv(name: str, *, lines: int = 200) -> list[str]:
@@ -119,6 +131,7 @@ def start_session(
     *,
     cwd: Path | str | None = None,
     run_paths: RunDirPaths | None = None,
+    identity: Mapping[str, str] | None = None,
 ) -> str:
     """Start a detached tmux session and return its deterministic name."""
 
@@ -130,17 +143,64 @@ def start_session(
             cwd=cwd,
             stdout_path=run_paths.stdout_path if run_paths else None,
             stderr_path=run_paths.stderr_path if run_paths else None,
+            environment=identity,
         )
     )
     return name
 
 
-def inspect_session(name: str) -> SessionStatus:
-    """Return structured live/missing/dead status for a tmux session."""
+def inspect_session(name: str, *, expected_identity: Mapping[str, str] | None = None) -> SessionStatus:
+    """Return live state and exact tmux-provided launch identity.
+
+    The tmux server environment is the query surface.  No marker, receipt, or
+    sidecar file is consulted; missing or mismatched identity is unavailable.
+    """
 
     result = run_tmux(has_session_argv(name), check=False)
-    if result.returncode == 0:
+    if result.returncode == 0 and expected_identity is None:
         return SessionStatus(session_name=name, state="running", exists=True)
+    if result.returncode == 0:
+        env_result = run_tmux(show_environment_argv(name), check=False)
+        if env_result.returncode != 0:
+            return SessionStatus(
+                session_name=name,
+                state="unavailable",
+                exists=True,
+                detail=env_result.stderr or env_result.stdout or "tmux identity query failed",
+            )
+        values: dict[str, str] = {}
+        for line in env_result.stdout.splitlines():
+            if "=" in line and not line.startswith("-"):
+                key, value = line.split("=", 1)
+                values[key] = value
+        identity = {
+            "operation_id": values.get("ARNOLD_LAUNCH_OPERATION_ID"),
+            "request_id": values.get("ARNOLD_LAUNCH_REQUEST_ID"),
+            "envelope_digest": values.get("ARNOLD_LAUNCH_ENVELOPE_DIGEST"),
+            "process_session_identity": values.get("ARNOLD_LAUNCH_PROCESS_IDENTITY"),
+        }
+        available = all(isinstance(value, str) and value for value in identity.values())
+        expected_keys = {
+            "operation_id": "ARNOLD_LAUNCH_OPERATION_ID",
+            "request_id": "ARNOLD_LAUNCH_REQUEST_ID",
+            "envelope_digest": "ARNOLD_LAUNCH_ENVELOPE_DIGEST",
+            "process_session_identity": "ARNOLD_LAUNCH_PROCESS_IDENTITY",
+        }
+        matches = available and all(
+            values.get(expected_keys.get(key, key)) == value
+            for key, value in (expected_identity or {}).items()
+        )
+        return SessionStatus(
+            session_name=name,
+            state="running" if matches else "unavailable",
+            exists=True,
+            detail=None if matches else "exact launch identity unavailable or mismatched",
+            operation_id=identity["operation_id"],
+            request_id=identity["request_id"],
+            envelope_digest=identity["envelope_digest"],
+            process_session_identity=identity["process_session_identity"],
+            identity_available=bool(matches),
+        )
     detail = result.stderr or result.stdout or None
     if detail and "no server running" in detail.lower():
         return SessionStatus(session_name=name, state="dead", exists=False, detail=detail)
@@ -235,6 +295,7 @@ __all__ = [
     "new_session_argv",
     "record_process_session_resource",
     "run_tmux",
+    "show_environment_argv",
     "send_keys_argv",
     "session_name",
     "start_session",

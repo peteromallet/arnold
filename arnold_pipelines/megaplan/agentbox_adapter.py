@@ -21,7 +21,6 @@ from arnold_pipelines.megaplan.chain.status import (
     ChainStatusSnapshot,
     build_chain_status_snapshot,
 )
-from arnold_pipelines.megaplan.cloud.liveness_lease import prepare_managed_run_marker
 from arnold_pipelines.megaplan.custody.process_adapter_wbc import (
     begin_process_adapter_attempt,
 )
@@ -38,6 +37,7 @@ from agentbox.host import (
     HostPreparedResources,
     prepare_host_resources,
     start_host_session,
+    launch_host,
 )
 from agentbox.operations import (
     load_agentbox_operation,
@@ -111,6 +111,93 @@ class MegaplanChainHandler:
         lock_timeout_seconds: float = 30.0,
     ) -> MegaplanChainLaunchResult:
         """Prepare AgentBox resources, validate the chain spec, then start tmux."""
+
+        # The durable launch engine owns preflight, admission, exactly-one
+        # dispatch, identity observation, and accepted-store transition.  The
+        # adapter only validates the immutable request and supplies the command
+        # factory for the physical AgentBox door.
+        canonical_root = get_repo(config, repo_name).path.expanduser().resolve()
+        resolved_canonical_spec = _resolve_spec_path(spec_path, canonical_root)
+        try:
+            spec = load_spec(resolved_canonical_spec)
+            validate_paths(spec, canonical_root)
+        except CliError as exc:
+            raise MegaplanChainLaunchError(
+                exc.code,
+                exc.message,
+                diagnostics=_validation_diagnostics(
+                    kind=exc.code,
+                    message=exc.message,
+                    spec_path=resolved_canonical_spec,
+                    project_root=canonical_root,
+                    extra=exc.extra,
+                ),
+            ) from exc
+        except Exception as exc:
+            raise MegaplanChainLaunchError(
+                "validation_failed",
+                str(exc),
+                diagnostics=_validation_diagnostics(
+                    kind=type(exc).__name__,
+                    message=str(exc),
+                    spec_path=resolved_canonical_spec,
+                    project_root=canonical_root,
+                ),
+            ) from exc
+        manifest = _load_credential_manifest(resolved_canonical_spec)
+        if manifest is not None:
+            ok, message, fix_commands = _check_required_credentials(config, manifest)
+            if not ok:
+                raise MegaplanChainLaunchError(
+                    "credential_preflight_failed",
+                    message,
+                    diagnostics=_credential_diagnostics(
+                        message=message,
+                        fix_commands=fix_commands,
+                        manifest=manifest,
+                    ),
+                )
+        launch_metadata = {
+            "adapter": "megaplan_chain",
+            "spec_path": str(spec_path),
+            "resolved_spec_path_relative": str(Path(spec_path)),
+            "validation": {
+                "status": "passed",
+                "spec_path": str(resolved_canonical_spec),
+                "project_root": str(canonical_root),
+            },
+        }
+        if metadata:
+            launch_metadata.update(dict(metadata))
+        relative_spec = Path(spec_path) if not Path(spec_path).is_absolute() else Path(spec_path).name
+        host_result = launch_host(
+            config,
+            operation_id,
+            command=("<deferred-command>",),
+            repo_names=(repo_name,),
+            base_refs={repo_name: base_ref} if base_ref else None,
+            metadata=launch_metadata,
+            lock_timeout_seconds=lock_timeout_seconds,
+            operation_type=MEGAPLAN_CHAIN_OPERATION_TYPE,
+            launch_intent="megaplan_chain",
+            command_factory=lambda project_root: _chain_start_command(
+                (project_root / relative_spec).resolve(), project_root
+            ),
+        )
+        project_root = _primary_worktree(
+            HostPreparedResources(
+                operation_id=host_result.operation_id,
+                run_paths=host_result.run_paths,
+                requested_repo_names=(repo_name,),
+                worktrees=host_result.worktrees,
+                log_resources=host_result.log_resources,
+            )
+        ) if host_result.worktrees else canonical_root
+        return MegaplanChainLaunchResult(
+            host_result=host_result,
+            resolved_spec_path=(project_root / relative_spec).resolve(),
+            project_root=project_root,
+        )
 
         existing = _load_existing_megaplan_operation(config, operation_id)
         if existing is not None:
@@ -245,20 +332,10 @@ class MegaplanChainHandler:
             ) from exc
 
         managed_session = agentbox_session_name(operation_id)
-        marker_dir = project_root / ".megaplan" / "cloud-sessions"
-        prepare_managed_run_marker(
-            managed_session,
-            marker_dir=marker_dir,
-            workspace=project_root,
-            remote_spec=resolved_spec_path,
-            run_kind="chain",
-            run_id=operation_id,
-        )
         command = _chain_start_command(
             resolved_spec_path,
             project_root,
             session=managed_session,
-            marker_dir=marker_dir,
         )
         validation = {
             "status": "passed",
@@ -274,7 +351,7 @@ class MegaplanChainHandler:
                 "project_root": str(project_root),
                 "validation": validation,
             },
-            launch_state="validated",
+            launch_state="accepted",
         )
         _merge_run_metadata(
             prepared.run_paths,
@@ -430,13 +507,19 @@ class MegaplanChainHandler:
         return updated
 
     def resume(self, config: AgentBoxConfig, operation_id: str) -> Any:
-        """Restart the stored chain command for stale suspended runner cases."""
+        """Report custody only; replay/reconcile never redispatches a process."""
+
+        raise MegaplanChainLaunchError(
+            "resume_not_allowed",
+            f"operation {operation_id!r} cannot be redispatched by replay or reconciliation",
+            diagnostics={"phase": "resume", "kind": "redispatch_forbidden"},
+        )
 
         snapshot = self.status(config, operation_id)
         classification = snapshot.classification
         if (
             classification.operation_state is OperationState.PENDING
-            and snapshot.launch_state == "failed_before_running"
+            and snapshot.launch_state == "rejected"
         ):
             message = (
                 f"operation {operation_id!r} failed before the chain runner started; "
@@ -485,20 +568,10 @@ class MegaplanChainHandler:
         _stored_chain_command(run.metadata)
         resolved_spec_path = _resolved_spec_from_metadata(run.metadata)
         managed_session = agentbox_session_name(operation_id)
-        marker_dir = snapshot.project_root / ".megaplan" / "cloud-sessions"
-        prepare_managed_run_marker(
-            managed_session,
-            marker_dir=marker_dir,
-            workspace=snapshot.project_root,
-            remote_spec=resolved_spec_path,
-            run_kind="chain",
-            run_id=operation_id,
-        )
         command = _chain_start_command(
             resolved_spec_path,
             snapshot.project_root,
             session=managed_session,
-            marker_dir=marker_dir,
         )
         update_agentbox_operation(
             config,
@@ -652,20 +725,8 @@ def _chain_start_command(
     project_root: Path,
     *,
     session: str | None = None,
-    marker_dir: Path | None = None,
 ) -> tuple[str, ...]:
-    managed_env: tuple[str, ...] = ()
-    if session and marker_dir is not None:
-        managed_env = (
-            "env",
-            f"ARNOLD_REPAIR_SESSION={session}",
-            f"ARNOLD_REPAIR_MARKER_DIR={marker_dir}",
-            "ARNOLD_REPAIR_RUN_KIND=chain",
-            "ARNOLD_LIVENESS_OWNER_PID=",
-            "ARNOLD_LIVENESS_OWNER_PROCESS_START=",
-        )
     return (
-        *managed_env,
         "python",
         "-m",
         "arnold_pipelines.megaplan",
@@ -726,12 +787,12 @@ def _record_validation_failure(
         config,
         operation_id,
         metadata={"launch_diagnostics": dict(diagnostics), "validation": validation},
-        launch_state="failed_before_running",
+        launch_state="rejected",
     )
     _merge_run_metadata(
         run_paths,
         {
-            "launch_state": "failed_before_running",
+            "launch_outcome": "REJECTED",
             "launch_diagnostics": dict(diagnostics),
             "validation": validation,
         },
@@ -796,11 +857,11 @@ def _summarize_live_running_session(
 
     run_paths = run_dir_paths(config, run.id)
     payload = {"session_name": session_name, "session_state": status.state}
-    append_event(run_paths, "megaplan_chain.running_reused", payload=payload)
+    append_event(run_paths, "megaplan_chain.replay_observed", payload=payload)
     _merge_run_metadata(run_paths, {"duplicate_launch": payload})
     return HostLaunchResult(
         operation_id=run.id,
-        launch_state="running",
+        launch_state="accepted",
         operation_state=run.state,
         run_paths=run_paths,
         worktrees=_worktrees_from_resources(config, run.id, resources),
@@ -814,8 +875,8 @@ def _summarize_live_running_session(
         process_session_resource=process_resources[0] if process_resources else None,
         diagnostics={
             "phase": "retry",
-            "kind": "already_running",
-            "message": f"operation {run.id!r} already has a live RUNNING session",
+            "kind": "replay_observed",
+            "message": f"operation {run.id!r} already has an accepted session",
             "session_name": session_name,
         },
     )
@@ -922,11 +983,10 @@ def _stored_chain_command(metadata: Mapping[str, Any]) -> tuple[str, ...]:
         python_at = 0
         if parts and parts[0] == "env":
             required_prefixes = (
-                "ARNOLD_REPAIR_SESSION=",
-                "ARNOLD_REPAIR_MARKER_DIR=",
-                "ARNOLD_REPAIR_RUN_KIND=chain",
-                "ARNOLD_LIVENESS_OWNER_PID=",
-                "ARNOLD_LIVENESS_OWNER_PROCESS_START=",
+                "ARNOLD_LAUNCH_OPERATION_ID=",
+                "ARNOLD_LAUNCH_REQUEST_ID=",
+                "ARNOLD_LAUNCH_ENVELOPE_DIGEST=",
+                "ARNOLD_LAUNCH_PROCESS_IDENTITY=",
             )
             env_values = parts[1:6]
             if len(env_values) != len(required_prefixes) or any(
@@ -1473,12 +1533,12 @@ def _record_credential_failure(
             "launch_diagnostics": dict(diagnostics),
             "validation": {"status": "failed", "phase": "credential_preflight"},
         },
-        launch_state="failed_before_running",
+        launch_state="rejected",
     )
     _merge_run_metadata(
         run_paths,
         {
-            "launch_state": "failed_before_running",
+            "launch_outcome": "REJECTED",
             "launch_diagnostics": dict(diagnostics),
             "validation": {"status": "failed", "phase": "credential_preflight"},
         },

@@ -943,7 +943,7 @@ def _run_result_payload(
         "kind": kind,
         "operation_type": run.operation_type,
         "operation_state": run.state.value,
-        "launch_state": run.metadata.get("launch_state"),
+        "launch_state": run.metadata.get("launch_state") or getattr(result, "launch_state", None),
         "run_dir": str(paths.root),
         "resources": _resource_payloads(resources),
         "resolved_spec_path": _resolved_spec_path(result, run.metadata),

@@ -461,10 +461,14 @@ class AgentBoxOperatorProfile:
             )
         return ToolResult(
             ok=True,
-            message=f"chain launched: {operation_id}",
+            message=(
+                f"chain launched: {operation_id}"
+                if getattr(result, "launch_state", None) in {"accepted", "replay"}
+                else f"chain launch outcome: {getattr(result, 'launch_state', 'unknown')}"
+            ),
             data=_tool_payload(
                 action="chain_launch",
-                next_state="operation_running",
+                next_state=_chain_launch_next_state(result),
                 **_chain_launch_payload(
                     agentbox_config,
                     operation_id,
@@ -1156,6 +1160,17 @@ def _runtime_context() -> Any | None:
 
 def _chain_launch_target_summary(payload: ChainLaunchInput) -> str:
     return f"{payload.repo} {payload.spec}".strip()
+
+
+def _chain_launch_next_state(result: Any) -> str:
+    """Project the durable launch result without inventing a running state."""
+
+    state = getattr(result, "launch_state", None)
+    if state in {"accepted", "replay"}:
+        return "operation_running"
+    if state == "rejected":
+        return "launch_rejected"
+    return "operation_unknown"
 
 
 def _new_chain_operation_id() -> str:

@@ -26,12 +26,15 @@ __all__ = [
     "UnknownLaunchEnvelopeVersion",
     "LaunchMethodResult",
     "LaunchOutcome",
+    "LaunchDispatchRejected",
+    "LaunchTransactionResult",
     "LaunchReason",
     "LaunchResult",
     "canonical_launch_envelope",
     "evaluate_launch_request",
     "launch_envelope_digest",
     "launch_once",
+    "launch_transaction",
 ]
 
 
@@ -81,6 +84,8 @@ LAUNCH_SPEC_FIELDS = frozenset(
         "timeout_budget_s",
         "production_intent",
         "configured_fallback_specs",
+        "process_session_identity",
+        "expected_session_name",
     }
 )
 
@@ -115,8 +120,10 @@ class LaunchReason(str, Enum):
     UNKNOWN_VERSION = "unknown_version"
     OPERATION_MISMATCH = "operation_mismatch"
     PREFLIGHT_MISMATCH = "preflight_mismatch"
+    PREFLIGHT_REJECTED = "preflight_rejected"
     REQUEST_CONFLICT = "request_conflict"
     DISPATCH_ACCEPTED = "dispatch_accepted"
+    DISPATCH_REJECTED = "dispatch_rejected"
     DISPATCH_UNCERTAIN = "dispatch_uncertain"
 
 
@@ -255,6 +262,137 @@ class LaunchOutcome:
         """Compatibility spelling for callers that call the result a status."""
 
         return self.result
+
+
+class LaunchDispatchRejected(RuntimeError):
+    """A physical launch was rejected with no process/session side effect."""
+
+
+@dataclass(frozen=True)
+class LaunchTransactionResult:
+    """Result of the complete preflight → admission → dispatch → acceptance flow."""
+
+    outcome: LaunchOutcome
+    store_result: Any | None = None
+    observation: Mapping[str, Any] | None = None
+
+    @property
+    def result(self) -> LaunchResult:
+        return self.outcome.result
+
+    @property
+    def reason(self) -> LaunchReason:
+        return self.outcome.reason
+
+    @property
+    def operation(self) -> Any | None:
+        return getattr(self.store_result, "operation", None)
+
+
+def _identity_matches(envelope: LaunchEnvelope, observation: Mapping[str, Any]) -> bool:
+    """Require every identity fact and liveness before accepting a process."""
+
+    expected_session = envelope.launch_spec.get("expected_session_name")
+    expected_process = envelope.launch_spec.get("process_session_identity")
+    required = {
+        "operation_id": envelope.operation_id,
+        "request_id": envelope.request_id,
+        "envelope_digest": envelope.digest,
+        "liveness": "running",
+    }
+    if isinstance(expected_session, str) and expected_session:
+        required["session_name"] = expected_session
+    if isinstance(expected_process, str) and expected_process:
+        required["process_session_identity"] = expected_process
+    return all(observation.get(key) == value for key, value in required.items())
+
+
+def launch_transaction(
+    envelope: LaunchEnvelope | Mapping[str, Any],
+    *,
+    store: Any,
+    preflight: Any,
+    dispatch: Callable[[LaunchEnvelope], Any],
+    observe: Callable[[Any, LaunchEnvelope], Mapping[str, Any]],
+    resource_factory: Callable[[Any, Mapping[str, Any], LaunchEnvelope], Any],
+    operation_type: str | None = None,
+) -> LaunchTransactionResult:
+    """Run one launch transaction through the existing durable-ops authority.
+
+    ``preflight`` is an already completed observation-only report.  The engine
+    does not create custody, worktrees, logs, sessions, or markers itself: the
+    adapter's ``dispatch`` performs those physical operations only after the
+    atomic store admission.  Exact replay returns without dispatch.  A known
+    no-side-effect rejection is ``REJECTED``; every lost acknowledgement,
+    unavailable observation, identity mismatch, or dead process is ``UNKNOWN``.
+    """
+
+    try:
+        candidate = envelope if isinstance(envelope, LaunchEnvelope) else LaunchEnvelope.from_json(envelope)
+    except UnknownLaunchEnvelopeVersion:
+        return LaunchTransactionResult(LaunchOutcome(LaunchResult.REJECTED, LaunchReason.UNKNOWN_VERSION))
+    except (LaunchEnvelopeError, TypeError, ValueError, KeyError):
+        return LaunchTransactionResult(LaunchOutcome(LaunchResult.REJECTED, LaunchReason.MALFORMED))
+
+    if not getattr(preflight, "accepted", False):
+        return LaunchTransactionResult(
+            LaunchOutcome(LaunchResult.REJECTED, LaunchReason.PREFLIGHT_REJECTED)
+        )
+    preflight_digest = getattr(preflight, "preflight_digest", None)
+    if preflight_digest != candidate.preflight_digest:
+        return LaunchTransactionResult(LaunchOutcome(LaunchResult.REJECTED, LaunchReason.PREFLIGHT_MISMATCH))
+
+    admission = store.admit_launch(candidate, operation_type=operation_type)
+    if admission.result is not LaunchResult.ACCEPTED:
+        reason = LaunchReason.REPLAY if admission.reason is LaunchReason.REPLAY else admission.reason
+        return LaunchTransactionResult(LaunchOutcome(admission.result, reason), admission)
+    if admission.reason is LaunchReason.REPLAY:
+        # An admitted-but-not-accepted request has an unknown physical result;
+        # replay observes custody and never redispatches it.
+        replay_state = getattr(getattr(admission, "operation", None), "state", None)
+        if getattr(replay_state, "value", replay_state) == "pending":
+            return LaunchTransactionResult(
+                LaunchOutcome(LaunchResult.UNKNOWN, LaunchReason.DISPATCH_UNCERTAIN),
+                admission,
+            )
+        return LaunchTransactionResult(LaunchOutcome(LaunchResult.ACCEPTED, LaunchReason.REPLAY), admission)
+
+    try:
+        dispatched = dispatch(candidate)
+    except LaunchDispatchRejected:
+        return LaunchTransactionResult(LaunchOutcome(LaunchResult.REJECTED, LaunchReason.DISPATCH_REJECTED), admission)
+    except Exception:
+        return LaunchTransactionResult(LaunchOutcome(LaunchResult.UNKNOWN, LaunchReason.DISPATCH_UNCERTAIN), admission)
+
+    try:
+        observation = dict(observe(dispatched, candidate))
+    except Exception:
+        return LaunchTransactionResult(LaunchOutcome(LaunchResult.UNKNOWN, LaunchReason.DISPATCH_UNCERTAIN), admission)
+    if not _identity_matches(candidate, observation):
+        return LaunchTransactionResult(
+            LaunchOutcome(LaunchResult.UNKNOWN, LaunchReason.DISPATCH_UNCERTAIN),
+            admission,
+            observation,
+        )
+    try:
+        resource = resource_factory(dispatched, observation, candidate)
+        accepted = store.accept_launch(
+            candidate,
+            process_resource=resource,
+            owner_evidence={
+                "operation_id": candidate.operation_id,
+                "request_id": candidate.request_id,
+                "envelope_digest": candidate.digest,
+                "process_session_identity": observation.get("process_session_identity"),
+                "liveness": observation.get("liveness"),
+            },
+            owner=candidate.venue,
+        )
+    except Exception:
+        return LaunchTransactionResult(LaunchOutcome(LaunchResult.UNKNOWN, LaunchReason.DISPATCH_UNCERTAIN), admission, observation)
+    if accepted.result is not LaunchResult.ACCEPTED:
+        return LaunchTransactionResult(LaunchOutcome(accepted.result, accepted.reason), accepted, observation)
+    return LaunchTransactionResult(LaunchOutcome(LaunchResult.ACCEPTED, accepted.reason), accepted, observation)
 
 
 def canonical_launch_envelope(envelope: LaunchEnvelope | Mapping[str, Any]) -> str:
