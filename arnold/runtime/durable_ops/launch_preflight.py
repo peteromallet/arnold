@@ -82,10 +82,12 @@ _GOOD_STATUSES = {
     "present",
     "ready",
     "clear",
-    "none",
-    "not_found",
     "observed",
     "stopped",
+}
+_SECTION_GOOD_STATUSES = {
+    section: (_GOOD_STATUSES | {"none", "not_found"} if section == "collision" else _GOOD_STATUSES)
+    for section in PREFLIGHT_SECTIONS
 }
 _REQUIRED_FIELD_ALIASES: dict[str, tuple[tuple[str, ...], ...]] = {
     "source": (("revision", "source_revision"), ("ref", "source_ref"), ("tree", "source_tree")),
@@ -248,7 +250,7 @@ def run_launch_preflight(
         state = _status(raw)
         if state is None:
             failures.append(f"{section}:unknown_status")
-        elif state in _BAD_STATUSES or state not in _GOOD_STATUSES:
+        elif state in _BAD_STATUSES or state not in _SECTION_GOOD_STATUSES[section]:
             failures.append(f"{section}:{state}")
         else:
             for aliases in _REQUIRED_FIELD_ALIASES.get(section, ()):

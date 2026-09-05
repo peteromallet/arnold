@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from arnold.runtime.durable_ops.launch_preflight import (
     PREFLIGHT_SECTIONS,
     PreflightResult,
@@ -77,6 +79,31 @@ def test_missing_or_unknown_prerequisite_rejects_without_effects() -> None:
     assert report.result is PreflightResult.REJECTED
     assert "network:unknown" in report.failures
     assert report.preflight_digest.startswith("sha256:")
+
+
+@pytest.mark.parametrize(
+    ("section", "status", "expected"),
+    [
+        (section, status, PreflightResult.ACCEPTED if section == "collision" else PreflightResult.REJECTED)
+        for section in PREFLIGHT_SECTIONS
+        for status in ("none", "not_found")
+    ]
+    + [
+        (section, observations[section]["status"], PreflightResult.ACCEPTED)
+        for section, observations in [(section, _observations()) for section in PREFLIGHT_SECTIONS]
+    ],
+)
+def test_section_status_matrix_fails_closed_except_for_collision_absence(
+    section: str,
+    status: str,
+    expected: PreflightResult,
+) -> None:
+    observations = _observations()
+    observations[section]["status"] = status
+
+    report = run_launch_preflight({"command": ["worker"]}, observations)
+
+    assert report.result is expected
 
 
 def test_capacity_observation_reads_only(tmp_path: Path) -> None:
