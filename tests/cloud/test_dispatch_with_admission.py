@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from arnold.runtime.durable_ops import FileBackedDurableOpsStore, OperationState
 from arnold_pipelines.megaplan.cloud.worker_dispatch import (
     AdmissionRefusal,
     WorkerAdmissionReceipt,
@@ -82,31 +83,23 @@ def test_gate_refusal_prevents_final_launch(tmp_path: Path) -> None:
     assert launches == []
 
 
-def test_admission_preflight_suppresses_before_controlled_entry(tmp_path: Path) -> None:
+def test_gate_refusal_is_the_only_pre_entry_suppression(tmp_path: Path) -> None:
     launches: list[int] = []
-
-    def preflight(receipt: WorkerAdmissionReceipt):
-        return {
-            "suppress": True,
-            "evidence_kind": "controlled_adapter",
-            "physical_operation_evidence": {
-                "schema": "test-no-launch.v1",
-                "reservation_event_id": receipt.reservation_event_id,
-                "admission_receipt_id": receipt.admission_receipt_id,
-                "physical_door_id": receipt.physical_door_id,
-                "launch_state_identity": "not_started",
-                "observed_at": "2026-09-02T00:00:00+00:00",
-            },
-        }
 
     result = dispatch_with_admission(
         request(tmp_path),
         lambda _context: launches.append(1),
-        admission_preflight=preflight,
+        gate=lambda _request: AdmissionRefusal(
+            code="preflight_rejected",
+            reason="observed capacity is unknown",
+            plan_id="plan",
+            phase="run",
+            logical_dispatch_id="logical",
+            admission_attempt=1,
+        ),
     )
-    assert isinstance(result, DispatchOutcome)
-    assert result.kind == "no_launch"
-    assert result.launch_state == "not_started"
+    assert isinstance(result, AdmissionRefusal)
+    assert result.code == "preflight_rejected"
     assert launches == []
 
 
@@ -152,26 +145,25 @@ def test_failure_shaped_worker_result_never_projects_as_success(tmp_path: Path) 
     assert not ledger.projection()["terminals"]
 
 
-def test_terminal_append_or_link_failure_holds_full_context_unresolved(tmp_path: Path) -> None:
+def test_launch_store_acceptance_does_not_depend_on_incident_ledger(tmp_path: Path) -> None:
     ledger = IncidentLedger(tmp_path)
-    original = ledger.append_terminal_outcome
-
-    def fail_append(**_kwargs):
-        raise OSError("terminal append unavailable")
-
-    ledger.append_terminal_outcome = fail_append  # type: ignore[method-assign]
     from arnold_pipelines.megaplan.workers import WorkerResult
     result = dispatch_with_admission(
         request(tmp_path, ledger=ledger),
-        lambda _context: LaunchResult(True, WorkerResult(payload={}, raw_output="", duration_ms=1, cost_usd=0.0)),
+        lambda _context: LaunchResult(
+            True,
+            WorkerResult(
+                payload={}, raw_output="", duration_ms=1, cost_usd=0.0,
+                worker_identity=WORKER,
+            ),
+            WORKER,
+        ),
         ledger=ledger,
     )
-    ledger.append_terminal_outcome = original  # type: ignore[method-assign]
     assert isinstance(result, DispatchOutcome)
-    assert result.kind == "unresolved_launch"
-    reservation = next(iter(ledger.projection()["reservations"].values()))
-    assert reservation["closed"] is False
-    assert reservation["logical_dispatch_id"] == "logical"
+    assert result.kind == "success"
+    assert FileBackedDurableOpsStore(tmp_path / "ops").load_operation_run("logical").state is OperationState.RUNNING
+    assert ledger.read_nbf_events() == []
 
 
 def test_pre_entry_release_requires_receipt_bound_physical_operation_evidence(tmp_path: Path) -> None:
@@ -216,5 +208,6 @@ def test_identical_retry_never_relaunches_unresolved_or_accepted_state(tmp_path:
     second = dispatch_with_admission(request(tmp_path, ledger=ledger), launch, ledger=ledger)
     assert isinstance(first, DispatchOutcome)
     assert first.kind == "success"
-    assert isinstance(second, AdmissionRefusal)
+    assert isinstance(second, DispatchOutcome)
+    assert second.kind == "success"
     assert launches == [1]

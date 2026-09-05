@@ -229,6 +229,7 @@ def test_launch_engine_rejected_preflight_has_no_admission_or_dispatch(tmp_path:
 def test_host_launch_admits_before_one_physical_dispatch_and_replays(monkeypatch, tmp_path: Path) -> None:
     config = AgentBoxConfig(workspace_root=tmp_path / "workspace")
     config.workspace_root.mkdir()
+    config.credentials_root.mkdir(parents=True, exist_ok=True)
     dispatches: list[str] = []
     expected_session = "agentbox-op-host"
 

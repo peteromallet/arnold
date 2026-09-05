@@ -226,7 +226,13 @@ def _committed_superfixer_occurrence(tmp_path: Path, *, now: datetime | None = N
     return store, service, row, projection, job
 
 
-def _fake_superfixer_launch(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, captured: dict):
+def _fake_superfixer_launch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    captured: dict,
+    *,
+    result_status: str = "accepted",
+):
     manifest = tmp_path / "sfx-manifest.json"
 
     def fake_launch(**kwargs):
@@ -236,7 +242,8 @@ def _fake_superfixer_launch(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, cap
             encoding="utf-8",
         )
         return SimpleNamespace(
-            run_id="sfx-run-1", manifest_path=str(manifest), status="launching"
+            ok=result_status in {"accepted", "running"},
+            run_id="sfx-run-1", manifest_path=str(manifest), status=result_status
         )
 
     monkeypatch.setattr(
@@ -313,6 +320,28 @@ def test_superfixer_proactive_consumer_launches_once_with_receipt_linkage(
     current = service.repo.read_definition(row.schedule_id)
     assert current.state == "active"
     assert current.revision == row.revision
+
+
+def test_superfixer_rejected_managed_launch_never_projects_launched(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store, service, row, projection, job = _committed_superfixer_occurrence(tmp_path)
+    monkeypatch.setenv(HOURLY_SUPERFIXER_ENABLED_ENV, "1")
+    monkeypatch.delenv("ARNOLD_RUNTIME_MANIFEST", raising=False)
+    monkeypatch.setattr(
+        scheduler_module, "_runtime_manifest_path", lambda: tmp_path / "no-such-manifest.json"
+    )
+    captured: dict = {}
+    _fake_superfixer_launch(tmp_path, monkeypatch, captured, result_status="rejected")
+    with pytest.raises(RuntimeError, match="canonical managed launch was not accepted"):
+        asyncio.run(
+            _consumer_worker(store).handlers["superfixer_proactive"](
+                job.model_dump(mode="json")
+            )
+        )
+
+    current = service.load_occurrence(projection.occurrence.occurrence_id)
+    assert current.state != "launched"
 
 
 def test_superfixer_proactive_duplicate_delivery_never_double_launches(

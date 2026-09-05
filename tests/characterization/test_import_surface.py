@@ -609,7 +609,6 @@ CLOUD_CLI_SYMBOLS = [
     "_relay_output",
     "_resolve_remote_chain_spec",
     "_run_supervise_tick",
-    "_tmux_chain_restart_command",
     # Private helpers imported by runtime (supervise.py)
     "_remote_human_verification_status_command",
 ]

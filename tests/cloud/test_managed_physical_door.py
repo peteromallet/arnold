@@ -39,7 +39,11 @@ def test_managed_physical_door_is_once_and_has_no_ledger_launch_projection(tmp_p
     assert replay.kind == "success"
     assert calls == [1]
     assert store.load_operation_run(receipt.operation_id).state is OperationState.RUNNING
-    assert len(store.list_typed_resources(receipt.operation_id)) == 1
+    resources = store.list_typed_resources(receipt.operation_id)
+    assert len(resources) == 1
+    assert resources[0].details["worker_identity"]["process_start_identity"] == "managed-start"
+    events = store.list_operation_events(receipt.operation_id)
+    assert sum(event.event_type == "launch.accepted" for event in events) == 1
     assert ledger.read_nbf_events() == []
 
 

@@ -115,3 +115,33 @@ def test_missing_source_prerequisite_rejects_before_popen(
     current = json.loads(manifest_path.read_text(encoding="utf-8"))
     assert current["launch_outcome"] == "REJECTED"
     assert current["launch_reason"] == "preflight_rejected"
+
+
+def test_resident_preflight_observes_before_manifest_identity_publication(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manifest_path, manifest = _manifest(tmp_path)
+    seen: list[dict[str, object]] = []
+    original = subagent.run_launch_preflight
+
+    def observe_preflight(spec, observations):
+        seen.append(json.loads(manifest_path.read_text(encoding="utf-8")))
+        return original(spec, observations)
+
+    monkeypatch.setattr(subagent, "run_launch_preflight", observe_preflight)
+    monkeypatch.setattr(
+        subagent.subprocess,
+        "Popen",
+        lambda *args, **kwargs: _Process(os.getpid()),
+    )
+    monkeypatch.setattr(subagent, "_git_revision_without_process", lambda _root: "rev-1")
+    monkeypatch.setattr(subagent, "_pid_start_ticks", lambda _pid: "start-1")
+    monkeypatch.setattr(subagent, "_pid_live", lambda _pid: True)
+
+    first_process, accepted = subagent._spawn_managed_supervisor(manifest_path, manifest)
+
+    assert first_process is not None
+    assert seen
+    assert "operation_id" not in seen[0]
+    assert "launch_request_id" not in seen[0]
+    assert accepted["status"] == "running"

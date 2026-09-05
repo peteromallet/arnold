@@ -14,6 +14,7 @@ from arnold_pipelines.megaplan.cloud.worker_dispatch import (
     dispatch_with_admission,
     require_production_worker_dispatch_runtime,
 )
+from arnold_pipelines.megaplan.cloud import worker_dispatch
 from arnold_pipelines.megaplan.incident.ledger import IncidentLedger
 from tests.cloud.dispatch_test_helpers import request
 
@@ -85,3 +86,33 @@ def test_physical_door_wrong_worker_identity_is_unknown_without_resource_or_retr
     assert store.load_operation_run(receipt.operation_id).state is OperationState.PENDING
     assert store.list_typed_resources(receipt.operation_id) == ()
     assert ledger.read_nbf_events() == []
+
+
+def test_worker_physical_preflight_fails_closed_on_unknown_venue_observations(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    request_value = request(tmp_path)
+    receipt = replace(
+        require_production_worker_dispatch_runtime(request_value),
+        production_intent=True,
+        provider="",
+    )
+    monkeypatch.setattr(
+        worker_dispatch,
+        "read_only_capacity_observation",
+        lambda *args, **kwargs: {"status": "unknown"},
+    )
+    monkeypatch.setattr(
+        worker_dispatch,
+        "read_only_network_observation",
+        lambda *args, **kwargs: {"status": "unknown", "transport": "local"},
+    )
+
+    report = worker_dispatch._worker_launch_preflight(
+        receipt, worker_dispatch._worker_launch_envelope(receipt)
+    )
+
+    assert report.accepted is False
+    assert {"credentials", "capacity", "network"}.issubset(
+        {failure.split(":", 1)[0] for failure in report.failures}
+    )

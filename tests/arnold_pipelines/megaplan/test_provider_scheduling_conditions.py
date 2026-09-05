@@ -900,12 +900,12 @@ def test_authorized_child_matching_exhaustion_is_observation_two(
 
 
 @pytest.mark.parametrize("door", ("native", "omp", "managed"))
-def test_production_door_replay_uses_one_live_operation_store_commit(
+def test_production_entrypoints_replay_one_physical_attempt_in_live_store(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     door: str,
 ) -> None:
-    """Each physical production door admits once and replays without relaunch."""
+    """Each real native/OMP/managed entry admits once and replays without relaunch."""
     _install_production_runtime(monkeypatch, tmp_path)
     spec, _alt, phase = _door_specs(door)
     launched: list[str] = []
@@ -940,6 +940,9 @@ def test_production_door_replay_uses_one_live_operation_store_commit(
     resources = store.list_typed_resources("logical")
     assert len(resources) == 1
     assert resources[0].details["worker_identity"] == WORKER
+    events = store.list_operation_events("logical")
+    assert sum(event.event_type == "launch.admitted" for event in events) == 1
+    assert sum(event.event_type == "launch.accepted" for event in events) == 1
     assert not IncidentLedger(tmp_path).read_nbf_events()
 
 

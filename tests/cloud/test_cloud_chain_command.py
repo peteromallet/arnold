@@ -107,6 +107,38 @@ def test_fresh_chain_stop_is_identity_guarded_before_reset() -> None:
     assert "exit 17" in command
 
 
+def test_supervisor_resume_routes_through_operator_transaction_authority() -> None:
+    from arnold_pipelines.megaplan.cloud.supervise import _canonical_resume_command
+
+    command = _canonical_resume_command(
+        "/workspace", "/workspace/chain.yaml", session_name="demo-chain"
+    )
+
+    assert "arnold_pipelines.megaplan.cloud.operator_control" in command
+    assert " resume " in f" {command} "
+    assert "tmux new-session" not in command
+
+
+def test_cloud_capacity_observation_fails_closed_without_remote_proof(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from arnold_pipelines.megaplan.cloud import cli as cloud_cli
+
+    monkeypatch.setattr(
+        cloud_cli,
+        "read_only_capacity_observation",
+        lambda *args, **kwargs: {"status": "unknown"},
+    )
+    observed = cloud_cli._cloud_launch_capacity_observation(
+        SimpleNamespace(), tmp_path
+    )
+
+    assert observed["status"] == "unknown"
+    assert observed["disk"] == "unknown"
+    assert observed["inode"] == "unknown"
+    assert observed["output"] == "unknown"
+
+
 def _cloud_spec() -> CloudSpec:
     return CloudSpec(
         provider="ssh",

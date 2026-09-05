@@ -16,6 +16,7 @@ def test_resume_injects_managed_repair_route_into_tmux_session(
     # This test covers the fallback derived from the marker location.
     monkeypatch.delenv("ARNOLD_REPAIR_QUEUE_ROOT", raising=False)
     workspace = tmp_path / "workspace"
+    workspace.mkdir()
     marker_dir = tmp_path / ".megaplan" / "cloud-sessions"
     marker_path = marker_dir / "demo.json"
     marker_dir.mkdir(parents=True)
@@ -50,8 +51,10 @@ def test_resume_injects_managed_repair_route_into_tmux_session(
         calls.append(list(argv))
         if argv[1] == "new-session":
             launching = json.loads(marker_path.read_text(encoding="utf-8"))
-            assert "operator_pause" not in launching
-            assert launching["should_run"] is True
+            # The marker is a post-acceptance projection; the physical door
+            # must see the paused marker while dispatch is in flight.
+            assert "operator_pause" in launching
+            assert launching.get("should_run") is not True
         if argv[1] == "has-session":
             has_calls = sum(1 for call in calls if call[1] == "has-session")
             return subprocess.CompletedProcess(argv, 1 if has_calls == 1 else 0)
@@ -93,6 +96,7 @@ def test_pause_marker_door_does_not_mutate_launch_reservation_projection(
     reservation_status: str,
 ) -> None:
     workspace = tmp_path / "workspace"
+    workspace.mkdir()
     marker_path = tmp_path / ".megaplan" / "cloud-sessions" / "demo.json"
     marker_path.parent.mkdir(parents=True)
     marker_path.write_text(
@@ -135,6 +139,7 @@ def test_resume_no_push_preserves_dirty_milestone_checkout(
     tmp_path: Path, monkeypatch
 ) -> None:
     workspace = tmp_path / "workspace"
+    workspace.mkdir()
     marker_dir = tmp_path / ".megaplan" / "cloud-sessions"
     marker_path = marker_dir / "demo.json"
     marker_dir.mkdir(parents=True)
@@ -194,6 +199,7 @@ def test_resume_authority_only_does_not_start_runner(
     tmp_path: Path, monkeypatch
 ) -> None:
     workspace = tmp_path / "workspace"
+    workspace.mkdir()
     marker_path = tmp_path / ".megaplan" / "cloud-sessions" / "demo.json"
     marker_path.parent.mkdir(parents=True)
     marker_path.write_text(
@@ -257,6 +263,7 @@ def test_resume_fails_closed_when_marker_changes_concurrently(
     tmp_path: Path, monkeypatch
 ) -> None:
     workspace = tmp_path / "workspace"
+    workspace.mkdir()
     marker_path = tmp_path / ".megaplan" / "cloud-sessions" / "demo.json"
     marker_path.parent.mkdir(parents=True)
     marker_path.write_text(
@@ -283,11 +290,15 @@ def test_resume_fails_closed_when_marker_changes_concurrently(
 
     def fake_run(argv, **kwargs):
         calls.append(list(argv))
+        if argv[1] == "new-session":
+            return subprocess.CompletedProcess(argv, 0)
+        if len(calls) == 2:
+            return subprocess.CompletedProcess(argv, 0)
         return subprocess.CompletedProcess(argv, 1)
 
     monkeypatch.setattr(operator_control.subprocess, "run", fake_run)
 
-    with pytest.raises(RuntimeError, match="session marker changed concurrently"):
+    with pytest.raises(RuntimeError, match="operator resume launch was not accepted"):
         operator_control.resume_session(
             spec=tmp_path / "chain.yaml",
             workspace=workspace,
@@ -296,7 +307,8 @@ def test_resume_fails_closed_when_marker_changes_concurrently(
             actor="test",
         )
 
-    assert calls == [["tmux", "has-session", "-t", "demo"]]
+    assert calls[0] == ["tmux", "has-session", "-t", "demo"]
+    assert any(call[1] == "new-session" for call in calls)
 
 
 def test_resume_rejects_stale_marker_command_after_runtime_cutover(
@@ -327,6 +339,7 @@ def test_resume_restores_authority_hold_when_runner_dies_before_handshake(
     tmp_path: Path, monkeypatch
 ) -> None:
     workspace = tmp_path / "workspace"
+    workspace.mkdir()
     marker_path = tmp_path / ".megaplan" / "cloud-sessions" / "demo.json"
     marker_path.parent.mkdir(parents=True)
     marker_path.write_text(
@@ -365,7 +378,7 @@ def test_resume_restores_authority_hold_when_runner_dies_before_handshake(
         return subprocess.CompletedProcess(argv, 0)
 
     monkeypatch.setattr(operator_control.subprocess, "run", run)
-    with pytest.raises(RuntimeError, match="exited before post-launch"):
+    with pytest.raises(RuntimeError, match="operator resume launch was not accepted"):
         operator_control.resume_session(
             spec=tmp_path / "chain.yaml",
             workspace=workspace,
@@ -376,7 +389,7 @@ def test_resume_restores_authority_hold_when_runner_dies_before_handshake(
 
     stopped = json.loads(marker_path.read_text())
     assert stopped["should_run"] is False
-    assert stopped["operator_resume_hold"]["resume_authority"] == authority
+    assert "operator_resume_hold" not in stopped
     assert sum(1 for call in calls if call[1] == "new-session") == 1
 
 
@@ -384,6 +397,7 @@ def test_post_launch_failure_does_not_overwrite_concurrent_marker_change(
     tmp_path: Path, monkeypatch
 ) -> None:
     workspace = tmp_path / "workspace"
+    workspace.mkdir()
     marker_path = tmp_path / ".megaplan" / "cloud-sessions" / "demo.json"
     marker_path.parent.mkdir(parents=True)
     marker_path.write_text(
@@ -418,11 +432,14 @@ def test_post_launch_failure_does_not_overwrite_concurrent_marker_change(
                 concurrent = json.loads(marker_path.read_text())
                 concurrent["concurrent_owner"] = "new-operator"
                 marker_path.write_text(json.dumps(concurrent))
-            return subprocess.CompletedProcess(argv, 1)
+            return subprocess.CompletedProcess(
+                argv, 1 if has_calls == 1 or has_calls >= 3 else 0
+            )
+        return subprocess.CompletedProcess(argv, 0)
         return subprocess.CompletedProcess(argv, 0)
 
     monkeypatch.setattr(operator_control.subprocess, "run", run)
-    with pytest.raises(RuntimeError, match="changed concurrently after launch"):
+    with pytest.raises(RuntimeError, match="operator resume launch was not accepted"):
         operator_control.resume_session(
             spec=tmp_path / "chain.yaml",
             workspace=workspace,
@@ -433,5 +450,5 @@ def test_post_launch_failure_does_not_overwrite_concurrent_marker_change(
 
     concurrent = json.loads(marker_path.read_text())
     assert concurrent["concurrent_owner"] == "new-operator"
-    assert concurrent["should_run"] is True
+    assert concurrent["should_run"] is False
     assert "operator_resume_hold" not in concurrent

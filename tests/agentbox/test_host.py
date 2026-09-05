@@ -187,6 +187,7 @@ def test_launch_host_records_tmux_failure_without_marking_running(
 
 def _config_with_repos(tmp_path: Path, *repo_names: str) -> AgentBoxConfig:
     config = AgentBoxConfig(workspace_root=tmp_path / "workspace")
+    config.credentials_root.mkdir(parents=True, exist_ok=True)
     for repo_name in repo_names:
         repo = _init_repo(config.repos_root / repo_name)
         register_repo(config, repo_name, path=repo)
