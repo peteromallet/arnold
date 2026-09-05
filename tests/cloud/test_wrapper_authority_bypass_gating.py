@@ -254,6 +254,25 @@ if "runtime_provenance" in " ".join(sys.argv[1:]):
 if "check_wrapper_acceptance_gate" in source and os.environ.get("CHAIN_GATE_FIXTURE") is not None:
     sys.stdout.write(os.environ["CHAIN_GATE_FIXTURE"])
     raise SystemExit(int(os.environ.get("CHAIN_GATE_RC", "0")))
+if "arnold_pipelines.megaplan.cloud.chain_drive" in " ".join(sys.argv[1:]):
+    marker = os.environ.get("CHAIN_LAUNCH_MARKER")
+    launch_env = os.environ.get("CHAIN_LAUNCH_ENV")
+    if marker:
+        with open(marker, "a", encoding="utf-8") as fh:
+            fh.write("launch\\n")
+    if launch_env:
+        with open(launch_env, "a", encoding="utf-8") as fh:
+            fh.write(
+                "ALL=" + " ".join(sys.argv[1:]) + "\\n"
+                "INTERPRETER="
+                + os.environ.get("CHAIN_GENERATION_INTERPRETER", os.path.abspath(sys.executable))
+                + "\\n"
+                "PYTHONPATH=" + os.environ.get("PYTHONPATH", "") + "\\n"
+                "ARNOLD_RUNTIME_MANIFEST="
+                + os.environ.get("ARNOLD_RUNTIME_MANIFEST", "")
+                + "\\n"
+            )
+    raise SystemExit(0)
 delegate = subprocess.run(
     [os.environ["REAL_PYTHON"], *sys.argv[1:]],
     input=source,
@@ -314,6 +333,8 @@ exit 0
             "PATH": f"{fake_bin}:{env.get('PATH', '')}",
             "PYTHONPATH": str(REPO_ROOT),
             "REAL_PYTHON": sys.executable,
+            "ARNOLD_CHAIN_LAUNCH_REQUEST_B64": "ZmFrZQ==",
+            "CHAIN_GENERATION_INTERPRETER": str(fake_bin / "python"),
             "MEGAPLAN_PROJECT_DIR": str(workspace),
             "CHAIN_LAUNCH_MARKER": str(tmp_path / "chain-launched"),
             "CHAIN_LAUNCH_ENV": str(tmp_path / "chain-launch-env"),
@@ -565,13 +586,12 @@ def test_arnold_chain_proof_complete_launch_threads_generation_interpreter(
     assert result.returncode == 0, (result.stdout, result.stderr)
     assert (tmp_path / "chain-launched").read_text(encoding="utf-8") == "launch\n"
     launch_env = (tmp_path / "chain-launch-env").read_text(encoding="utf-8")
-    all_line = next(
-        line for line in launch_env.splitlines() if line.startswith("ALL=")
+    interpreter_line = next(
+        line for line in launch_env.splitlines() if line.startswith("INTERPRETER=")
     )
-    # The generation interpreter rides into the launch as the 4th positional
-    # arg (after ENGINE_DIR / SPEC / PROJECT_DIR) — the ambient-python launch
-    # boundary never carried it.
-    assert str(tmp_path / "bin" / "python") in all_line, launch_env
+    # The generation interpreter is the executable that invokes the co-located
+    # launch engine; it is not an ambient-python argument or a shell fallback.
+    assert str(tmp_path / "bin" / "python") in interpreter_line, launch_env
     assert "PYTHONPATH=" in launch_env, launch_env
     provenance = (tmp_path / "provenance-record").read_text(encoding="utf-8")
     assert f"pythonpath={REPO_ROOT}" in provenance, provenance
@@ -611,12 +631,6 @@ def test_arnold_chain_wrapper_has_no_shared_root_fallback() -> None:
 
 def test_non_authoritative_cleanup_best_effort_remains_allowed() -> None:
     examples = {
-        "arnold_pipelines/megaplan/cloud/systemd/ensure-megaplan-resident": (
-            'docker exec "$CONTAINER" tmux kill-session -t "$SESSION" >/dev/null 2>&1 || true'
-        ),
-        "arnold_pipelines/megaplan/cloud/systemd/ensure-megaplan-watchdog": (
-            'docker exec "$CONTAINER" bash -lc "tmux kill-session -t watchdog 2>/dev/null || true"'
-        ),
         "arnold_pipelines/megaplan/cloud/templates/entrypoint.sh.tmpl": (
             'arnold config set execution.auto_approve true >/dev/null 2>&1 || true'
         ),
