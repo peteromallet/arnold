@@ -37,60 +37,6 @@ def _valid_nbf(validator: Callable[[dict[str, Any]], dict[str, Any]], payload: d
     return True
 
 
-def _validate_controlled_transition_history(records: list[dict[str, Any]]) -> None:
-    """Validate every persisted controlled-door history as one sequence.
-
-    Projection must not choose a strongest marker from contradictory history.
-    A replay is valid only when the marker payload is byte-identical; the
-    lifecycle must always begin at ``not_started`` and reach ``closed`` only
-    after ``entered`` and ``accepted``.
-    """
-    grouped: dict[tuple[str, str], list[dict[str, Any]]] = {}
-    for record in records:
-        payload = record.get("payload", {})
-        if payload.get("event_type") != "controlled_adapter_state":
-            continue
-        key = (str(payload.get("reservation_event_id")), str(payload.get("admission_receipt_id")))
-        grouped.setdefault(key, []).append(payload)
-    for (reservation_id, receipt_id), markers in grouped.items():
-        doors = {marker.get("physical_door_id") for marker in markers}
-        if len(doors) != 1:
-            raise ValueError("controlled adapter history mixes physical doors")
-        # Exact idempotent replay is harmless and is the only duplicate form
-        # accepted. Conflicting payloads remain visible and fail below.
-        unique: list[dict[str, Any]] = []
-        for marker in markers:
-            if marker in unique:
-                continue
-            unique.append(marker)
-        markers = unique
-        # Legacy ambiguous markers are projected as a separate permanent hold
-        # signal, never as a fifth lifecycle state.
-        markers = [marker for marker in markers if marker.get("launch_state_identity") != "ambiguous"]
-        states = [marker.get("launch_state_identity") for marker in markers]
-        if states and states[0] == "closed":
-            raise ValueError("controlled adapter history is closed before lifecycle start")
-        if states and states[0] == "entered":
-            raise ValueError("controlled adapter history entered before not_started")
-        highest = -1
-        ranks = {"not_started": 0, "entered": 1, "accepted": 2, "closed": 3}
-        for index, state in enumerate(states):
-            if state not in ranks:
-                raise ValueError("controlled adapter history contains an invalid transition")
-            rank = ranks[state]
-            if rank <= highest:
-                raise ValueError("controlled adapter history contains a stale or conflicting transition")
-            if state == "entered" and highest != ranks["not_started"]:
-                raise ValueError("controlled adapter entered before not_started")
-            if state == "accepted" and highest != ranks["entered"]:
-                raise ValueError("controlled adapter accepted before entered")
-            if state == "closed" and highest != ranks["accepted"]:
-                raise ValueError("controlled adapter closed before accepted")
-            if state == "not_started" and highest >= 0:
-                raise ValueError("controlled adapter has stale not_started marker")
-            highest = rank
-
-
 def reservation_key(projection_key: str, semantic_dispatch_fingerprint: str) -> str:
     if not isinstance(projection_key, str) or not projection_key or not isinstance(semantic_dispatch_fingerprint, str) or not semantic_dispatch_fingerprint:
         raise ValueError("reservation key requires projection key and semantic fingerprint")
@@ -839,7 +785,6 @@ class IncidentLedger:
                 seen_ids[identity] = payload
                 checked.append(record)
         records = checked
-        _validate_controlled_transition_history(records)
         reservations: dict[str, dict[str, Any]] = {}
         terminals: dict[str, dict[str, Any]] = {}
         dispositions: dict[str, dict[str, Any]] = {}
@@ -873,7 +818,6 @@ class IncidentLedger:
                     "event_id": p["event_id"],
                     "closed": False,
                     "reconciliation": None,
-                    "accepted_launch": False,
                 }
                 consumed = p.get("changed_precondition_event_id")
                 if consumed in changes:
@@ -900,7 +844,6 @@ class IncidentLedger:
                     ),
                     "closed": False,
                     "reconciliation": None,
-                    "accepted_launch": False,
                 }
                 consumed = p.get("consumed_changed_precondition_event_id") or p.get("authorizing_event_id")
                 if consumed in changes:
@@ -1066,13 +1009,6 @@ class IncidentLedger:
                         confirmations[p["confirmation_id"]]["consumed"] = True
                     else:
                         confirmations[p["confirmation_id"]]["expired"] = True
-            elif typ == "controlled_adapter_state":
-                for reservation in reservations.values():
-                    if (reservation.get("event_id") == p.get("reservation_event_id")
-                            and reservation.get("admission_receipt_id") == p.get("admission_receipt_id")):
-                        if p.get("launch_state_identity") == "accepted":
-                            reservation["accepted_launch"] = True
-                            reservation["accepted_launch_marker"] = dict(p)
             elif typ == "spawn_cleanup_handoff":
                 cleanup_handoffs[p["handoff_id"]] = dict(p)
         latest = provider_streams.get(latest_stream_key, {"provider_failure_key": None, "observation_streak": 0})
@@ -1152,42 +1088,6 @@ class IncidentLedger:
             # The receipt is returned only after _emit_locked has fsynced the
             # reservation.  The payload still carries the deterministic value
             # so replay can validate the exact committed context.
-            return self._append_nbf_locked(fd, payload, records)
-
-    def append_controlled_adapter_state(self, *, reservation_event_id: str, admission_receipt_id: str, physical_door_id: str, launch_state_identity: str, phase: str | None = None, selected_spec: str | None = None, primary_spec: str | None = None, logical_dispatch_id: str | None = None, worker_identity: Any = None, victim_process_start_identity: str | None = None, started_at: str | None = None, finished_at: str | None = None, operation_evidence: Mapping[str, Any] | None = None, physical_operation_evidence: Mapping[str, Any] | None = None, actor: str = "controlled-adapter") -> dict[str, Any]:
-        """Persist the adapter's launch proof through the canonical NBF door."""
-        if launch_state_identity == "ambiguous":
-            raise ValueError("ambiguous is a reconciliation hold, not a controlled lifecycle state")
-        payload = {
-            "schema_version": 1,
-            "event_type": "controlled_adapter_state",
-            "event_id": _stable_id("controlled-adapter", reservation_event_id, admission_receipt_id, launch_state_identity, str(phase), str(selected_spec), str(logical_dispatch_id)),
-            "reservation_event_id": reservation_event_id,
-            "admission_receipt_id": admission_receipt_id,
-            "physical_door_id": physical_door_id,
-            "launch_state_identity": launch_state_identity,
-            "recorded_at": _now(),
-            "actor": actor,
-        }
-        if launch_state_identity == "accepted":
-            payload.update({"phase": phase, "selected_spec": selected_spec, "primary_spec": primary_spec, "logical_dispatch_id": logical_dispatch_id, "worker_identity": worker_identity, "started_at": started_at, "finished_at": finished_at})
-            if victim_process_start_identity is not None:
-                payload["victim_process_start_identity"] = victim_process_start_identity
-        evidence = physical_operation_evidence or operation_evidence
-        if evidence is not None:
-            payload["physical_operation_evidence"] = dict(evidence)
-        with self._locked() as (fd, records):
-            reservation = next((r.get("payload", {}) for r in records if r.get("payload", {}).get("event_type") in {"admission_reserved", "provider_route_child_reserved"} and r.get("payload", {}).get("event_id") == reservation_event_id), None)
-            if reservation is None or reservation.get("admission_receipt_id", admission_receipt_id) != admission_receipt_id:
-                raise ValueError("controlled adapter state is not bound to reservation receipt")
-            reserved_door = reservation.get("physical_door_id") or reservation.get("child_physical_door_id")
-            if reserved_door and reserved_door != physical_door_id:
-                raise ValueError("controlled adapter state physical door is not bound to reservation")
-            _validate_controlled_transition_history([*records, {"payload": payload}])
-            if launch_state_identity == "accepted":
-                prior = [r.get("payload", {}) for r in records if r.get("payload", {}).get("event_type") == "controlled_adapter_state" and r.get("payload", {}).get("reservation_event_id") == reservation_event_id and r.get("payload", {}).get("launch_state_identity") == "accepted"]
-                if prior and prior[0] != payload:
-                    raise ValueError("accepted launch marker already exists")
             return self._append_nbf_locked(fd, payload, records)
 
     def append_spawn_cleanup_handoff(self, *, reservation_event_id: str, admission_receipt_id: str, physical_door_id: str, plan_id: str, phase: str, projection_key: str, dispatch_family_id: str, logical_dispatch_id: str, semantic_dispatch_fingerprint: str, selected_spec: str, execution_context_identity: str, worker_identity: Mapping[str, Any], victim_pid: int, victim_process_start_identity: str, spawn_registration_id: str, spawn_certification_id: str, route_identity: str, error_kind: str, reason: str, started_at: str = "", hold_metadata: Mapping[str, Any] | None = None, actor: str = "controlled-adapter") -> dict[str, Any]:
@@ -1285,42 +1185,6 @@ class IncidentLedger:
             expected_chain = reservation.get("configured_fallback_chain_identity", "")
             if configured_fallback_chain_identity is not None and configured_fallback_chain_identity != expected_chain:
                 raise ValueError("terminal outcome reservation context mismatch: configured_fallback_chain_identity")
-            accepted_markers = [r.get("payload", {}) for r in records
-                                if r.get("payload", {}).get("event_type") == "controlled_adapter_state"
-                                and r.get("payload", {}).get("reservation_event_id") == reservation_event_id
-                                and r.get("payload", {}).get("admission_receipt_id") == expected_receipt
-                                and r.get("payload", {}).get("launch_state_identity") == "accepted"]
-            if len(accepted_markers) != 1:
-                if not preacceptance_observation_id or len(accepted_markers) != 0:
-                    raise ValueError("terminal outcome requires exactly one persisted accepted launch marker")
-                cited_observation = next(
-                    (r.get("payload", {}) for r in records
-                     if r.get("payload", {}).get("event_type") == "observed_process_death"
-                     and r.get("payload", {}).get("observation_id") == preacceptance_observation_id),
-                    None,
-                )
-                if cited_observation is None:
-                    raise ValueError("pre-acceptance terminal requires persisted death observation")
-                handoff_id = (cited_observation.get("evidence") or {}).get("spawn_cleanup_handoff_id")
-                handoff = next(
-                    (r.get("payload", {}) for r in records
-                     if r.get("payload", {}).get("event_type") == "spawn_cleanup_handoff"
-                     and r.get("payload", {}).get("handoff_id") == handoff_id
-                     and r.get("payload", {}).get("reservation_event_id") == reservation_event_id),
-                    None,
-                )
-                if handoff is None:
-                    raise ValueError("pre-acceptance terminal observation is not bound to cleanup handoff")
-                if outcome.kind != "ordinary_terminal_failure":
-                    raise ValueError("pre-acceptance observation can only close as ordinary failure")
-                marker = {}
-            else:
-                marker = accepted_markers[0]
-                for name, value in (("phase", outcome.phase), ("selected_spec", outcome.selected_spec), ("logical_dispatch_id", outcome.logical_dispatch_id), ("worker_identity", outcome.worker_identity), ("started_at", outcome.started_at), ("finished_at", outcome.finished_at), ("physical_door_id", physical_door_id)):
-                    if marker.get(name) != value:
-                        raise ValueError(f"terminal outcome accepted-launch marker mismatch: {name}")
-                if marker.get("primary_spec") != expected_primary:
-                    raise ValueError("terminal outcome accepted-launch marker mismatch: primary_spec")
             if outcome.kind == "worker_disposition":
                 disp = p["dispositions"].get(outcome.disposition_id)
                 if not disp:
@@ -1670,52 +1534,7 @@ class IncidentLedger:
                     raise ValueError("reconciliation evidence is not persisted")
                 evidence.append(found)
             resolution = payload.get("resolution")
-            if resolution == "released_no_launch":
-                if payload.get("evidence_kind") != "controlled_adapter" or payload.get("launch_state_identity") != "not_started":
-                    raise ValueError("blind no-launch release rejected")
-                bound_operations = []
-                for item in evidence:
-                    operation = item.get("physical_operation_evidence") or item.get("operation_evidence")
-                    if item.get("event_type") != "controlled_adapter_state":
-                        continue
-                    if item.get("reservation_event_id") != target["event_id"]:
-                        continue
-                    if item.get("admission_receipt_id") != expected_receipt:
-                        continue
-                    if item.get("physical_door_id") != target.get("physical_door_id", ""):
-                        continue
-                    if item.get("launch_state_identity") != "not_started":
-                        continue
-                    if not isinstance(operation, Mapping):
-                        continue
-                    if (
-                        operation.get("reservation_event_id") != target["event_id"]
-                        or operation.get("admission_receipt_id") != expected_receipt
-                        or operation.get("physical_door_id") != target.get("physical_door_id", "")
-                        or operation.get("launch_state_identity") != "not_started"
-                        or not operation.get("observed_at")
-                    ):
-                        continue
-                    bound_operations.append(item)
-                if not bound_operations:
-                    raise ValueError("no-launch release lacks positive bound adapter evidence")
-                related = [
-                    r.get("payload", {}) for r in records
-                    if (
-                        r.get("payload", {}).get("reservation_event_id") == target["event_id"]
-                        or r.get("payload", {}).get("admission_receipt_id") == expected_receipt
-                        or r.get("payload", {}).get("logical_dispatch_id") == target.get("logical_dispatch_id")
-                    )
-                ]
-                if any(
-                    item.get("physical_door_id") not in (None, target.get("physical_door_id", ""))
-                    or item.get("launch_state_identity") in {"entered", "accepted", "closed", "ambiguous"}
-                    or item.get("event_type") in {"worker_terminal_outcome", "worker_disposition"}
-                    or (item.get("event_type") == "reservation_reconciled" and item.get("resolution") != "released_no_launch")
-                    for item in related
-                ):
-                    raise ValueError("contradictory launch evidence rejects no-launch release")
-            elif resolution == "terminal_outcome_recovered":
+            if resolution == "terminal_outcome_recovered":
                 if payload.get("launch_state_identity") != "accepted":
                     raise ValueError("terminal recovery requires accepted launch evidence")
                 terminal = next((item for item in evidence if item.get("event_type") == "worker_terminal_outcome" and item.get("terminal_outcome_id") == payload.get("terminal_outcome_event_id") and item.get("reservation_event_id") == target["event_id"] and item.get("admission_receipt_id") == expected_receipt), None)
@@ -2433,39 +2252,6 @@ class IncidentLedger:
 
     append_provider_probe_closed = close_provider_probe_locked
 
-    def reconcile_provider_probe_locked(
-        self,
-        *,
-        probe_lease_id: str,
-        provider_failure_key: str | None = None,
-        parent_reservation_event_id: str | None = None,
-        phase: str | None = None,
-        route_identity: str | None = None,
-        now_ns: int | None = None,
-        actor: str = "megaplan",
-    ) -> dict[str, Any]:
-        """Close an expired/failed result through the same fenced CAS door."""
-        with self._locked() as (fd, records):
-            projection = self._project_records(records)
-            lease = self._provider_find_lease(projection, probe_lease_id)
-            if lease is None:
-                raise ValueError("provider probe reconciliation requires a persisted lease")
-            result = self._provider_find_result(projection, probe_lease_id)
-            reason = "failed" if result is not None and result.get("passed") is not True else None
-            return self._close_provider_probe_locked(
-                fd,
-                records,
-                probe_lease_id=probe_lease_id,
-                provider_failure_key=provider_failure_key,
-                parent_reservation_event_id=parent_reservation_event_id,
-                phase=phase,
-                route_identity=route_identity,
-                now_ns=now_ns,
-                close_reason=reason,
-                retry_not_before_ns=0,
-                actor=actor,
-            )
-
     def record_provider_recovery_verified_locked(
         self,
         *,
@@ -2616,37 +2402,6 @@ class IncidentLedger:
                 "observation_streak": (stream or {}).get("observation_streak", 0),
                 "actor": actor,
             }
-
-    def reconcile_provider_observation_locked(
-        self,
-        *,
-        observation_id: str,
-        provider_failure_key: str | None = None,
-        actor: str = "megaplan",
-    ) -> dict[str, Any]:
-        with self._locked() as (_fd, records):
-            projection = self._project_records(records)
-            observation = projection.get("provider_observations", {}).get(observation_id)
-            if observation is None:
-                raise ValueError("provider observation is not persisted")
-            if provider_failure_key is not None and observation.get("provider_failure_key") != provider_failure_key:
-                raise ValueError("provider observation key mismatch")
-            return {**observation, "status": "observed", "actor": actor}
-
-    def reconcile_provider_durability_unknown_locked(
-        self,
-        *,
-        provider_failure_key: str,
-        phase: str,
-        reason: str = "provider_durability_unknown",
-        actor: str = "megaplan",
-    ) -> dict[str, Any]:
-        return self.record_provider_hold_locked(
-            provider_failure_key=provider_failure_key,
-            phase=phase,
-            reason=reason,
-            actor=actor,
-        )
 
     def append_probe_result(
         self,

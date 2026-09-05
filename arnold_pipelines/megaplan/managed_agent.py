@@ -361,8 +361,8 @@ def certify_managed_worker_launch(
     """Verify canonical accepted identity for an admission-backed child.
 
     Launch acceptance is committed by ``launch_transaction``.  This managed
-    adapter is intentionally read-only: it no longer writes or reads an
-    IncidentLedger accepted-launch marker.
+    adapter is intentionally read-only: it no longer writes or reads a
+    parallel launch projection; the durable operation store is authoritative.
     """
     raw_context = manifest.get("worker_execution_context")
     if raw_context is None:

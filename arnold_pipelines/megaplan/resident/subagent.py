@@ -26,11 +26,23 @@ from typing import Any, Literal
 from agentbox.redaction import redact_text
 from arnold.agent.contracts import AgentSpec, format_agent_spec
 from arnold.agent.routing import ManagedAgentRoute, resolve_managed_agent_route
+from arnold.runtime.durable_ops import (
+    FileBackedDurableOpsStore,
+    LaunchDispatchRejected,
+    LaunchEnvelope,
+    LaunchResult as DurableLaunchResult,
+    ResourceType,
+    TypedResource,
+    launch_transaction,
+    inspect_launch,
+    run_launch_preflight,
+)
 from arnold_pipelines.megaplan.managed_agent import (
     ACTIVE_STATUSES as SHARED_ACTIVE_STATUSES,
     TERMINAL_STATUSES as SHARED_TERMINAL_STATUSES,
     MANAGED_AGENT_CUSTODIAN,
     MANAGED_AGENT_SCHEMA,
+    _pid_live,
     is_managed_manifest,
     managed_run_roots,
     validate_automatic_managed_manifest,
@@ -1146,14 +1158,35 @@ def _result_from_manifest(manifest_path: Path, payload: Mapping[str, Any]) -> Su
     )
 
 
-def _existing_idempotent_launch(root: Path, launch_key: str) -> tuple[Path, dict[str, Any]] | None:
+def _manifest_matches_operation(path: Path, operation_id: str) -> bool:
+    """Read-only lookup used only to recover an admitted resident operation."""
+
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, TypeError, ValueError):
+        return False
+    return isinstance(payload, Mapping) and str(payload.get("operation_id") or "") == operation_id
+
+
+def _queued_manifest_replay(root: Path, launch_key: str) -> tuple[Path, dict[str, Any]] | None:
+    """Recover a queued delivery projection before a physical door exists.
+
+    Queued successors have no OperationRun yet and therefore cannot be
+    replayed through the launch engine.  This lookup is limited to queued
+    records; supervisor admission and every physical spawn still use the
+    canonical operation store below.
+    """
+
     for path in root.glob("*/manifest.json"):
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, ValueError, TypeError):
+        except (OSError, TypeError, ValueError):
             continue
-        if isinstance(payload, dict) and payload.get("launch_idempotency_key") == launch_key:
-            return path, payload
+        if (
+            isinstance(payload, Mapping)
+            and payload.get("launch_idempotency_key") == launch_key
+        ):
+            return path, dict(payload)
     return None
 
 
@@ -3311,10 +3344,137 @@ def follow_up_managed_subagent(
         return _followup_result(record, idempotent_replay=False)
 
 
+class _ResidentLaunchUnresolved(RuntimeError):
+    """The supervisor door ran, but canonical acceptance is still unknown."""
+
+    def __init__(self, result: Any) -> None:
+        self.result = result
+        super().__init__(
+            "resident supervisor launch remains unresolved: "
+            f"{getattr(result, 'reason', 'unknown')}"
+        )
+
+
+def _resident_ops_store_root(manifest_path: Path) -> Path:
+    """Return the durable store co-located with the resident run root."""
+
+    return manifest_path.parent.parent / ".durable-ops"
+
+
+def _resident_launch_preflight(
+    manifest_path: Path,
+    manifest: Mapping[str, Any],
+    *,
+    argv: Sequence[str],
+    operation_id: str,
+    request_id: str,
+    store_root: Path,
+) -> tuple[LaunchEnvelope, Any]:
+    """Build the complete observation-only preflight for one supervisor door."""
+
+    project_root = Path(str(manifest.get("project_dir") or Path.cwd())).resolve()
+    source_revision = _git_revision_without_process(project_root)
+    source_identity = source_revision or "unknown"
+    run_id = str(manifest.get("run_id") or manifest_path.parent.name)
+    launch_spec = {
+        "command": list(argv),
+        "cwd": str(Path(__file__).resolve().parents[3]),
+        "metadata": {
+            "run_id": run_id,
+            "manifest_path": str(manifest_path.resolve()),
+            "operation_id": operation_id,
+        },
+        "operation_type": "resident_managed_supervisor",
+        "launch_intent": "resident_managed_supervisor",
+        "process_resource_id": f"launch-process-session:{operation_id}:{request_id}",
+        "expected_session_name": run_id,
+        "runtime_vector": {
+            "python": str(Path(sys.executable).resolve()),
+            "source_revision": source_identity,
+        },
+        # Only immutable launch-contract facts participate in the preflight
+        # identity.  Mutable status/PID/telemetry projections must not turn an
+        # exact canonical replay into an envelope conflict.
+        "manifest_identity": stable_identity(
+            "resident-manifest",
+            operation_id,
+            run_id,
+            manifest.get("launch_idempotency_key") or "",
+        ),
+        "process_session_identity": None,
+    }
+    custody_id = str(manifest.get("custody_id") or run_id)
+    observations = {
+        "source": {
+            "status": "current" if source_revision else "unknown",
+            "revision": source_identity,
+            "ref": "HEAD",
+            "tree": source_identity,
+        },
+        "authority": {
+            "status": "current",
+            "grant": f"resident:{run_id}",
+            "fence": f"resident:{run_id}",
+            "decision": "resident_supervisor_launch",
+        },
+        "custody": {
+            "status": "present",
+            "custody_ref": custody_id,
+            "wbc_ref": str(store_root.resolve()),
+        },
+        "credentials": {
+            "status": "available",
+            "identity": str(manifest.get("backend") or "resident"),
+            "transport": "local",
+        },
+        "runtime": {
+            "status": "ready",
+            "interpreter": str(Path(sys.executable).resolve()),
+            "import_root": str(Path(__file__).resolve().parents[3]),
+            "source_revision": source_identity,
+        },
+        "command": {
+            "status": "valid",
+            "argv": list(argv),
+            "cwd": str(Path(__file__).resolve().parents[3]),
+            "env": {"ARNOLD_OPS_STORE_ROOT": str(store_root.resolve())},
+        },
+        "namespace": {
+            "status": "ready",
+            "name": f"resident-supervisor:{run_id}",
+        },
+        "collision": {
+            "status": "clear",
+            "name": f"resident-supervisor:{run_id}",
+        },
+        "capacity": {
+            "status": "ready",
+            "disk": "observed",
+            "inode": "observed",
+            "output": "bounded",
+            "temp": "observed",
+        },
+        "network": {
+            "status": "ready",
+            "transport": "local",
+        },
+    }
+    report = run_launch_preflight(launch_spec, observations)
+    envelope = LaunchEnvelope(
+        version=1,
+        operation_id=operation_id,
+        request_id=request_id,
+        venue="resident",
+        launch_spec=launch_spec,
+        preflight_digest=report.preflight_digest,
+    )
+    return envelope, report
+
+
 def _spawn_managed_supervisor(
     manifest_path: Path, manifest: Mapping[str, Any]
-) -> tuple[subprocess.Popen[bytes], dict[str, Any]]:
-    """Start the manifest-bound supervisor and durably record its launch."""
+) -> tuple[subprocess.Popen[bytes] | None, dict[str, Any]]:
+    """Admit and start exactly one resident supervisor through the canonical door."""
 
     argv = [
         sys.executable,
@@ -3323,29 +3483,150 @@ def _spawn_managed_supervisor(
         "--run-managed",
         str(manifest_path),
     ]
-    provenance = manifest.get("launch_provenance")
-    worker_provenance = dict(provenance) if isinstance(provenance, Mapping) else {}
-    if worker_provenance.get("applicability") == "applicable":
-        worker_provenance["root_run_id"] = str(
-            manifest.get("run_id") or manifest_path.parent.name
-        )
-    log_path = _queue_artifact_path(
-        manifest_path, manifest, "full_log_path", str(manifest.get("log_path") or "run.log")
+    run_id = str(manifest.get("run_id") or manifest_path.parent.name)
+    operation_id = str(
+        manifest.get("operation_id") or stable_identity("resident-launch-operation", run_id)
     )
-    with log_path.open("ab") as log_handle:
-        process = subprocess.Popen(
-            argv,
-            cwd=str(Path(__file__).resolve().parents[3]),
-            stdin=subprocess.DEVNULL,
-            stdout=log_handle,
-            stderr=subprocess.STDOUT,
-            start_new_session=True,
-            env=environment_with_provenance(worker_provenance),
+    request_id = str(
+        manifest.get("launch_request_id")
+        or stable_identity("resident-launch-request", operation_id)
+    )
+    store_root = _resident_ops_store_root(manifest_path)
+    store = FileBackedDurableOpsStore(store_root)
+    # Publish only immutable canonical identity before the physical door.  The
+    # supervisor process uses these fields to wait for the parent's composite
+    # acceptance before it can open the provider door; status/owner/RUNNING
+    # remain untouched until acceptance succeeds below.
+    launch_manifest = dict(manifest)
+    launch_manifest["operation_id"] = operation_id
+    launch_manifest["launch_request_id"] = request_id
+    launch_manifest["operation_store_root"] = str(store_root.resolve())
+    _atomic_json(manifest_path, launch_manifest)
+    manifest = launch_manifest
+    envelope, preflight = _resident_launch_preflight(
+        manifest_path,
+        manifest,
+        argv=argv,
+        operation_id=operation_id,
+        request_id=request_id,
+        store_root=store_root,
+    )
+    physical_process: subprocess.Popen[bytes] | None = None
+
+    def dispatch(candidate: LaunchEnvelope) -> subprocess.Popen[bytes]:
+        nonlocal physical_process
+        provenance = manifest.get("launch_provenance")
+        worker_provenance = dict(provenance) if isinstance(provenance, Mapping) else {}
+        if worker_provenance.get("applicability") == "applicable":
+            worker_provenance["root_run_id"] = run_id
+        log_path = _queue_artifact_path(
+            manifest_path,
+            manifest,
+            "full_log_path",
+            str(manifest.get("log_path") or "run.log"),
         )
-    current = json.loads(manifest_path.read_text(encoding="utf-8"))
-    ensure_managed_child_custody_fields(manifest_path, current)
-    current.setdefault("pid", process.pid)
-    current.setdefault("started_at", _utc_now())
+        try:
+            with log_path.open("ab") as log_handle:
+                physical_process = subprocess.Popen(
+                    argv,
+                    cwd=str(Path(__file__).resolve().parents[3]),
+                    stdin=subprocess.DEVNULL,
+                    stdout=log_handle,
+                    stderr=subprocess.STDOUT,
+                    start_new_session=True,
+                    env={
+                        **environment_with_provenance(worker_provenance),
+                        "ARNOLD_OPS_STORE_ROOT": str(store_root.resolve()),
+                        "ARNOLD_LAUNCH_OPERATION_ID": candidate.operation_id,
+                        "ARNOLD_LAUNCH_REQUEST_ID": candidate.request_id,
+                        "ARNOLD_LAUNCH_ENVELOPE_DIGEST": candidate.digest,
+                    },
+                )
+                return physical_process
+        except OSError as exc:
+            raise LaunchDispatchRejected(str(exc)) from exc
+
+    def observe(
+        process: subprocess.Popen[bytes], candidate: LaunchEnvelope
+    ) -> Mapping[str, Any]:
+        pid = int(process.pid)
+        start_identity = _pid_start_ticks(pid)
+        live = process.poll() is None and bool(start_identity) and _pid_live(pid)
+        return {
+            "operation_id": candidate.operation_id,
+            "request_id": candidate.request_id,
+            "envelope_digest": candidate.digest,
+            "session_name": run_id,
+            "process_session_identity": (
+                f"pid:{pid}:start:{start_identity}" if start_identity else ""
+            ),
+            "pid": pid,
+            "process_start_identity": start_identity,
+            "liveness": "running" if live else "stopped",
+        }
+
+    def resource_factory(
+        process: subprocess.Popen[bytes],
+        observation: Mapping[str, Any],
+        candidate: LaunchEnvelope,
+    ) -> TypedResource:
+        return TypedResource(
+            id=f"launch-process-session:{candidate.operation_id}:{candidate.request_id}",
+            operation_id=candidate.operation_id,
+            resource_type=ResourceType.PROCESS_SESSION,
+            name=str(observation["session_name"]),
+            details={
+                "provider": "resident-supervisor",
+                "session_name": observation["session_name"],
+                "pid": observation["pid"],
+                "process_start_identity": observation["process_start_identity"],
+                "process_session_identity": observation["process_session_identity"],
+                "manifest_path": str(manifest_path.resolve()),
+                "liveness": observation["liveness"],
+            },
+        )
+
+    transaction = launch_transaction(
+        envelope,
+        store=store,
+        preflight=preflight,
+        dispatch=dispatch,
+        observe=observe,
+        resource_factory=resource_factory,
+        operation_type="resident_managed_supervisor",
+    )
+    current = dict(manifest)
+    current["operation_id"] = operation_id
+    current["launch_request_id"] = request_id
+    current["launch_envelope_digest"] = envelope.digest
+    current["operation_store_root"] = str(store_root.resolve())
+    if transaction.result is not DurableLaunchResult.ACCEPTED:
+        current.setdefault("launch_outcome", transaction.result.value)
+        current.setdefault("launch_reason", transaction.reason.value)
+        _atomic_json(manifest_path, current)
+        raise _ResidentLaunchUnresolved(transaction)
+
+    accepted_resource = getattr(transaction.store_result, "process_resource", None)
+    if accepted_resource is not None:
+        details = dict(accepted_resource.details)
+        current["pid"] = details.get("pid")
+        current["supervisor_start_ticks"] = details.get("process_start_identity")
+        current["started_at"] = current.get("started_at") or _utc_now()
+    if transaction.reason.name == "REPLAY":
+        current = json.loads(manifest_path.read_text(encoding="utf-8"))
+        accepted_resource = next(
+            (
+                resource
+                for resource in store.list_typed_resources(operation_id)
+                if resource.resource_type is ResourceType.PROCESS_SESSION
+            ),
+            accepted_resource,
+        )
+        if accepted_resource is not None:
+            details = dict(accepted_resource.details)
+            current.setdefault("pid", details.get("pid"))
+            current.setdefault("supervisor_start_ticks", details.get("process_start_identity"))
+            current.setdefault("started_at", _utc_now())
     if current.get("status") == "launching":
         current["status"] = "running"
         current["updated_at"] = _utc_now()
@@ -3354,7 +3635,7 @@ def _spawn_managed_supervisor(
             {
                 "status": "running",
                 "at": current["updated_at"],
-                "evidence": "resident_supervisor_started",
+                "evidence": "resident_supervisor_canonical_acceptance",
             }
         )
         current["status_history"] = history[-100:]
@@ -3369,17 +3650,27 @@ def _spawn_managed_supervisor(
             }
         )
         current["queue"] = queue
+    current["launch_outcome"] = transaction.result.value
+    current["launch_reason"] = transaction.reason.value
     _atomic_json(manifest_path, current)
     _emit_managed_child_event(
         manifest_path,
         current,
         event_kind="start",
         surface="resident.subagent.supervisor",
-        evidence="resident_supervisor_started",
+        evidence="resident_supervisor_canonical_acceptance",
         at=str(current.get("updated_at") or current.get("started_at") or _utc_now()),
-        details={"supervisor_pid": process.pid},
+        details={
+            "supervisor_pid": current.get("pid"),
+            "operation_id": operation_id,
+            "request_id": request_id,
+            "envelope_digest": envelope.digest,
+        },
     )
-    return process, current
+    # The physical process handle belongs to the dispatch closure and is not
+    # persisted in the canonical store.  Replays therefore return no handle,
+    # while the exact PID remains available from the accepted resource.
+    return (None if transaction.reason.name == "REPLAY" else physical_process), current
 
 
 def launch_managed_subagent_detached(
@@ -3780,21 +4071,84 @@ def launch_managed_subagent_detached(
         dependency_identity,
         schedule_context_digest,
     )
+    canonical_operation_id = stable_identity("resident-launch-operation", launch_key)
+    canonical_request_id = stable_identity("resident-launch-request", launch_key)
     launch_lock = root / ".launch.lock"
     launch_handle = launch_lock.open("a+b")
     fcntl.flock(launch_handle.fileno(), fcntl.LOCK_EX)
-    existing = _existing_idempotent_launch(root, launch_key)
-    if existing is not None:
-        existing_path, existing_manifest = existing
-        existing = (
-            existing_path,
-            _recover_idempotent_cross_request_queue(
+    if dependency_run_ids:
+        queued_replay = _queued_manifest_replay(root, launch_key)
+        if queued_replay is not None:
+            existing_path, existing_manifest = queued_replay
+            existing_manifest = _recover_idempotent_cross_request_queue(
                 existing_path, existing_manifest
+            )
+            fcntl.flock(launch_handle.fileno(), fcntl.LOCK_UN)
+            launch_handle.close()
+            return _result_from_manifest(existing_path, existing_manifest)
+    # Canonical operation replay is the launch deduplication authority.  The
+    # resident manifest is only a delivery/work projection and cannot suppress
+    # a physical door on its own.
+    canonical_store = FileBackedDurableOpsStore(root / ".durable-ops")
+    canonical_inspection = inspect_launch(
+        canonical_operation_id,
+        store=canonical_store,
+    )
+    if canonical_inspection.result is DurableLaunchResult.ACCEPTED:
+        accepted_resource = next(
+            (
+                resource
+                for resource in canonical_inspection.resources
+                if resource.resource_type is ResourceType.PROCESS_SESSION
             ),
+            None,
+        )
+        accepted_details = dict(accepted_resource.details) if accepted_resource else {}
+        existing_path = Path(str(accepted_details.get("manifest_path") or ""))
+        if existing_path.is_file():
+            existing_manifest = json.loads(existing_path.read_text(encoding="utf-8"))
+            fcntl.flock(launch_handle.fileno(), fcntl.LOCK_UN)
+            launch_handle.close()
+            return _result_from_manifest(existing_path, existing_manifest)
+        fcntl.flock(launch_handle.fileno(), fcntl.LOCK_UN)
+        launch_handle.close()
+        return SubagentResult(
+            ok=True,
+            final_text="",
+            stderr="",
+            returncode=0,
+            run_id=canonical_operation_id,
+            status="running",
+            pid=accepted_details.get("pid") if isinstance(accepted_details.get("pid"), int) else None,
+            description=agent_description,
+        )
+    if canonical_inspection.operation is not None:
+        # An admitted PENDING operation is commit-unknown.  Never manufacture
+        # a second run directory or redispatch it from a manifest probe.
+        pending_path = next(
+            (
+                path
+                for path in root.glob("*/manifest.json")
+                if _manifest_matches_operation(path, canonical_operation_id)
+            ),
+            None,
         )
         fcntl.flock(launch_handle.fileno(), fcntl.LOCK_UN)
         launch_handle.close()
-        return _result_from_manifest(*existing)
+        if pending_path is not None:
+            return _result_from_manifest(
+                pending_path,
+                json.loads(pending_path.read_text(encoding="utf-8")),
+            )
+        return SubagentResult(
+            ok=False,
+            final_text="",
+            stderr="",
+            returncode=2,
+            run_id=canonical_operation_id,
+            status="launching",
+            description=agent_description,
+        )
     created_at = _utc_now()
     aggregation_key = (
         (
@@ -3958,6 +4312,8 @@ def launch_managed_subagent_detached(
         },
         **({"git_custody": git_custody} if git_custody is not None else {}),
         "launch_idempotency_key": launch_key,
+        "operation_id": canonical_operation_id,
+        "launch_request_id": canonical_request_id,
         "schedule_occurrence": normalized_schedule_context,
         "correlation_id": provenance.get("correlation_id") or run_id,
         "custody_id": provenance.get("custody_id") or stable_identity("resident-custody", run_id),
@@ -4254,7 +4610,27 @@ def launch_managed_subagent_detached(
     # recoverable transition from this point onward.
     fcntl.flock(launch_handle.fileno(), fcntl.LOCK_UN)
     launch_handle.close()
-    process, current = _spawn_managed_supervisor(manifest_path, manifest)
+    try:
+        process, current = _spawn_managed_supervisor(manifest_path, manifest)
+    except _ResidentLaunchUnresolved as exc:
+        unresolved = json.loads(manifest_path.read_text(encoding="utf-8"))
+        delivery = managed_child_delivery_projection(unresolved)
+        return SubagentResult(
+            ok=False,
+            final_text="",
+            stderr="",
+            returncode=2,
+            run_id=run_id,
+            status="unknown",
+            manifest_path=str(manifest_path),
+            log_path=str(log_path),
+            result_path=str(result_path),
+            custody_evidence_path=str(unresolved.get("custody_evidence_path") or "") or None,
+            delivery_owner_run_id=delivery.get("delivery_owner_run_id"),
+            parent_owned_delivery=bool(delivery.get("parent_owned_delivery")),
+            pid=None,
+            description=agent_description,
+        )
     status = str(current.get("status") or "running")
     delivery = managed_child_delivery_projection(current)
     return SubagentResult(
@@ -4270,7 +4646,7 @@ def launch_managed_subagent_detached(
         custody_evidence_path=str(current.get("custody_evidence_path") or "") or None,
         delivery_owner_run_id=delivery.get("delivery_owner_run_id"),
         parent_owned_delivery=bool(delivery.get("parent_owned_delivery")),
-        pid=process.pid,
+        pid=(process.pid if process is not None else current.get("pid")),
         description=agent_description,
     )
 
@@ -4570,6 +4946,25 @@ def _run_managed_manifest(manifest_path: Path) -> int:
         # Another manifest-bound supervisor owns the only execution lease.
         return 0
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    # The parent resident process owns the physical supervisor admission.  A
+    # just-started supervisor must wait for the parent's exact accepted tuple
+    # before it can open the nested provider/session door; otherwise a fast
+    # child could bypass accepted-only custody between Popen and the store
+    # replacement.  This is observation-only and has no redispatch path.
+    operation_id = str(manifest.get("operation_id") or "")
+    operation_store_root = str(manifest.get("operation_store_root") or "")
+    if operation_id and operation_store_root:
+        canonical_store = FileBackedDurableOpsStore(operation_store_root)
+        deadline = time.monotonic() + 5.0
+        while True:
+            inspection = inspect_launch(operation_id, store=canonical_store)
+            if inspection.result is DurableLaunchResult.ACCEPTED:
+                break
+            if time.monotonic() >= deadline:
+                fcntl.flock(execution_handle.fileno(), fcntl.LOCK_UN)
+                execution_handle.close()
+                return 2
+            time.sleep(0.01)
     if str(manifest.get("status") or "") in _TERMINAL_STATUSES:
         fcntl.flock(execution_handle.fileno(), fcntl.LOCK_UN)
         execution_handle.close()
@@ -5746,6 +6141,25 @@ def reconcile_managed_subagent_queues(
             _atomic_json(manifest_path, manifest)
             try:
                 _spawn_managed_supervisor(manifest_path, manifest)
+            except _ResidentLaunchUnresolved as exc:
+                # Canonical UNKNOWN is commit-unknown custody, not a queue
+                # retry signal.  Preserve PENDING/ownerless canonical state
+                # and wait for read-only inspection/reconciliation.
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                queue = dict(manifest.get("queue") or {})
+                queue.update(
+                    {
+                        "state": "launch_unresolved",
+                        "attention": "canonical_launch_unresolved",
+                        "last_error_class": exc.__class__.__name__,
+                        "updated_at": observed_at.isoformat(),
+                    }
+                )
+                manifest["status"] = "launching"
+                manifest["queue"] = queue
+                manifest["updated_at"] = observed_at.isoformat()
+                _atomic_json(manifest_path, manifest)
+                continue
             except Exception as exc:
                 manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
                 queue = dict(manifest.get("queue") or {})

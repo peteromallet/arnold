@@ -1,7 +1,7 @@
 """Persisted, single-use final-launch sequencing."""
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 import hashlib
@@ -13,13 +13,6 @@ from typing import Any, Callable, Mapping
 from arnold_pipelines.megaplan.incident.ledger import IncidentLedger
 from arnold_pipelines.megaplan.cloud.worker_dispatch import WorkerAdmissionReceipt, WorkerExecutionContextRef, LaunchResult
 from arnold_pipelines.megaplan.custody.common_worker_dispatch import SpawnedChildControl
-
-
-@dataclass(frozen=True)
-class LaunchStateRecord:
-    state: str
-    event_id: str
-    receipt_id: str
 
 
 class ControlledFinalLaunch:
@@ -60,93 +53,6 @@ class ControlledFinalLaunch:
             handoff_impl=self.handoff_spawn_cleanup,
             production=receipt.production_intent,
         )
-        # ``ambiguous`` was written by pre-attempt-6 adapters.  It is not a
-        # lifecycle state: keep the four-state projection intact and retain a
-        # separate, durable hold so a reopen can never manufacture a fresh
-        # ``not_started`` marker or expose the launch closure.
-        self._permanent_hold_ambiguous = False
-        self._permanent_hold_outcome: Any = None
-        # Reopen is a full-history validation boundary.  Never select a
-        # strongest marker from a contradictory persisted sequence.
-        if self.canonical:
-            # The durable operation store owns admission/lifecycle/acceptance
-            # for migrated launches.  IncidentLedger remains available only
-            # to the signal/disposition custody adapter.
-            return
-        self.ledger.projection()
-        matching = [
-            record.get("payload", {})
-            for record in self.ledger.read_nbf_events()
-            if (
-                record.get("payload", {}).get("reservation_event_id")
-                == receipt.reservation_event_id
-                and record.get("payload", {}).get("admission_receipt_id")
-                == receipt.admission_receipt_id
-            )
-        ]
-        prior = [
-            payload for payload in matching
-            if payload.get("event_type") == "controlled_adapter_state"
-            and payload.get("launch_state_identity") != "ambiguous"
-        ]
-        # Reopen from the ordered terminal marker.  Selecting the strongest
-        # marker would silently resurrect a stale accepted/closed state after
-        # a malformed or conflicting append.
-        if prior:
-            marker = prior[-1]
-            self._state = str(marker.get("launch_state_identity"))
-            self._called = self._state in {"entered", "accepted", "closed"}
-            if self._state in {"accepted", "closed"}:
-                self.accepted_worker_identity = marker.get("worker_identity")
-                self.registered_worker_identity = marker.get("worker_identity")
-                self.accepted_started_at = marker.get("started_at")
-                self.accepted_finished_at = marker.get("finished_at")
-        ambiguous_marker = any(
-            payload.get("event_type") == "controlled_adapter_state"
-            and (
-                payload.get("launch_state_identity") == "ambiguous"
-                or payload.get("permanent_hold_ambiguous") is True
-            )
-            for payload in matching
-        )
-        ambiguous_reconciliation = any(
-            payload.get("event_type") == "reservation_reconciled"
-            and (
-                payload.get("resolution") == "permanent_hold_ambiguous"
-                or payload.get("launch_state_identity") == "ambiguous"
-                or payload.get("permanent_hold_ambiguous") is True
-            )
-            for payload in matching
-        )
-        if ambiguous_marker or ambiguous_reconciliation:
-            self._permanent_hold_ambiguous = True
-            # The typed outcome is deliberately derived from the original
-            # receipt.  This keeps provider/route and execution-context fields
-            # stable across byte-identical reopens; a reconciliation identity
-            # is included when one was already persisted.
-            from arnold_pipelines.megaplan.cloud.worker_dispatch import _unresolved_outcome
-            self._permanent_hold_outcome = _unresolved_outcome(receipt)
-            reconciliation = next(
-                (
-                    payload for payload in matching
-                    if payload.get("event_type") == "reservation_reconciled"
-                    and payload.get("resolution") == "permanent_hold_ambiguous"
-                ),
-                None,
-            )
-            if reconciliation:
-                from dataclasses import replace
-                self._permanent_hold_outcome = replace(
-                    self._permanent_hold_outcome,
-                    reconciliation_event_id=str(
-                        reconciliation.get("reconciliation_id")
-                        or reconciliation.get("event_id")
-                    ),
-                )
-            self._called = True
-        elif not prior:
-            self._persist("not_started")
-
     @property
     def state(self) -> str:
         return self._state
@@ -154,49 +60,6 @@ class ControlledFinalLaunch:
     @property
     def context(self) -> WorkerExecutionContextRef:
         return self.receipt.execution_context
-
-    @property
-    def permanent_hold_ambiguous(self) -> bool:
-        """Whether legacy history permanently holds this reservation."""
-        return self._permanent_hold_ambiguous
-
-    @property
-    def permanent_hold_outcome(self) -> Any:
-        """The stable typed unresolved outcome for a legacy hold, if any."""
-        return self._permanent_hold_outcome
-
-    def _canonical_process_identity(self) -> dict[str, Any] | None:
-        """Read exact accepted worker identity from OperationRun resources."""
-        try:
-            from arnold.runtime.durable_ops import FileBackedDurableOpsStore
-            root = Path(self.receipt.operation_store_root or self.context.operation_store_root or Path(self.context.ledger_root) / "ops")
-            store = FileBackedDurableOpsStore(root)
-            operation_id = self.receipt.operation_id or self.receipt.logical_dispatch_id
-            run = store.load_operation_run(operation_id)
-            if getattr(run.state, "value", run.state) != "running":
-                return None
-            for resource in store.list_typed_resources(operation_id):
-                identity = dict(resource.details).get("worker_identity")
-                if resource.resource_type.value == "process_session" and isinstance(identity, dict):
-                    return identity
-        except (OSError, KeyError, TypeError, ValueError):
-            return None
-        return None
-
-    def _raise_permanent_hold(self) -> None:
-        from arnold_pipelines.megaplan.types import CliError
-        raise CliError(
-            "scheduling_condition",
-            "controlled final launch is permanently held for ambiguous legacy history",
-            extra={
-                "reason": "permanent_hold_ambiguous",
-                "dispatch_outcome": self._permanent_hold_outcome.to_dict(),
-                "reservation_event_id": self.receipt.reservation_event_id,
-                "admission_receipt_id": self.receipt.admission_receipt_id,
-                "physical_door_id": self.receipt.physical_door_id,
-                "execution_context": self.context.to_dict(),
-            },
-        )
 
     def register_spawned_child(self, registration: Mapping[str, Any]) -> Mapping[str, Any]:
         """Capture the exact spawned-child identity before the launch waits.
@@ -531,8 +394,8 @@ class ControlledFinalLaunch:
         """Append one observation and ordinary terminal for a dead child.
 
         This path is used after a durable handoff proves the child died.  An
-        accepted-launch marker is still required before attributing an
-        ordinary worker terminal; before acceptance the reservation remains a
+        canonical operation-store acceptance is required before attributing an
+        ordinary worker terminal; before acceptance the request remains a
         permanent custody hold.  No signal disposition or physical signal is
         created here; an available parent handle is only reaped after the
         durable terminal append.
@@ -575,13 +438,13 @@ class ControlledFinalLaunch:
         )
         canonical_identity = self._canonical_process_identity()
         if not canonical_identity:
-            # Before the closure returns there is no accepted-launch marker,
-            # hence no lawful worker terminal attribution.  Preserve custody
-            # as a durable hold for an operator/restart reconciler; do not
-            # infer success, failure, or a signal disposition from death.
+            # Before canonical operation-store acceptance there is no lawful
+            # worker terminal attribution. Preserve custody as a durable hold
+            # for an operator/restart reconciler; do not infer success,
+            # failure, or a signal disposition from death.
             return self.reconcile_spawn_cleanup(
                 process, resolution="permanent_hold", handoff_id=handoff["handoff_id"],
-                reason="child died before accepted launch marker",
+                reason="child died before canonical launch acceptance",
             )
         prior_terminal = next(
             (record["payload"] for record in self.ledger.read_nbf_events()
@@ -972,57 +835,13 @@ class ControlledFinalLaunch:
         except Exception as exc:
             return {"state": "unresolved", "reason": str(exc)}
 
-    def _persist(self, state: str, *, worker_identity: Any = None, started_at: str | None = None, finished_at: str | None = None, victim_process_start_identity: str | None = None) -> dict[str, Any]:
-        if self._permanent_hold_ambiguous and state != "not_started":
-            self._raise_permanent_hold()
-        if state == "entered" and self._state != "not_started":
-            raise RuntimeError("controlled final launch entered out of order")
-        if state == "accepted" and self._state != "entered":
-            raise RuntimeError("controlled final launch accepted out of order")
-        if state == "closed" and self._state != "accepted":
-            raise RuntimeError("controlled final launch closed out of order")
-        self._state = state
-        if self.canonical:
-            return {
-                "event_type": "canonical_operation_state",
-                "launch_state_identity": state,
-                "operation_id": self.receipt.operation_id,
-                "request_id": self.receipt.request_id,
-                "admission_receipt_id": self.receipt.admission_receipt_id,
-            }
-        event = self.ledger.append_controlled_adapter_state(
-            reservation_event_id=self.receipt.reservation_event_id,
-            admission_receipt_id=self.receipt.admission_receipt_id,
-            physical_door_id=self.receipt.physical_door_id,
-            launch_state_identity=state,
-            phase=self.receipt.phase,
-            selected_spec=self.receipt.normalized_spec,
-            primary_spec=self.receipt.normalized_spec,
-            logical_dispatch_id=self.receipt.logical_dispatch_id,
-            worker_identity=worker_identity,
-            victim_process_start_identity=victim_process_start_identity,
-            started_at=started_at,
-            finished_at=finished_at,
-            physical_operation_evidence=(
-                self.physical_operation_evidence if state == "not_started" else None
-            ),
-            actor=self.actor,
-        )
-        return event
-
     def run(self, launch: Callable[[WorkerExecutionContextRef], Any]) -> Any:
-        if self._permanent_hold_ambiguous:
-            # Keep the historical exception boundary used by dispatchers, but
-            # include the exact typed hold for callers that need to reconcile
-            # it.  Crucially this occurs before callable validation/entry and
-            # therefore cannot trigger WBC, provider, or relaunch effects.
-            self._raise_permanent_hold()
         if self._called:
             raise RuntimeError("controlled final launch closure may be called only once")
         if not callable(launch):
             raise TypeError("final launch must be callable")
         self._called = True
-        self._persist("entered")
+        self._state = "entered"
         try:
             launch_context = replace(
                 self.context,
@@ -1106,11 +925,7 @@ class ControlledFinalLaunch:
         self.accepted_started_at = started_at
         self.accepted_finished_at = finished_at
         self.accepted_worker_identity = worker_identity
-        self._persist(
-            "accepted", worker_identity=worker_identity, started_at=started_at,
-            finished_at=finished_at,
-            victim_process_start_identity=(worker_identity or {}).get("process_start_identity"),
-        )
+        self._state = "accepted"
         return value
 
     @staticmethod
@@ -1223,8 +1038,8 @@ class ControlledFinalLaunch:
 
     def close(self) -> None:
         if self._state == "accepted":
-            self._persist("closed")
+            self._state = "closed"
 
 
 
-__all__ = ["ControlledFinalLaunch", "LaunchStateRecord"]
+__all__ = ["ControlledFinalLaunch"]

@@ -205,8 +205,6 @@ def test_dispatch_success_and_uncertainty_use_only_bounded_results() -> None:
     ("consumer", "members"),
     [
         ("agentbox.host.launch_host", ("command", "repo_names", "base_refs", "cwd", "metadata", "lock_timeout_seconds")),
-        ("agentbox.host.prepare_host_resources", ("operation_type", "command", "repo_names", "base_refs", "launch_intent", "metadata", "lock_timeout_seconds")),
-        ("agentbox.host.start_host_session", ("command", "cwd", "process_resource_id")),
         ("arnold_pipelines.megaplan.agentbox_adapter.MegaplanChainHandler.launch", ("repo_name", "spec_path", "base_ref", "metadata", "lock_timeout_seconds")),
     ],
 )
@@ -271,8 +269,6 @@ def test_cloud_dispatch_launch_spec_members_are_named_by_current_request() -> No
 def test_every_launch_spec_member_is_owned_by_a_current_consumer(member: str) -> None:
     host_consumers = (
         "agentbox.host.launch_host",
-        "agentbox.host.prepare_host_resources",
-        "agentbox.host.start_host_session",
         "arnold_pipelines.megaplan.agentbox_adapter.MegaplanChainHandler.launch",
     )
     parameters: set[str] = set()
@@ -303,4 +299,6 @@ def test_every_launch_spec_member_is_owned_by_a_current_consumer(member: str) ->
         for node in request.body
         if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name)
     }
-    assert member in parameters or member in cloud_fields
+    # The process resource identifier is derived by the co-located durable
+    # store from the envelope; no venue adapter owns a caller-facing argument.
+    assert member in parameters or member in cloud_fields or member == "process_resource_id"

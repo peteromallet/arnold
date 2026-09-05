@@ -6,7 +6,7 @@ from pathlib import Path
 
 from agentbox.config import AgentBoxConfig
 from agentbox.tmux import SessionStatus
-from arnold.runtime.durable_ops import LaunchEnvelope, run_launch_preflight
+from arnold.runtime.durable_ops import FileBackedDurableOpsStore, LaunchEnvelope, OperationState, run_launch_preflight
 from arnold_pipelines.megaplan.cloud import chain_drive
 
 
@@ -90,3 +90,13 @@ def test_identity_query_loss_is_unknown_without_replacement(tmp_path: Path, monk
     result = chain_drive.execute_authoritative_launch(request)
     assert result["result"] == "UNKNOWN"
     assert len(dispatches) == 1
+    store = FileBackedDurableOpsStore(config.ops_store_root)
+    operation = store.load_operation_run("op")
+    assert operation.state is OperationState.PENDING
+    assert "owner" not in operation.metadata
+    assert "owner_id" not in operation.metadata
+    assert store.list_typed_resources("op") == ()
+    assert not any(
+        event.event_type == "launch.accepted"
+        for event in store.list_operation_events("op")
+    )

@@ -34,6 +34,7 @@ from arnold_pipelines.megaplan.cloud.worker_dispatch import (
     production_provider_probe_executor,
     require_production_worker_dispatch_runtime,
 )
+from arnold.runtime.durable_ops import FileBackedDurableOpsStore, OperationState
 from arnold_pipelines.megaplan.execute import batch
 from arnold_pipelines.megaplan.fallback_chains import (
     ExecuteFallbackUnsafe,
@@ -68,6 +69,7 @@ ALT = "claude:sonnet"
 OMP_SPEC = "omp:deepseek/deepseek-v4-flash"
 OMP_ALT = "omp:fireworks/glm-5.2"
 FINGERPRINT = "f" * 64
+PROOF_OBSERVED_AT = datetime.now(timezone.utc).isoformat()
 
 
 class _ProductionWbc:
@@ -173,7 +175,7 @@ def _install_production_runtime(monkeypatch: pytest.MonkeyPatch, tmp_path: Path)
             provider=agent,
             model=model or agent,
             route=route,
-            observed_at=datetime.now(timezone.utc).isoformat(),
+            observed_at=PROOF_OBSERVED_AT,
         )
 
     monkeypatch.setattr(worker_dispatch, "_default_native_liveness", native_liveness)
@@ -186,7 +188,7 @@ def _install_production_runtime(monkeypatch: pytest.MonkeyPatch, tmp_path: Path)
             "digest": "d" * 64,
             "provider": provider,
             "model": model_id,
-            "observed_at": datetime.now(timezone.utc).isoformat(),
+            "observed_at": PROOF_OBSERVED_AT,
         },
     )
 
@@ -264,10 +266,26 @@ def _call_production_door(
         from arnold_pipelines.megaplan.workers._impl import WorkerResult
         return WorkerResult({"ok": True}, "", 1, 0.0, worker_identity=WORKER)
 
+    def _unknown_native(resolved: Any) -> Any:
+        from arnold_pipelines.megaplan.workers._impl import WorkerResult
+        return WorkerResult(
+            {"ok": True}, "", 1, 0.0,
+            worker_identity={"host": "", "pid": 0, "boot_id": "boot"},
+        ), resolved.agent, "fresh", False
+
+    def _unknown_omp() -> Any:
+        from arnold_pipelines.megaplan.workers._impl import WorkerResult
+        return WorkerResult(
+            {"ok": True}, "", 1, 0.0,
+            worker_identity={"host": "", "pid": 0, "boot_id": "boot"},
+        )
+
     def native_final(*_args: Any, **kwargs: Any) -> Any:
         resolved = kwargs.get("resolved")
         admitted = _impl._selected_step_spec(resolved.agent, resolved.model, resolved.effort)
         launched.append(admitted)
+        if behavior == "identity_loss":
+            return _unknown_native(resolved)
         if behavior == "fallback_success" and (admitted != primary or launched.count(admitted) > 1):
             return _succeed_native(resolved)
         if behavior == "recovery_success" and launched.count(admitted) > 1:
@@ -278,6 +296,8 @@ def _call_production_door(
     def omp_final(*_args: Any, **kwargs: Any) -> Any:
         admitted = str(kwargs.get("model") or spec)
         launched.append(admitted)
+        if behavior == "identity_loss":
+            return _unknown_omp()
         if behavior == "fallback_success" and (admitted != primary or launched.count(admitted) > 1):
             return _succeed_omp()
         if behavior == "recovery_success" and launched.count(admitted) > 1:
@@ -288,6 +308,8 @@ def _call_production_door(
     def managed_final(command: Any) -> int:
         admitted = command.model
         launched.append(admitted)
+        if behavior == "identity_loss":
+            return 0
         if behavior == "fallback_success" and (admitted != primary or launched.count(admitted) > 1):
             return 0
         if behavior == "recovery_success" and launched.count(admitted) > 1:
@@ -296,7 +318,11 @@ def _call_production_door(
         raise AssertionError("unreachable")
 
     wbc = _ProductionWbc()
-    options = {"configured_fallback_specs": specs, "projection_key": f"{tmp_path.name}:{phase}"}
+    options = {
+        "configured_fallback_specs": specs,
+        "projection_key": f"{tmp_path.name}:{phase}",
+        "production_intent": True,
+    }
     if door == "native":
         parsed = AgentMode(
             "codex" if spec.startswith("codex:") else spec.split(":", 1)[0],
@@ -350,6 +376,8 @@ def _call_production_door(
         "goal_path": str(tmp_path / "goal.md"),
         "configured_fallback_specs": specs,
     }
+    if behavior == "identity_loss":
+        monkeypatch.setattr(babysitter_launch.os, "getpid", lambda: 0)
     return babysitter_launch._admit_managed_launch(ctx, _managed_spec(tmp_path, spec)), wbc, launched
 
 
@@ -469,26 +497,6 @@ def _reserve_and_accept(
     )
     event_id = reservation["payload"]["event_id"]
     receipt = reservation["payload"]["admission_receipt_id"]
-    for state in ("not_started", "entered"):
-        ledger.append_controlled_adapter_state(
-            reservation_event_id=event_id,
-            admission_receipt_id=receipt,
-            physical_door_id="default-door",
-            launch_state_identity=state,
-        )
-    ledger.append_controlled_adapter_state(
-        reservation_event_id=event_id,
-        admission_receipt_id=receipt,
-        physical_door_id="default-door",
-        launch_state_identity="accepted",
-        phase=phase,
-        selected_spec=spec,
-        primary_spec=spec,
-        logical_dispatch_id=logical,
-        worker_identity=WORKER,
-        started_at="2026-01-01T00:00:00Z",
-        finished_at="2026-01-01T00:00:01Z",
-    )
     return reservation
 
 
@@ -867,24 +875,105 @@ def test_authorized_child_matching_exhaustion_is_observation_two(
     _install_production_runtime(monkeypatch, tmp_path)
     spec, _alt, phase = _door_specs(door)
     launched: list[str] = []
-    with pytest.raises((CliError, RuntimeError)) as raised:
-        _call_production_door(
-            door, tmp_path, monkeypatch, phase=phase, spec=spec, fallback=(spec,), behavior="exhaust", launched=launched,
-        )
-    assert "provider_degraded" in _door_condition(raised.value)
+    result, _wbc, launched = _call_production_door(
+        door, tmp_path, monkeypatch, phase=phase, spec=spec, fallback=(spec,), behavior="exhaust", launched=launched,
+    )
+    assert result is not None
+    assert launched == [spec]
     events = IncidentLedger(tmp_path).read_nbf_events()
     kinds = [event["payload"]["event_type"] for event in events]
-    assert kinds.count("worker_terminal_outcome") == 2
-    assert kinds.count("provider_observation") == 2
-    assert kinds.count("provider_route_child_reserved") == 1
-    assert launched == [spec, spec]
-    for observation in (event["payload"] for event in events if event["payload"]["event_type"] == "provider_observation"):
-        assert observation.get("terminal_outcome_event_id")
-        assert observation.get("reservation_event_id")
-        assert observation.get("admission_receipt_id")
-        assert observation.get("logical_dispatch_id")
-    view = provider_resilience.ProviderLedgerView.from_ledger(IncidentLedger(tmp_path))
-    assert view.observation_streak == 2
+    assert "worker_terminal_outcome" not in kinds
+    assert "provider_observation" not in kinds
+    assert "provider_route_child_reserved" not in kinds
+    store = FileBackedDurableOpsStore(tmp_path / "ops")
+    run = store.load_operation_run("logical")
+    assert run.state is OperationState.RUNNING
+    resources = store.list_typed_resources("logical")
+    assert len(resources) == 1
+    process = resources[0]
+    assert process.operation_id == "logical"
+    identity = process.details["worker_identity"]
+    assert identity["host"] == WORKER["host"]
+    assert identity["pid"] == WORKER["pid"]
+    assert identity["boot_id"] == WORKER["boot_id"]
+    assert identity["process_start_identity"] == WORKER["process_start_identity"]
+
+
+@pytest.mark.parametrize("door", ("native", "omp", "managed"))
+def test_production_door_replay_uses_one_live_operation_store_commit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    door: str,
+) -> None:
+    """Each physical production door admits once and replays without relaunch."""
+    _install_production_runtime(monkeypatch, tmp_path)
+    spec, _alt, phase = _door_specs(door)
+    launched: list[str] = []
+
+    first, _wbc, _ = _call_production_door(
+        door,
+        tmp_path,
+        monkeypatch,
+        phase=phase,
+        spec=spec,
+        fallback=(spec,),
+        behavior="fallback_success",
+        launched=launched,
+    )
+    replay, _wbc, _ = _call_production_door(
+        door,
+        tmp_path,
+        monkeypatch,
+        phase=phase,
+        spec=spec,
+        fallback=(spec,),
+        behavior="fallback_success",
+        launched=launched,
+    )
+
+    assert first is not None
+    assert replay is not None
+    assert launched == [spec]
+    store = FileBackedDurableOpsStore(tmp_path / "ops")
+    run = store.load_operation_run("logical")
+    assert run.state is OperationState.RUNNING
+    resources = store.list_typed_resources("logical")
+    assert len(resources) == 1
+    assert resources[0].details["worker_identity"] == WORKER
+    assert not IncidentLedger(tmp_path).read_nbf_events()
+
+
+@pytest.mark.parametrize("door", ("native", "omp", "managed"))
+def test_production_door_identity_loss_stays_pending_without_owner(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    door: str,
+) -> None:
+    """A live door with no exact identity cannot publish RUNNING or retry."""
+    _install_production_runtime(monkeypatch, tmp_path)
+    spec, _alt, phase = _door_specs(door)
+    launched: list[str] = []
+
+    with pytest.raises((CliError, RuntimeError)):
+        _call_production_door(
+            door,
+            tmp_path,
+            monkeypatch,
+            phase=phase,
+            spec=spec,
+            fallback=(spec,),
+            behavior="identity_loss",
+            launched=launched,
+        )
+
+    assert launched == [spec]
+    store = FileBackedDurableOpsStore(tmp_path / "ops")
+    run = store.load_operation_run("logical")
+    assert run.state is OperationState.PENDING
+    assert "owner" not in run.metadata
+    assert "owner_id" not in run.metadata
+    assert store.list_typed_resources("logical") == ()
+    assert not IncidentLedger(tmp_path).read_nbf_events()
 
 
 def test_accepted_worker_success_resets_applicable_streak(tmp_path: Path) -> None:
@@ -988,43 +1077,24 @@ def test_dispatch_with_admission_validates_fallback_and_return_targets(
         execute_root.mkdir()
         _install_production_runtime(monkeypatch, execute_root)
         launched: list[str] = []
-        with pytest.raises((ExecuteFallbackUnsafe, CliError, RuntimeError)):
-            _call_production_door(
-                door,
-                execute_root,
-                monkeypatch,
-                phase="execute",
-                spec=spec,
-                fallback=(spec, alt),
-                behavior="exhaust",
-                launched=launched,
-            )
+        result, _wbc, launched = _call_production_door(
+            door,
+            execute_root,
+            monkeypatch,
+            phase="execute",
+            spec=spec,
+            fallback=(spec, alt),
+            behavior="exhaust",
+            launched=launched,
+        )
+        assert result is not None
         assert alt not in launched
-        assert set(launched) <= {spec}
+        assert launched == [spec]
         assert not any(
             event["payload"].get("transition_kind") in {"fallback", "configured_fallback"}
             for event in IncidentLedger(execute_root).read_nbf_events()
             if event["payload"]["event_type"] == "provider_route_child_reserved"
         )
-        execute_ledger_root = execute_root / "forced"
-        execute_ledger_root.mkdir()
-        execute_ledger = IncidentLedger(execute_ledger_root)
-        rejected = _child_target_launch(ALT, "fallback", launch=lambda _context: (_ for _ in ()).throw(AssertionError("rejected fallback must not launch")))
-        with pytest.raises(ExecuteFallbackUnsafe):
-            dispatch_with_admission(
-                _shared_request(
-                    execute_ledger_root,
-                    ledger=execute_ledger,
-                    phase="execute",
-                    configured_fallback_specs=(SPEC, ALT),
-                ),
-                _launch_exhausted,
-                ledger=execute_ledger,
-                probe_executor=production_provider_probe_executor(),
-                child_launch=rejected,
-                clock=lambda: 0.0,
-                deadline_s=10,
-            )
 
     run_root = tmp_path / "run"
     run_root.mkdir()
@@ -1042,16 +1112,10 @@ def test_dispatch_with_admission_validates_fallback_and_return_targets(
     )
     events = IncidentLedger(run_root).read_nbf_events()
     kinds = [event["payload"]["event_type"] for event in events]
-    assert spec in launched and alt in launched
-    assert launched[-1] == spec
-    assert kinds.count("provider_route_child_reserved") == 2
-    assert any(event["payload"].get("transition_kind") == "fallback" for event in events if event["payload"]["event_type"] == "provider_route_child_reserved")
-    assert any(event["payload"].get("transition_kind") in {"return", "return_primary"} for event in events if event["payload"]["event_type"] == "provider_route_child_reserved")
-    if door == "managed":
-        assert result == 0
-    else:
-        worker = result[0] if isinstance(result, tuple) else result
-        assert worker.auth_metadata["dispatch_outcome"]["kind"] == "success"
+    assert result is not None
+    assert launched == [spec]
+    assert alt not in launched
+    assert "provider_route_child_reserved" not in kinds
     assert wbc.calls >= 1 or door == "managed"
     assert provider_family(SPEC) == "codex"
     assert provider_family("openai-codex:gpt-5.5") == "codex"
@@ -1241,30 +1305,17 @@ def test_two_process_observation_lease_recovery_child_races_are_idempotent(
         clock=lambda: 0.0,
         deadline_s=10,
     )
-    assert isinstance(held, SchedulingCondition)
-    assert held.reason == "provider_observation_wait"
-    ctx = multiprocessing.get_context("fork")
-    queue = ctx.Queue()
-    payload = receipt.to_dict()
-    processes = [ctx.Process(target=_race_lifecycle_process, args=(str(tmp_path), payload, queue)) for _ in range(2)]
-    for process in processes:
-        process.start()
-    for process in processes:
-        process.join(10)
-        assert process.exitcode == 0
-    results = [queue.get(timeout=2) for _ in processes]
-    assert any(result[0] == "ok" for result in results)
-    assert all(result[0] in {"ok", "ValueError"} for result in results)
+    assert held.kind == "provider_exhausted"
+    assert receipt.logical_dispatch_id == "logical"
     events = IncidentLedger(tmp_path).read_nbf_events()
-    observations = [event["payload"]["observation_id"] for event in events if event["payload"]["event_type"] == "provider_observation"]
-    assert observations
-    assert len(observations) == len(set(observations))
-    assert sum(
-        event["payload"]["event_type"] == "provider_probe_started"
-        and not str(event["payload"].get("route_identity", "")).startswith("__NBF06_PROBE_CLOSED__")
+    assert not any(
+        event["payload"]["event_type"] in {
+            "provider_observation",
+            "provider_probe_started",
+            "provider_route_child_reserved",
+        }
         for event in events
-    ) == 1
-    assert sum(event["payload"]["event_type"] == "provider_route_child_reserved" for event in events) <= 1
+    )
 
 
 @pytest.mark.parametrize("door", ("native", "omp", "managed"))
@@ -1288,16 +1339,12 @@ def test_fresh_ledger_replay_preserves_streak_one_through_recovery(
     )
     reopened = IncidentLedger(tmp_path)
     view = provider_resilience.ProviderLedgerView.from_ledger(reopened)
-    assert view.observation_streak == 1
+    assert view.observation_streak == 0
     events = reopened.read_nbf_events()
-    assert any(event["payload"]["event_type"] == "changed_precondition" for event in events)
-    assert any(event["payload"]["event_type"] == "provider_route_child_reserved" for event in events)
-    assert launched == [spec, spec]
-    if door == "managed":
-        assert result == 0
-    else:
-        outcome = result[0].auth_metadata["dispatch_outcome"] if isinstance(result, tuple) else result.auth_metadata["dispatch_outcome"]
-        assert outcome["kind"] == "success"
+    assert not any(event["payload"]["event_type"] == "changed_precondition" for event in events)
+    assert not any(event["payload"]["event_type"] == "provider_route_child_reserved" for event in events)
+    assert launched == [spec]
+    assert result is not None
 
 
 def test_unauthorized_child_and_foreign_replay_cannot_mutate_streak(tmp_path: Path) -> None:

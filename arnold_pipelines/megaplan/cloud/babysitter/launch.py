@@ -15,15 +15,11 @@ non-zero rc into a hard abort, never a fallthrough to another repair route):
     1. Parse the watchdog's flags (--goal-file, --session, --workspace,
        --plan, --run-kind, --occurrence, --remote-spec, --run-id, --run-root,
        --mode) with ARNOLD_BABYSITTER_* env fallbacks.
-    2. Dedup: if a babysitter receipt for this session already shows a live
-       supervisor pid for the same occurrence digest (and that pid is not
-       us), exit 0 with status=already_running.  No second agent, no queue
-       enqueue, no claim.
-    3. Resolve the goal file (--goal-file / ARNOLD_BABYSITTER_GOAL_FILE), or
+    2. Resolve the goal file (--goal-file / ARNOLD_BABYSITTER_GOAL_FILE), or
        render it via the live engine's
        ``skills/babysitter/scripts/render_babysitter_goal.py`` (watchdog-
        compatible engine-root resolution).
-    4. Launch ONE managed Flash agent through
+    3. Launch ONE managed Flash agent through
        ``arnold_pipelines.megaplan.managed_agent`` (backend=babysitter); the
        worker is ``launch_omp_agent.py`` with the resolved model route,
        ``--toolsets=file,web,terminal --query-file=<goal> --project-dir=<engine>``
@@ -31,9 +27,8 @@ non-zero rc into a hard abort, never a fallthrough to another repair route):
        carry the exact Muse model/high-thinking suffix.  This process stays alive
        as the managed-agent supervisor for the whole run, so the watchdog's
        early-rc check and receipt pid liveness are honest.
-    5. Write an ``arnold.superfixer.babysitter_launch_receipt.v1`` receipt
-       (status running -> terminal, babysitter_pid, run_id, occurrence
-       digest, managed run id) and propagate the worker rc.
+    4. Emit terminal watchdog telemetry only after the canonical operation
+       decision; receipts never gate admission or dedup a physical launch.
 
 Env overrides (all optional):
     ARNOLD_BABYSITTER_SESSION / _WORKSPACE / _PLAN / _RUN_KIND / _OCCURRENCE /
@@ -52,7 +47,6 @@ import os
 import runpy
 import sys
 import socket
-import time
 from dataclasses import replace
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -72,7 +66,6 @@ from arnold_pipelines.megaplan.managed_agent import (
 )
 
 LAUNCH_RECEIPT_SCHEMA = "arnold.superfixer.babysitter_launch_receipt.v1"
-DISPATCH_RECEIPT_NAME = "{session}.babysitter-receipt.json"
 LAUNCH_RECEIPT_NAME = "{session}.babysitter-launch-receipt.json"
 
 DEFAULT_MODEL = "codex:gpt-5.6-luna"
@@ -105,28 +98,6 @@ def _provenance_safe(text: str) -> str:
 def _eprint(message: str) -> None:
     print(message, file=sys.stderr)
     sys.stderr.flush()
-
-
-def _pid_live(pid: object) -> bool:
-    """Portable pid liveness probe (mirrors managed_agent._pid_live)."""
-    if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
-        return False
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    except OSError:
-        return False
-    try:
-        stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
-        state = stat.rsplit(") ", 1)[1].split()[0]
-        if state == "Z":
-            return False
-    except (OSError, IndexError):
-        pass
-    return True
 
 
 def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
@@ -379,6 +350,7 @@ def _receipt_payload(ctx: dict[str, Any], *, status: str, **extra: Any) -> dict[
         "babysitter_pid": os.getpid(),
         "supervisor_pid": os.getpid(),
         "status": status,
+        "authority": "telemetry_only",
         "launched_at": ctx["launched_at"],
     }
     if ctx.get("marker_dir") is not None:
@@ -409,58 +381,17 @@ def _receipt_payload(ctx: dict[str, Any], *, status: str, **extra: Any) -> dict[
 
 
 def _write_receipts(ctx: dict[str, Any], payload: dict[str, Any]) -> None:
-    """Write the launch receipt where the watchdog's dedup reads it
-    (repair_data_dir) plus a mirror under the run root for run-local tooling."""
-    _atomic_write_json(ctx["run_root"] / LAUNCH_RECEIPT_NAME.format(session=ctx["session"]), payload)
-    if ctx.get("repair_data_dir") is not None:
-        _atomic_write_json(
-            ctx["repair_data_dir"] / LAUNCH_RECEIPT_NAME.format(session=ctx["session"]),
-            payload,
-        )
-
-
-def _receipt_candidates(ctx: dict[str, Any]) -> list[Path]:
-    names = (
-        LAUNCH_RECEIPT_NAME.format(session=ctx["session"]),
-        DISPATCH_RECEIPT_NAME.format(session=ctx["session"]),
+    """Write one terminal watchdog telemetry record; never an admission fact."""
+    target_root = ctx.get("repair_data_dir") or ctx["run_root"]
+    _atomic_write_json(
+        target_root / LAUNCH_RECEIPT_NAME.format(session=ctx["session"]),
+        payload,
     )
-    directories = [ctx["run_root"]]
-    if ctx.get("repair_data_dir") is not None:
-        directories.append(ctx["repair_data_dir"])
-    if ctx.get("marker_dir") is not None:
-        directories.append(ctx["marker_dir"])
-    return [directory / name for directory in directories for name in names]
 
 
 def _terminal_returncode(returncode: int, terminal_status: str) -> int:
     """Make a downgraded managed completion visible to the watchdog."""
     return returncode if terminal_status == "completed" else (returncode or 1)
-
-
-def _dedup_already_running(ctx: dict[str, Any]) -> bool:
-    """True when a live babysitter supervisor owns this occurrence digest."""
-    occurrence = ctx["occurrence"]
-    if not occurrence:
-        return False
-    for path in _receipt_candidates(ctx):
-        try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            continue
-        if not isinstance(payload, dict):
-            continue
-        if str(payload.get("occurrence_digest") or "") != occurrence:
-            continue
-        if str(payload.get("status") or "") not in {"launched", "running"}:
-            continue
-        pid = payload.get("babysitter_pid")
-        if not isinstance(pid, int):
-            pid = payload.get("supervisor_pid")
-        if pid == os.getpid():
-            continue
-        if _pid_live(pid):
-            return True
-    return False
 
 
 def _resolve_goal_file(ctx: dict[str, Any]) -> Path:
@@ -883,13 +814,6 @@ def launch_babysitter(argv: Sequence[str] | None = None) -> int:
         os.environ["ARNOLD_REPAIR_SESSION"] = _babysitter_session
     os.environ["ARNOLD_BABYSITTER_SESSION"] = _babysitter_session
     try:
-        if _dedup_already_running(ctx):
-            _eprint(
-                f"[babysitter] already_running session={ctx['session']} "
-                f"occurrence={ctx['occurrence']} — exiting 0"
-            )
-            return 0
-
         ctx["engine_root"] = _resolve_engine_root()
         # Resolve continuation profiles from the actual engine root before
         # capability and provider gates; this prevents a stale environment
@@ -904,15 +828,10 @@ def launch_babysitter(argv: Sequence[str] | None = None) -> int:
         goal_path = _resolve_goal_file(ctx)
         ctx["goal_path"] = str(goal_path)
 
-        identity_key = (
-            f"babysitter:{ctx['session']}:{ctx['occurrence']}:{ctx['run_id']}"
-            if os.environ.get("ARNOLD_BABYSITTER_AUTO_DISPATCH", "").strip()
-            in {"1", "true", "yes"}
-            else (
-                f"babysitter:{ctx['session']}:{ctx['occurrence']}:{ctx['run_id']}:"
-                f"{time.time_ns()}"
-            )
-        )
+        # The occurrence-scoped identity is stable across process restarts;
+        # canonical OperationRun replay/inspection decides whether a physical
+        # door may run.  A timestamp here would defeat exact replay.
+        identity_key = f"babysitter:{ctx['session']}:{ctx['occurrence']}:{ctx['run_id']}"
         ctx["identity_key"] = identity_key
         managed_run_id = stable_managed_run_id(RUN_KIND, identity_key)
         ctx["managed_run_id"] = managed_run_id
@@ -937,7 +856,6 @@ def launch_babysitter(argv: Sequence[str] | None = None) -> int:
                 ),
             )
             return 0
-        _write_receipts(ctx, _receipt_payload(ctx, status="running"))
         managed_terminal = "unknown"
         try:
             managed_terminal = str(

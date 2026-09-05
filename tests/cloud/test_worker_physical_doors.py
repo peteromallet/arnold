@@ -25,15 +25,15 @@ def test_physical_door_valid_admission_dispatches_once(door: str, tmp_path: Path
     req = request(root, physical_door_id=door, ledger=ledger)
     receipt = replace(require_production_worker_dispatch_runtime(req), production_intent=True)
     calls: list[int] = []
+    identity = {
+        "host": f"{door}-host",
+        "pid": 123,
+        "boot_id": "boot",
+        "process_start_identity": f"{door}-start",
+    }
 
     def launch(_context):
         calls.append(1)
-        identity = {
-            "host": f"{door}-host",
-            "pid": 123,
-            "boot_id": "boot",
-            "process_start_identity": f"{door}-start",
-        }
         return LaunchResult(True, ManagedCommandResult(0, identity), identity)
 
     first = dispatch_with_admission(req, launch, ledger=ledger, gate=lambda _request: receipt)
@@ -43,7 +43,9 @@ def test_physical_door_valid_admission_dispatches_once(door: str, tmp_path: Path
     assert replay.kind == "success"
     assert calls == [1]
     assert store.load_operation_run(receipt.operation_id).state is OperationState.RUNNING
-    assert len(store.list_typed_resources(receipt.operation_id)) == 1
+    resources = store.list_typed_resources(receipt.operation_id)
+    assert len(resources) == 1
+    assert resources[0].details["worker_identity"] == identity
     assert ledger.read_nbf_events() == []
 
 
@@ -62,4 +64,24 @@ def test_physical_door_missing_process_incarnation_is_unknown_without_retry(tmp_
     assert result.kind == "unresolved_launch"
     assert calls == [1]
     assert FileBackedDurableOpsStore(tmp_path / "ops").load_operation_run(receipt.operation_id).state is OperationState.PENDING
+    assert ledger.read_nbf_events() == []
+
+
+def test_physical_door_wrong_worker_identity_is_unknown_without_resource_or_retry(tmp_path: Path) -> None:
+    ledger = IncidentLedger(tmp_path)
+    req = request(tmp_path, ledger=ledger)
+    receipt = replace(require_production_worker_dispatch_runtime(req), production_intent=True)
+    calls: list[int] = []
+
+    def launch(_context):
+        calls.append(1)
+        identity = {"host": "", "pid": 0, "boot_id": "boot", "process_start_identity": "start"}
+        return LaunchResult(True, ManagedCommandResult(0, identity), identity)
+
+    result = dispatch_with_admission(req, launch, ledger=ledger, gate=lambda _request: receipt)
+    store = FileBackedDurableOpsStore(tmp_path / "ops")
+    assert result.kind == "unresolved_launch"
+    assert calls == [1]
+    assert store.load_operation_run(receipt.operation_id).state is OperationState.PENDING
+    assert store.list_typed_resources(receipt.operation_id) == ()
     assert ledger.read_nbf_events() == []

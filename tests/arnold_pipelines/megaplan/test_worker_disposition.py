@@ -112,23 +112,6 @@ def _terminal_ledger(tmp_path, outcome, suffix="terminal"):
         selected_spec=outcome.selected_spec,
     )
     receipt = reservation["payload"]["admission_receipt_id"]
-    marker = dict(
-        reservation_event_id=reservation["payload"]["event_id"],
-        admission_receipt_id=receipt,
-        physical_door_id="default-door",
-        phase=outcome.phase,
-        selected_spec=outcome.selected_spec,
-        primary_spec=outcome.selected_spec,
-        logical_dispatch_id=outcome.logical_dispatch_id,
-        worker_identity=WORKER,
-        started_at=outcome.started_at,
-        finished_at=outcome.finished_at,
-    )
-    for state in ("not_started", "entered", "accepted"):
-        ledger.append_controlled_adapter_state(
-            **marker,
-            launch_state_identity=state,
-        )
     return ledger, reservation, receipt
 
 

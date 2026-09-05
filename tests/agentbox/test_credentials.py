@@ -139,22 +139,6 @@ def test_missing_required_credentials_block_chain_launch_and_return_fix_command(
     )
     run_paths = ensure_run_dir(agentbox_config, operation_id)
 
-    fake_worktree = SimpleNamespace(worktree_path=project_root)
-    fake_prepared = SimpleNamespace(
-        operation_id=operation_id,
-        run_paths=run_paths,
-        requested_repo_names=(),
-        worktrees=(fake_worktree,),
-        log_resources=(),
-    )
-    monkeypatch.setattr(
-        "arnold_pipelines.megaplan.agentbox_adapter.prepare_host_resources",
-        lambda *args, **kwargs: fake_prepared,
-    )
-    monkeypatch.setattr(
-        "arnold_pipelines.megaplan.agentbox_adapter.start_host_session",
-        lambda *args, **kwargs: None,
-    )
     monkeypatch.setattr(
         "arnold_pipelines.megaplan.agentbox_adapter.list_credentials",
         lambda config, environ=None: [
@@ -166,6 +150,10 @@ def test_missing_required_credentials_block_chain_launch_and_return_fix_command(
                 test_status="untested",
             )
         ],
+    )
+    monkeypatch.setattr(
+        "arnold_pipelines.megaplan.agentbox_adapter.get_repo",
+        lambda _config, _name: SimpleNamespace(path=project_root),
     )
 
     handler = MegaplanChainHandler()
