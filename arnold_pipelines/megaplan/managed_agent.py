@@ -1276,24 +1276,30 @@ def _run_managed_command_locked(
             and capability.get("profile") == FILESYSTEM_CAPABILITY_RECOVERY_ENGINE_ONLY
         ):
             _record_target_git_state(manifest, capability)
-        manifest["worker_pid"] = child.pid
-
-        manifest["worker_start_ticks"] = _pid_start_ticks(child.pid)
-        manifest["worker_started_at"] = utc_now()
-        manifest["worker_identity"] = _managed_worker_identity(
-            child.pid, manifest["worker_start_ticks"]
-        )
-        manifest["worker_launch_certified"] = certify_managed_worker_launch(
-            manifest_path,
-            manifest,
-            pid=child.pid,
-            worker_identity=manifest["worker_identity"],
-            process_start_identity=str(manifest["worker_start_ticks"] or ""),
-            started_at=str(manifest["worker_started_at"]),
-        )
+        # The child is physically started inside the canonical dispatch
+        # closure, but its PID/identity/running projection belongs to the
+        # OperationRun accepted transition.  Canonical doors therefore defer
+        # this projection; standalone managed-agent invocations retain their
+        # established local lifecycle telemetry.
+        canonical_door = os.environ.get("ARNOLD_CANONICAL_LAUNCH_ACTIVE") == "1"
+        if not canonical_door:
+            manifest["worker_pid"] = child.pid
+            manifest["worker_start_ticks"] = _pid_start_ticks(child.pid)
+            manifest["worker_started_at"] = utc_now()
+            manifest["worker_identity"] = _managed_worker_identity(
+                child.pid, manifest["worker_start_ticks"]
+            )
+            manifest["worker_launch_certified"] = certify_managed_worker_launch(
+                manifest_path,
+                manifest,
+                pid=child.pid,
+                worker_identity=manifest["worker_identity"],
+                process_start_identity=str(manifest["worker_start_ticks"] or ""),
+                started_at=str(manifest["worker_started_at"]),
+            )
+            _append_status(manifest, "running", evidence="worker_process_started")
+            atomic_write_manifest(manifest_path, manifest)
         manifest["worker_cmdline_sha256"] = hashlib.sha256(raw_cmdline).hexdigest()
-        _append_status(manifest, "running", evidence="worker_process_started")
-        atomic_write_manifest(manifest_path, manifest)
         log_path = Path(str(manifest["log_path"]))
         with log_path.open("ab") as log:
             assert child.stdout is not None

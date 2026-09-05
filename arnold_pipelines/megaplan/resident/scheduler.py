@@ -684,9 +684,18 @@ class ResidentJobHandlers:
                 f"superfixer_proactive launch not authorized: {verdict.value}"
             )
         result = await self._launch_superfixer_managed(job, occurrence, claim, dispatch)
-        self._record_superfixer_launch_receipt(
-            job, occurrence, claim, result, service=service
-        )
+        # The schedule occurrence is only a projection of a canonical
+        # accepted launch.  Queued, rejected, and unresolved managed results
+        # must never be recorded as ``launched``.
+        result_status = str(getattr(result, "status", "") or "").lower()
+        if bool(getattr(result, "ok", False)) and result_status in {"accepted", "running"}:
+            self._record_superfixer_launch_receipt(
+                job, occurrence, claim, result, service=service
+            )
+        elif result_status in {"unknown", "rejected", "failed"} or not getattr(result, "ok", False):
+            raise RuntimeError(
+                f"canonical managed launch was not accepted: {result_status or 'unknown'}"
+            )
 
     def _reschedule_superfixer_proactive(
         self, job: ScheduledJob, dispatch: Mapping[str, Any]

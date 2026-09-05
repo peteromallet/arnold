@@ -65,6 +65,10 @@ from arnold_pipelines.megaplan.cloud.template import (
 )
 from arnold_pipelines.megaplan.layout import is_canonical_chain_spec
 from arnold_pipelines.megaplan.types import CliError
+from arnold.runtime.durable_ops import (
+    read_only_capacity_observation,
+    read_only_network_observation,
+)
 
 
 load_spec = load_cloud_spec
@@ -2504,6 +2508,40 @@ def _provider_prelaunch_capacity(provider) -> dict[str, Any]:
             "errors": ["provider returned a non-object capacity observation"],
         }
     return payload
+
+
+def _cloud_launch_capacity_observation(provider: Any, project_root: Path) -> dict[str, Any]:
+    """Return an observed capacity row for the canonical launch preflight."""
+    if callable(getattr(provider, "observe_prelaunch_capacity", None)):
+        remote = _provider_prelaunch_capacity(provider)
+        if remote.get("verdict") == "GO" and remote.get("status") in {"available", "ok", "ready"}:
+            return {
+                "status": "available",
+                "disk": "observed",
+                "inode": "observed",
+                "output": "bounded",
+                "temp": "observed",
+                "mount": remote.get("mount"),
+                "temp_mount": remote.get("temp_mount"),
+            }
+        return {"status": "unknown", "disk": "unknown", "inode": "unknown", "output": "unknown", "temp": "unknown"}
+    raw = read_only_capacity_observation(project_root, output_bound_bytes=0, temp_path=project_root)
+    return {
+        "status": raw.get("status", "unknown"),
+        "disk": "observed" if raw.get("free_bytes") is not None else "unknown",
+        "inode": "observed" if raw.get("free_inodes") is not None else "unknown",
+        "output": "bounded" if raw.get("output_bound_proven") else "unknown",
+        "temp": "observed" if raw.get("temp_free_bytes") is not None else "unknown",
+        "mount": raw.get("mount"),
+        "temp_mount": raw.get("temp_mount"),
+    }
+
+
+def _cloud_launch_network_observation(spec: CloudSpec) -> dict[str, Any]:
+    transport = "ssh" if spec.provider == "ssh" else "docker" if spec.provider == "local" else "local"
+    host = str(getattr(getattr(spec, "ssh", None), "host", None) or "localhost")
+    port = getattr(getattr(spec, "ssh", None), "port", None)
+    return read_only_network_observation(transport=transport, host=host, port=port)
 
 
 def _container_collector_ready(observation: Mapping[str, Any] | None) -> bool:
@@ -5090,53 +5128,6 @@ def _tmux_chain_stop_for_fresh_command(
     )
 
 
-def _tmux_chain_restart_command(
-    workspace: str,
-    remote_spec_path: str,
-    *,
-    session_name: str | None = None,
-    spec: CloudSpec | None = None,
-    log_relative: str = _CHAIN_LOG_RELATIVE,
-    marker_path: str | None = None,
-) -> str:
-    """Return a shell command that kills any existing tmux session and starts a
-    fresh one-shot tick.
-
-    Only the supervisor uses this path — it is never called from the normal
-    ``cloud chain`` launch flow.
-
-    *session_name* defaults to :data:`CHAIN_SESSION_NAME` (``megaplan-chain``)
-    when not provided.
-    """
-    name = session_name or CHAIN_SESSION_NAME
-    if log_relative == _CHAIN_LOG_RELATIVE and name != CHAIN_SESSION_NAME:
-        log_relative = f".megaplan/cloud-chain-{name}.log"
-    marker = marker_path or str(PurePosixPath(_CHAIN_SESSION_MARKER_DIR) / f"{name}.json")
-    chain_cmd = _refresh_then_chain_start_command(
-        remote_spec_path,
-        spec=spec,
-        project_dir=workspace,
-        one_shot=True,
-        log_relative=log_relative,
-        repair_session=name,
-        repair_run_kind="chain",
-        repair_marker_dir=str(PurePosixPath(marker).parent),
-    )
-    return (
-        f"mkdir -p {shlex.quote(str(PurePosixPath(workspace) / '.megaplan'))}"
-        " && "
-        f"if tmux has-session -t {shlex.quote(name)} 2>/dev/null; then "
-        f"python3 -P -m arnold_pipelines.megaplan.cloud.operator_control tmux-stop "
-        f"--spec /dev/null --workspace $(dirname {shlex.quote(marker)}) "
-        f"--session {shlex.quote(name)} --marker {shlex.quote(marker)} "
-        f"--remote-spec {shlex.quote(remote_spec_path)} || "
-        "{ echo 'ERROR: exact tmux authority proof failed; refusing restart'; exit 17; }; "
-        "fi; "
-        f"tmux new-session -d -s {shlex.quote(name)} -c {shlex.quote(workspace)} {shlex.quote(chain_cmd)}; "
-        f"echo {shlex.quote(f'restarted {name} session')}"
-    )
-
-
 def _chain_state_reset_command(
     *,
     workspace: str,
@@ -5971,11 +5962,6 @@ def _run_authoritative_chain_wrapper(root: Path, args: argparse.Namespace, spec:
         )))
     for source, destination in _chain_anchor_uploads(local_spec_path, launch_ctx.remote_spec_path, chain_spec):
         _append_unique_upload(uploads, source, destination)
-    _ensure_repo_checkout(spec, provider, relay=False)
-    for source, destination in uploads:
-        provider.upload_file(source, destination)
-    provider.upload_file(local_spec_path, launch_ctx.remote_spec_path)
-
     command = _chain_start_command(
         launch_ctx.remote_spec_path,
         project_dir=launch_ctx.workspace,
@@ -6005,13 +5991,13 @@ def _run_authoritative_chain_wrapper(root: Path, args: argparse.Namespace, spec:
         "source": {"status": "current", "revision": str(spec.megaplan.ref), "ref": str(spec.megaplan.ref), "tree": str(project_root)},
         "authority": {"status": "current", "grant": launch_ctx.identity, "fence": launch_ctx.identity, "decision": launch_ctx.identity},
         "custody": {"status": "present", "custody_ref": launch_ctx.workspace, "wbc_ref": launch_ctx.workspace},
-        "credentials": {"status": "available", "identity": spec.provider, "transport": spec.provider},
+        "credentials": {"status": "available" if not _missing_configured_secrets(spec, os.environ) else "unknown", "identity": spec.provider, "transport": spec.provider},
         "runtime": {"status": "present", "interpreter": spec.megaplan.runtime_python or "python", "import_root": spec.megaplan.src_path, "source_revision": str(spec.megaplan.ref)},
         "command": {"status": "valid", "argv": command, "cwd": launch_ctx.workspace, "env": {}},
         "namespace": {"status": "valid", "name": launch_ctx.session_name},
         "collision": {"status": "none", "namespace": launch_ctx.session_name},
-        "capacity": {"status": "available", "disk": "remote", "inode": "remote", "output": "bounded", "temp": "remote"},
-        "network": {"status": "available", "transport": spec.provider},
+        "capacity": _cloud_launch_capacity_observation(provider, project_root),
+        "network": _cloud_launch_network_observation(spec),
     }
     preflight = run_launch_preflight(launch_spec, observations)
     envelope = LaunchEnvelope(
@@ -6022,6 +6008,12 @@ def _run_authoritative_chain_wrapper(root: Path, args: argparse.Namespace, spec:
         launch_spec=launch_spec,
         preflight_digest=preflight.preflight_digest,
     )
+    if not preflight.accepted:
+        raise CliError("launch_preflight_rejected", "; ".join(preflight.failures))
+    _ensure_repo_checkout(spec, provider, relay=False)
+    for source, destination in uploads:
+        provider.upload_file(source, destination)
+    provider.upload_file(local_spec_path, launch_ctx.remote_spec_path)
     request = build_launch_request(
         envelope=envelope,
         command=command,
@@ -6301,17 +6293,7 @@ def _run_epic_chain_wrapper(root: Path, args: argparse.Namespace, spec: CloudSpe
         local_spec_path=local_spec_path,
         epic_chain_spec=epic_chain_spec,
     )
-    _ensure_repo_checkout(spec, provider, relay=False)
     uploads = _durable_megaplan_uploads(project_root, launch_ctx.workspace)
-    archive_path: Path | None = None
-    try:
-        archive_path = _write_durable_megaplan_archive(project_root, uploads)
-        provider.upload_archive(archive_path, launch_ctx.workspace)
-    finally:
-        if archive_path is not None:
-            archive_path.unlink(missing_ok=True)
-    provider.upload_file(local_spec_path, launch_ctx.remote_spec_path)
-
     command = _epic_chain_start_command(
         launch_ctx.remote_spec_path,
         workspace=launch_ctx.workspace,
@@ -6338,13 +6320,13 @@ def _run_epic_chain_wrapper(root: Path, args: argparse.Namespace, spec: CloudSpe
         "source": {"status": "current", "revision": str(spec.megaplan.ref), "ref": str(spec.megaplan.ref), "tree": str(project_root)},
         "authority": {"status": "current", "grant": launch_ctx.identity, "fence": launch_ctx.identity, "decision": launch_ctx.identity},
         "custody": {"status": "present", "custody_ref": launch_ctx.workspace, "wbc_ref": launch_ctx.workspace},
-        "credentials": {"status": "available", "identity": spec.provider, "transport": spec.provider},
+        "credentials": {"status": "available" if not _missing_configured_secrets(spec, os.environ) else "unknown", "identity": spec.provider, "transport": spec.provider},
         "runtime": {"status": "present", "interpreter": spec.megaplan.runtime_python or "python", "import_root": spec.megaplan.src_path, "source_revision": str(spec.megaplan.ref)},
         "command": {"status": "valid", "argv": command, "cwd": launch_ctx.workspace, "env": {}},
         "namespace": {"status": "valid", "name": launch_ctx.session_name},
         "collision": {"status": "none", "namespace": launch_ctx.session_name},
-        "capacity": {"status": "available", "disk": "remote", "inode": "remote", "output": "bounded", "temp": "remote"},
-        "network": {"status": "available", "transport": spec.provider},
+        "capacity": _cloud_launch_capacity_observation(provider, project_root),
+        "network": _cloud_launch_network_observation(spec),
     }
     preflight = run_launch_preflight(launch_spec, observations)
     envelope = LaunchEnvelope(
@@ -6355,6 +6337,17 @@ def _run_epic_chain_wrapper(root: Path, args: argparse.Namespace, spec: CloudSpe
         launch_spec=launch_spec,
         preflight_digest=preflight.preflight_digest,
     )
+    if not preflight.accepted:
+        raise CliError("launch_preflight_rejected", "; ".join(preflight.failures))
+    _ensure_repo_checkout(spec, provider, relay=False)
+    archive_path: Path | None = None
+    try:
+        archive_path = _write_durable_megaplan_archive(project_root, uploads)
+        provider.upload_archive(archive_path, launch_ctx.workspace)
+    finally:
+        if archive_path is not None:
+            archive_path.unlink(missing_ok=True)
+    provider.upload_file(local_spec_path, launch_ctx.remote_spec_path)
     request = build_launch_request(
         envelope=envelope,
         command=command,

@@ -41,6 +41,21 @@ def _chain_tick_command(remote_spec_path: str, *, one_shot: bool = False) -> str
     return _cmd(remote_spec_path, one_shot=one_shot)
 
 
+def _canonical_resume_command(workspace: str, remote_spec: str, *, session_name: str) -> str:
+    """Invoke the operator resume adapter, whose physical door is canonical.
+
+    The supervisor must not manufacture a raw ``tmux new-session`` command.
+    The remote operator-control module performs the complete preflight and
+    routes the physical session through ``launch_transaction``.
+    """
+    marker = str(PurePosixPath(workspace) / ".megaplan" / "cloud-sessions" / f"{session_name}.json")
+    return shlex.join([
+        "python3", "-P", "-m", "arnold_pipelines.megaplan.cloud.operator_control",
+        "resume", "--spec", remote_spec, "--workspace", workspace,
+        "--session", session_name, "--marker", marker, "--actor", "supervisor",
+    ])
+
+
 def _remote_sync_refresh_command(
     workspace: str,
     remote_spec: str,
@@ -386,7 +401,6 @@ def cloud_supervise_tick(
     # ── deferred imports to keep the module's top-level light ──────────
     from arnold_pipelines.megaplan.cloud.cli import (
         _resolve_remote_chain_spec,
-        _tmux_chain_restart_command,
         cloud_chain_status_payload,
     )
     from arnold_pipelines.megaplan.cloud import feature_flags
@@ -776,7 +790,7 @@ def cloud_supervise_tick(
             if not feature_flags.mutation_authorized(feature_flags.MUTATION_PATH_L1):
                 return l1_mutation_blocked_report("merged PR eligible for advance")
             try:
-                restart_cmd = _tmux_chain_restart_command(
+                restart_cmd = _canonical_resume_command(
                     resolved_workspace, remote_spec, session_name=resolved_session
                 )
                 ssh_meth(restart_cmd)
@@ -847,7 +861,7 @@ def cloud_supervise_tick(
             if not feature_flags.mutation_authorized(feature_flags.MUTATION_PATH_L1):
                 return l1_mutation_blocked_report("stale bookkeeping eligible for restart")
             try:
-                restart_cmd = _tmux_chain_restart_command(
+                restart_cmd = _canonical_resume_command(
                     resolved_workspace, remote_spec, session_name=resolved_session
                 )
                 ssh_meth(restart_cmd)
@@ -976,7 +990,7 @@ def cloud_supervise_tick(
             if not feature_flags.mutation_authorized(feature_flags.MUTATION_PATH_L1):
                 return l1_mutation_blocked_report("verified runner eligible for wake")
             try:
-                restart_cmd = _tmux_chain_restart_command(
+                restart_cmd = _canonical_resume_command(
                     resolved_workspace,
                     remote_spec,
                     session_name=resolved_session,

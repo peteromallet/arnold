@@ -18,6 +18,8 @@ from arnold.runtime.durable_ops import (
     TypedResource,
     ResourceType,
     run_launch_preflight,
+    read_only_capacity_observation,
+    read_only_network_observation,
 )
 
 from agentbox.config import AgentBoxConfig
@@ -349,20 +351,37 @@ def _host_preflight_observations(
     source = repo_paths[0] if repo_paths else config.workspace_root
     source_revision = str(source)
     source_status = "current" if source.exists() and all(path.exists() for path in repo_paths) else "missing"
+    raw_capacity = read_only_capacity_observation(
+        config.workspace_root,
+        output_bound_bytes=0,
+        temp_path=config.workspace_root,
+    )
+    capacity = {
+        "status": raw_capacity.get("status", "unknown"),
+        "disk": "observed" if raw_capacity.get("free_bytes") is not None else "unknown",
+        "inode": "observed" if raw_capacity.get("free_inodes") is not None else "unknown",
+        "output": "bounded" if raw_capacity.get("output_bound_proven") else "unknown",
+        "temp": "observed" if raw_capacity.get("temp_free_bytes") is not None else "unknown",
+        "mount": raw_capacity.get("mount"),
+        "temp_mount": raw_capacity.get("temp_mount"),
+    }
+    network = read_only_network_observation(transport="local", host="localhost")
+    credentials = {
+        "status": "available" if config.credentials_root.exists() else "unknown",
+        "identity": str(config.credentials_root),
+        "transport": "local",
+    }
     return {
         "source": {"status": source_status, "revision": source_revision, "ref": source_revision, "tree": source_revision},
         "authority": {"status": "current", "grant": operation_id, "fence": operation_id, "decision": operation_id},
         "custody": {"status": "present", "custody_ref": str(config.workspace_root), "wbc_ref": str(config.ops_store_root)},
-        "credentials": {"status": "available", "identity": str(config.credentials_root), "transport": "local"},
+        "credentials": credentials,
         "runtime": {"status": "present", "interpreter": sys.executable, "import_root": str(config.workspace_root), "source_revision": source_revision},
         "command": {"status": "valid", "argv": _command_payload(command), "cwd": str(cwd or config.workspace_root), "env": {}},
         "namespace": {"status": "valid", "name": session},
         "collision": {"status": collision, "namespace": session},
-        # Capacity is observed as bounded named resources; volatile byte
-        # counters are intentionally excluded from launch identity so an exact
-        # replay does not become a divergent request between two syscalls.
-        "capacity": {"status": "available", "disk": "workspace", "inode": "workspace", "output": "bounded", "temp": "workspace"},
-        "network": {"status": "available", "transport": "local"},
+        "capacity": capacity,
+        "network": network,
     }
 
 

@@ -29,6 +29,11 @@ from arnold.runtime.durable_ops.launch import (
     launch_transaction,
 )
 from arnold.runtime.durable_ops.typed_resources import ResourceType, TypedResource
+from arnold.runtime.durable_ops.launch_preflight import (
+    read_only_capacity_observation,
+    read_only_network_observation,
+    run_launch_preflight,
+)
 from arnold_pipelines.megaplan.incident.schema import semantic_dispatch_fingerprint
 from arnold_pipelines.megaplan.fallback_chains import provider_family
 from arnold_pipelines.megaplan.orchestration.phase_result import (
@@ -112,12 +117,90 @@ def _worker_launch_envelope(receipt: "WorkerAdmissionReceipt") -> LaunchEnvelope
     )
 
 
-class _WorkerPreflight:
-    __slots__ = ("accepted", "preflight_digest")
+def _worker_launch_preflight(
+    receipt: "WorkerAdmissionReceipt", envelope: LaunchEnvelope
+) -> Any:
+    """Collect the complete physical-door preflight at the launch venue.
 
-    def __init__(self, preflight_digest: str) -> None:
-        self.accepted = True
-        self.preflight_digest = preflight_digest
+    The admission receipt proves route selection; it is not itself a
+    preflight report.  Physical worker doors must still run the shared
+    observation-only ten-section gate immediately before admission.  Capacity
+    is measured with stat/statvfs only and the network row is a validated route
+    observation, never an optimistic label.
+    """
+    # Measure the venue workspace, never the store directory itself: admission
+    # creates the latter, so using it would make the first and replayed
+    # preflight disagree solely because the store now exists.
+    root = (
+        Path(receipt.operation_store_root).parent
+        if receipt.operation_store_root
+        else Path(receipt.execution_context.ledger_root)
+    )
+    if not root.exists():
+        root = root.parent
+    raw_capacity = read_only_capacity_observation(root, output_bound_bytes=0, temp_path=root)
+    # Free-byte counters are observations, not launch identity.  Retain the
+    # proof result and stable mount identity so exact replay cannot conflict
+    # merely because another process consumed a few bytes between reads.
+    capacity = {
+        "status": raw_capacity.get("status", "unknown"),
+        "disk": "observed" if raw_capacity.get("free_bytes") is not None else "unknown",
+        "inode": "observed" if raw_capacity.get("free_inodes") is not None else "unknown",
+        "output": "bounded" if raw_capacity.get("output_bound_proven") else "unknown",
+        "temp": "observed" if raw_capacity.get("temp_free_bytes") is not None else "unknown",
+        "mount": raw_capacity.get("mount"),
+        "temp_mount": raw_capacity.get("temp_mount"),
+    }
+    network = read_only_network_observation(transport="local", host="localhost")
+    source_revision = str(receipt.source_revision or "")
+    runtime_vector = receipt.runtime_vector
+    observations = {
+        "source": {
+            "status": "current" if source_revision else "unknown",
+            "revision": source_revision,
+            "ref": source_revision,
+            "tree": source_revision,
+        },
+        "authority": {
+            "status": "current",
+            "grant": receipt.admission_receipt_id,
+            "fence": receipt.dispatch_family_id,
+            "decision": receipt.reservation_event_id,
+        },
+        "custody": {
+            "status": "present" if root.exists() else "unknown",
+            "custody_ref": str(root),
+            "wbc_ref": str(root),
+        },
+        "credentials": {
+            "status": "available" if receipt.provider else "unknown",
+            "identity": receipt.provider,
+            "transport": "local",
+        },
+        "runtime": {
+            "status": "ready" if runtime_vector else "unknown",
+            "interpreter": receipt.dependency_interpreter_identity,
+            "import_root": str(root),
+            "source_revision": source_revision,
+        },
+        "command": {
+            "status": "valid",
+            "argv": [receipt.normalized_spec],
+            "cwd": str(root),
+            "env": {},
+        },
+        "namespace": {
+            "status": "valid",
+            "name": receipt.physical_door_id,
+        },
+        "collision": {
+            "status": "none",
+            "namespace": receipt.physical_door_id,
+        },
+        "capacity": capacity,
+        "network": network,
+    }
+    return run_launch_preflight(envelope.launch_spec, observations)
 
 
 def _continuation_probe_profile_identity(project_dir: Path) -> dict[str, str]:
@@ -1443,7 +1526,13 @@ def _canonical_worker_launch(
     from arnold_pipelines.megaplan.cloud.controlled_final_launch import ControlledFinalLaunch
 
     controlled = ControlledFinalLaunch(receipt, ledger=ledger, canonical=True)
-    envelope = _worker_launch_envelope(receipt)
+    provisional_envelope = _worker_launch_envelope(receipt)
+    # The receipt's route proof is not a substitute for the complete physical
+    # launch preflight.  Rebuild the immutable envelope with the digest from
+    # the shared observation-only report so admission cannot occur through a
+    # positive/digest-only stub.
+    preflight = _worker_launch_preflight(receipt, provisional_envelope)
+    envelope = replace(provisional_envelope, preflight_digest=preflight.preflight_digest)
     started = _now()
     physical_value: Any = None
 
@@ -1451,7 +1540,15 @@ def _canonical_worker_launch(
         # The closure is the sole physical door.  The engine invokes it once;
         # replay and reconciliation return before this callback.
         nonlocal physical_value
-        physical_value = controlled.run(launch)
+        prior_canonical = os.environ.get("ARNOLD_CANONICAL_LAUNCH_ACTIVE")
+        os.environ["ARNOLD_CANONICAL_LAUNCH_ACTIVE"] = "1"
+        try:
+            physical_value = controlled.run(launch)
+        finally:
+            if prior_canonical is None:
+                os.environ.pop("ARNOLD_CANONICAL_LAUNCH_ACTIVE", None)
+            else:
+                os.environ["ARNOLD_CANONICAL_LAUNCH_ACTIVE"] = prior_canonical
         return physical_value
 
     def observe(value: Any, candidate: LaunchEnvelope) -> Mapping[str, Any]:
@@ -1498,7 +1595,7 @@ def _canonical_worker_launch(
     result = launch_transaction(
         envelope,
         store=store,
-        preflight=_WorkerPreflight(receipt.preflight_digest),
+        preflight=preflight,
         dispatch=dispatch,
         observe=observe,
         resource_factory=resource_factory,
@@ -1614,7 +1711,6 @@ def dispatch_with_admission(
     return_worker: bool = False,
     probe_executor: Callable[[Any], Any] | Any | None = None,
     child_launch: Callable[[WorkerExecutionContextRef], Any] | None = None,
-    admission_preflight: Callable[[WorkerAdmissionReceipt], Mapping[str, Any] | None] | None = None,
 ) -> Any:
     """Run one logical dispatch through admission and one controlled closure."""
     if not isinstance(request, WorkerAdmissionRequest):

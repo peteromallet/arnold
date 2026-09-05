@@ -27,6 +27,17 @@ from arnold_pipelines.megaplan.cloud.liveness_lease import tmux_authority_bindin
 from arnold_pipelines.megaplan.incident.disposition import SignalDispositionError, signal_non_worker
 from arnold_pipelines.megaplan.incident.ledger import IncidentLedger
 from arnold_pipelines.megaplan.incident.schema import NonWorkerSignalDisposition
+from arnold.runtime.durable_ops import (
+    FileBackedDurableOpsStore,
+    LaunchDispatchRejected,
+    LaunchEnvelope,
+    ResourceType,
+    TypedResource,
+    launch_transaction,
+    read_only_capacity_observation,
+    read_only_network_observation,
+    run_launch_preflight,
+)
 
 
 RESUME_HOLD_KEY = "operator_resume_hold"
@@ -449,49 +460,106 @@ def resume_session(
         "ARNOLD_REPAIR_RUN_KIND": str(marker.get("run_kind") or "chain"),
     }
     if no_push:
-        # A no-push chain resume deliberately stays on the current milestone
-        # checkout. In chain.run_chain this disables PR branch preparation,
-        # whose cleanup step otherwise resets tracked and untracked WIP before
-        # checking out the remote milestone branch.
         managed_env["MEGAPLAN_CHAIN_NO_PUSH"] = "1"
-    tmux_command = ["tmux", "new-session", "-d", "-s", session, "-c", str(workspace)]
-    for key, value in managed_env.items():
-        tmux_command.extend(["-e", f"{key}={value}"])
-    tmux_command.append(relaunch)
-    # Publish the final launch-authorizing marker before dispatch.  Runtime
-    # attestation binds the marker's stable launch identity, while this CAS
-    # prevents a concurrent pause/rebind from being overwritten.
-    marker.pop("operator_pause", None)
-    marker.pop(RESUME_HOLD_KEY, None)
-    marker["should_run"] = True
-    launched_marker_sha256 = _write_marker(
-        marker_path,
-        marker,
-        expected_sha256=marker_sha256,
+    operation_id = str(marker.get("operation_id") or f"operator-resume:{session}")
+    request_id = str(marker.get("launch_request_id") or f"operator-resume-request:{session}")
+    store_root = Path(str(marker.get("operation_store_root") or workspace / ".durable-ops"))
+    launch_command = " ".join([relaunch])
+    launch_spec = {
+        "command": launch_command,
+        "cwd": str(workspace),
+        "operation_type": "operator_resume",
+        "launch_intent": "operator_resume",
+        "process_resource_id": f"launch-process-session:{operation_id}:{request_id}",
+        "expected_session_name": session,
+        "process_session_identity": session,
+    }
+    raw_capacity = read_only_capacity_observation(workspace, output_bound_bytes=0, temp_path=workspace)
+    capacity = {
+        "status": raw_capacity.get("status", "unknown"),
+        "disk": "observed" if raw_capacity.get("free_bytes") is not None else "unknown",
+        "inode": "observed" if raw_capacity.get("free_inodes") is not None else "unknown",
+        "output": "bounded" if raw_capacity.get("output_bound_proven") else "unknown",
+        "temp": "observed" if raw_capacity.get("temp_free_bytes") is not None else "unknown",
+        "mount": raw_capacity.get("mount"),
+        "temp_mount": raw_capacity.get("temp_mount"),
+    }
+    observations = {
+        "source": {"status": "current", "revision": str(spec.resolve()), "ref": str(spec.resolve()), "tree": str(spec.resolve())},
+        "authority": {"status": "current", "grant": str(result.get("resume_authority") or actor), "fence": session, "decision": "operator_resume"},
+        "custody": {"status": "present", "custody_ref": str(marker_path.resolve()), "wbc_ref": str(store_root.resolve())},
+        "credentials": {"status": "available", "identity": actor, "transport": "local"},
+        "runtime": {"status": "ready", "interpreter": sys.executable, "import_root": str(workspace), "source_revision": str(spec.resolve())},
+        "command": {"status": "valid", "argv": [launch_command], "cwd": str(workspace), "env": managed_env},
+        "namespace": {"status": "valid", "name": session},
+        "collision": {"status": "none", "namespace": session},
+        "capacity": capacity,
+        "network": read_only_network_observation(transport="local", host="localhost"),
+    }
+    preflight = run_launch_preflight(launch_spec, observations)
+    envelope = LaunchEnvelope(
+        version=1,
+        operation_id=operation_id,
+        request_id=request_id,
+        venue="operator",
+        launch_spec=launch_spec,
+        preflight_digest=preflight.preflight_digest,
     )
-    try:
-        subprocess.run(tmux_command, check=True)
-        alive = _runner_survives_launch(session)
-        if not alive:
-            raise RuntimeError("session runner exited before post-launch liveness confirmation")
-    except Exception:
-        # Restore a resumable stopped marker.  CAS prevents this failure path
-        # from overwriting a concurrent pause, rebind, or successful relaunch.
-        stopped, stopped_sha256 = _load_marker(marker_path)
-        if stopped_sha256 != launched_marker_sha256:
-            raise RuntimeError(
-                "session marker changed concurrently after launch dispatch; "
-                "refusing to restore stale stop authority"
-            )
-        stopped["should_run"] = False
-        stopped[RESUME_HOLD_KEY] = _resume_hold(
-            spec=spec,
-            workspace=workspace,
-            session=session,
-            resume_authority=result["resume_authority"],
+    store = FileBackedDurableOpsStore(store_root)
+
+    def dispatch(candidate: LaunchEnvelope) -> str:
+        tmux_command = ["tmux", "new-session", "-d", "-s", session, "-c", str(workspace)]
+        for key, value in managed_env.items():
+            tmux_command.extend(["-e", f"{key}={value}"])
+        tmux_command.append(relaunch)
+        try:
+            subprocess.run(tmux_command, check=True)
+        except (OSError, subprocess.CalledProcessError) as exc:
+            raise LaunchDispatchRejected(str(exc)) from exc
+        return session
+
+    def observe(dispatched: str, candidate: LaunchEnvelope) -> dict[str, Any]:
+        alive = _runner_survives_launch(dispatched)
+        return {
+            "operation_id": candidate.operation_id,
+            "request_id": candidate.request_id,
+            "envelope_digest": candidate.digest,
+            "session_name": dispatched,
+            "process_session_identity": dispatched,
+            "liveness": "running" if alive else "stopped",
+        }
+
+    def resource_factory(dispatched: str, observation: dict[str, Any], candidate: LaunchEnvelope) -> TypedResource:
+        return TypedResource(
+            id=f"launch-process-session:{candidate.operation_id}:{candidate.request_id}",
+            operation_id=candidate.operation_id,
+            resource_type=ResourceType.PROCESS_SESSION,
+            name=dispatched,
+            details=dict(observation),
         )
-        _write_marker(marker_path, stopped, expected_sha256=stopped_sha256)
-        raise
+
+    transaction = launch_transaction(
+        envelope,
+        store=store,
+        preflight=preflight,
+        dispatch=dispatch,
+        observe=observe,
+        resource_factory=resource_factory,
+        operation_type="operator_resume",
+    )
+    if transaction.result.name != "ACCEPTED":
+        raise RuntimeError(f"operator resume launch was not accepted: {transaction.reason.value}")
+    # Marker state is a post-acceptance projection only.  A marker write can
+    # never admit or certify the session, and a projection failure must not
+    # turn an already accepted OperationRun into a second launch attempt.
+    try:
+        accepted_marker, accepted_sha256 = _load_marker(marker_path)
+        accepted_marker.pop("operator_pause", None)
+        accepted_marker.pop(RESUME_HOLD_KEY, None)
+        accepted_marker["should_run"] = True
+        _write_marker(marker_path, accepted_marker, expected_sha256=accepted_sha256)
+    except (OSError, RuntimeError, ValueError):
+        pass
     return {
         **result,
         "session": session,

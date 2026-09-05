@@ -35,6 +35,8 @@ from arnold.runtime.durable_ops import (
     TypedResource,
     launch_transaction,
     inspect_launch,
+    read_only_capacity_observation,
+    read_only_network_observation,
     run_launch_preflight,
 )
 from arnold_pipelines.megaplan.managed_agent import (
@@ -3404,6 +3406,20 @@ def _resident_launch_preflight(
         "process_session_identity": None,
     }
     custody_id = str(manifest.get("custody_id") or run_id)
+    raw_capacity = read_only_capacity_observation(
+        store_root.parent,
+        output_bound_bytes=0,
+        temp_path=store_root.parent,
+    )
+    capacity = {
+        "status": raw_capacity.get("status", "unknown"),
+        "disk": "observed" if raw_capacity.get("free_bytes") is not None else "unknown",
+        "inode": "observed" if raw_capacity.get("free_inodes") is not None else "unknown",
+        "output": "bounded" if raw_capacity.get("output_bound_proven") else "unknown",
+        "temp": "observed" if raw_capacity.get("temp_free_bytes") is not None else "unknown",
+        "mount": raw_capacity.get("mount"),
+        "temp_mount": raw_capacity.get("temp_mount"),
+    }
     observations = {
         "source": {
             "status": "current" if source_revision else "unknown",
@@ -3423,7 +3439,7 @@ def _resident_launch_preflight(
             "wbc_ref": str(store_root.resolve()),
         },
         "credentials": {
-            "status": "available",
+            "status": "available" if manifest.get("backend") else "unknown",
             "identity": str(manifest.get("backend") or "resident"),
             "transport": "local",
         },
@@ -3447,17 +3463,8 @@ def _resident_launch_preflight(
             "status": "clear",
             "name": f"resident-supervisor:{run_id}",
         },
-        "capacity": {
-            "status": "ready",
-            "disk": "observed",
-            "inode": "observed",
-            "output": "bounded",
-            "temp": "observed",
-        },
-        "network": {
-            "status": "ready",
-            "transport": "local",
-        },
+        "capacity": capacity,
+        "network": read_only_network_observation(transport="local", host="localhost"),
     }
     report = run_launch_preflight(launch_spec, observations)
     envelope = LaunchEnvelope(
@@ -3493,15 +3500,13 @@ def _spawn_managed_supervisor(
     )
     store_root = _resident_ops_store_root(manifest_path)
     store = FileBackedDurableOpsStore(store_root)
-    # Publish only immutable canonical identity before the physical door.  The
-    # supervisor process uses these fields to wait for the parent's composite
-    # acceptance before it can open the provider door; status/owner/RUNNING
-    # remain untouched until acceptance succeeds below.
+    # Keep launch identity in memory until the complete observation-only gate
+    # passes.  Manifest publication is launch-side mutation and must not occur
+    # on a rejected preflight.
     launch_manifest = dict(manifest)
     launch_manifest["operation_id"] = operation_id
     launch_manifest["launch_request_id"] = request_id
     launch_manifest["operation_store_root"] = str(store_root.resolve())
-    _atomic_json(manifest_path, launch_manifest)
     manifest = launch_manifest
     envelope, preflight = _resident_launch_preflight(
         manifest_path,
@@ -3536,6 +3541,7 @@ def _spawn_managed_supervisor(
                     start_new_session=True,
                     env={
                         **environment_with_provenance(worker_provenance),
+                        "ARNOLD_CANONICAL_LAUNCH_ACTIVE": "1",
                         "ARNOLD_OPS_STORE_ROOT": str(store_root.resolve()),
                         "ARNOLD_LAUNCH_OPERATION_ID": candidate.operation_id,
                         "ARNOLD_LAUNCH_REQUEST_ID": candidate.request_id,
@@ -5220,49 +5226,51 @@ def _run_managed_manifest(manifest_path: Path) -> int:
         # process cannot be lost to a parent/child manifest race.
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         ensure_managed_child_custody_fields(manifest_path, manifest)
+        canonical_door = os.environ.get("ARNOLD_CANONICAL_LAUNCH_ACTIVE") == "1"
         worker_started_at = _utc_now()
-        manifest.update({"worker_started_at": worker_started_at, "worker_pid": worker.pid})
-        manifest["worker_start_ticks"] = _pid_start_ticks(worker.pid)
-        manifest["worker_identity"] = _managed_worker_identity(
-            worker.pid, manifest["worker_start_ticks"]
-        )
-        manifest["worker_launch_certified"] = certify_managed_worker_launch(
-            manifest_path,
-            manifest,
-            pid=worker.pid,
-            worker_identity=manifest["worker_identity"],
-            process_start_identity=str(manifest["worker_start_ticks"] or ""),
-            started_at=worker_started_at,
-        )
-        manifest["session_dispatch"] = {
-            "status": "accepted",
-            "mode": (
-                "resume" if manifest.get("run_mode") == "session_continuation" else "new"
-            ),
-            "session_id": session_id,
-            "accepted_at": worker_started_at,
-            "evidence": (
-                f"{backend}_resume_process_started"
-                if manifest.get("run_mode") == "session_continuation"
-                else f"{backend}_session_process_started"
-            ),
-        }
-        if provider_permission_mode is not None:
-            manifest["session_dispatch"]["permission_mode"] = provider_permission_mode
-        _atomic_json(manifest_path, manifest)
-        _emit_managed_child_event(
-            manifest_path,
-            manifest,
-            event_kind="effect",
-            surface="resident.subagent_worker.dispatch",
-            evidence=str(manifest["session_dispatch"]["evidence"]),
-            at=worker_started_at,
-            details={
-                "worker_pid": worker.pid,
-                "dispatch_mode": manifest["session_dispatch"]["mode"],
+        if not canonical_door:
+            manifest.update({"worker_started_at": worker_started_at, "worker_pid": worker.pid})
+            manifest["worker_start_ticks"] = _pid_start_ticks(worker.pid)
+            manifest["worker_identity"] = _managed_worker_identity(
+                worker.pid, manifest["worker_start_ticks"]
+            )
+            manifest["worker_launch_certified"] = certify_managed_worker_launch(
+                manifest_path,
+                manifest,
+                pid=worker.pid,
+                worker_identity=manifest["worker_identity"],
+                process_start_identity=str(manifest["worker_start_ticks"] or ""),
+                started_at=worker_started_at,
+            )
+            manifest["session_dispatch"] = {
+                "status": "accepted",
+                "mode": (
+                    "resume" if manifest.get("run_mode") == "session_continuation" else "new"
+                ),
                 "session_id": session_id,
-            },
-        )
+                "accepted_at": worker_started_at,
+                "evidence": (
+                    f"{backend}_resume_process_started"
+                    if manifest.get("run_mode") == "session_continuation"
+                    else f"{backend}_session_process_started"
+                ),
+            }
+            if provider_permission_mode is not None:
+                manifest["session_dispatch"]["permission_mode"] = provider_permission_mode
+            _atomic_json(manifest_path, manifest)
+            _emit_managed_child_event(
+                manifest_path,
+                manifest,
+                event_kind="effect",
+                surface="resident.subagent_worker.dispatch",
+                evidence=str(manifest["session_dispatch"]["evidence"]),
+                at=worker_started_at,
+                details={
+                    "worker_pid": worker.pid,
+                    "dispatch_mode": manifest["session_dispatch"]["mode"],
+                    "session_id": session_id,
+                },
+            )
         try:
             returncode = worker.wait(timeout=timeout_s) if timeout_s is not None else worker.wait()
         except subprocess.TimeoutExpired:

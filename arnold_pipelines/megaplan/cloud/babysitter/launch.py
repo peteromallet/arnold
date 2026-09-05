@@ -621,28 +621,6 @@ def canonical_launch_custody_view(
     }
 
 
-def _automatic_dispatch_preflight(ctx: dict[str, Any], spec: ManagedCommandSpec):
-    """Return an observation-only managed-door preflight.
-
-    Launch acceptance, identity, and replay are owned by the canonical
-    OperationRun store.  The babysitter does not inspect or write a marker,
-    reservation, receipt, or IncidentLedger launch projection.
-    """
-    del spec
-    if os.environ.get("ARNOLD_BABYSITTER_AUTO_DISPATCH", "").strip() not in {"1", "true", "yes"}:
-        return None
-    workspace = str(ctx.get("workspace") or "").strip()
-
-    def preflight(_receipt: Any) -> dict[str, Any]:
-        if not workspace:
-            return {"suppress": True, "reason": "managed launch workspace is unavailable"}
-        if not Path(workspace).expanduser().exists():
-            return {"suppress": True, "reason": "managed launch workspace is unavailable"}
-        return {"observed": {"workspace": workspace}}
-
-    return preflight
-
-
 def _admit_managed_launch(ctx: dict[str, Any], spec: ManagedCommandSpec) -> int:
     """Run the managed command only after one canonical admission decision."""
     from arnold_pipelines.megaplan.cloud.runtime_attestation import require_production_worker_dispatch_runtime
@@ -737,7 +715,6 @@ def _admit_managed_launch(ctx: dict[str, Any], spec: ManagedCommandSpec) -> int:
         gate=require_production_worker_dispatch_runtime,
         probe_executor=production_provider_probe_executor(),
         child_launch=launch,
-        admission_preflight=_automatic_dispatch_preflight(ctx, spec),
     )
     if isinstance(result, AdmissionRefusal):
         raise RuntimeError(f"babysitter admission refused: {result.code}: {result.reason}")
