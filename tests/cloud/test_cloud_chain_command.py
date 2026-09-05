@@ -2624,6 +2624,78 @@ def test_chain_rejects_noncanonical_before_materialization_or_filesystem_delta(
     assert after == before
 
 
+def test_public_cloud_chain_rejects_noncanonical_before_deploy_cache_materialization(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    home = tmp_path / "isolated-home"
+    monkeypatch.setenv("HOME", str(home))
+    project = tmp_path / "project"
+    project.mkdir()
+    loose = project / "incoming-chain.yaml"
+    loose.write_text(
+        "milestones:\n  - label: m1\n    idea: idea.md\n",
+        encoding="utf-8",
+    )
+    before = {path.relative_to(tmp_path): path.read_bytes() for path in tmp_path.rglob("*") if path.is_file()}
+    monkeypatch.setattr(
+        "arnold_pipelines.megaplan.cloud.cli._load_cloud_spec",
+        lambda *_args: _cloud_spec(),
+    )
+    monkeypatch.setattr(
+        "arnold_pipelines.megaplan.cloud.cli._provider_for_action",
+        lambda *_args: SimpleNamespace(),
+    )
+
+    args = _cloud_parser().parse_args(
+        ["cloud", "chain", str(loose), "--cloud-yaml", str(project / "cloud.yaml")]
+    )
+    rc = run_cloud_cli(project, args)
+    captured = capsys.readouterr()
+    output = captured.out + captured.err
+
+    assert rc == 1
+    assert "chain_spec_not_canonical" in output
+    assert not home.exists()
+    assert {path.relative_to(tmp_path): path.read_bytes() for path in tmp_path.rglob("*") if path.is_file()} == before
+
+
+def test_public_cloud_launch_epic_rejects_noncanonical_before_deploy_cache_materialization(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    home = tmp_path / "isolated-home"
+    monkeypatch.setenv("HOME", str(home))
+    project = tmp_path / "project"
+    loose = project / "incoming-epic"
+    loose.mkdir(parents=True)
+    (loose / "NORTHSTAR.md").write_text("North star\n", encoding="utf-8")
+    (loose / "m1.md").write_text("M1\n", encoding="utf-8")
+    before = {path.relative_to(tmp_path): path.read_bytes() for path in tmp_path.rglob("*") if path.is_file()}
+    monkeypatch.setattr(
+        "arnold_pipelines.megaplan.cloud.cli._load_cloud_spec",
+        lambda *_args: _cloud_spec(),
+    )
+    monkeypatch.setattr(
+        "arnold_pipelines.megaplan.cloud.cli._provider_for_action",
+        lambda *_args: SimpleNamespace(),
+    )
+
+    args = _cloud_parser().parse_args(
+        ["cloud", "launch-epic", str(loose), "--cloud-yaml", str(project / "cloud.yaml")]
+    )
+    rc = run_cloud_cli(project, args)
+    captured = capsys.readouterr()
+    output = captured.out + captured.err
+
+    assert rc == 1
+    assert "chain_spec_not_canonical" in output
+    assert not home.exists()
+    assert {path.relative_to(tmp_path): path.read_bytes() for path in tmp_path.rglob("*") if path.is_file()} == before
+
+
 def test_launch_epic_materializes_canonical_layout_from_brief_dir(tmp_path: Path) -> None:
     app = tmp_path / "app"
     brief_dir = app / "incoming" / "research-plan-execute-epic"

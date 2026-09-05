@@ -1167,6 +1167,7 @@ def run_cloud_cli(root: Path, args: argparse.Namespace) -> int:
             attest_runtime()
 
         if action == "chain":
+            _reject_noncanonical_launch_input(root, args, action="chain")
             with _materialized_deploy_dir(spec):
                 return _run_chain_wrapper(root, args, spec, provider)
 
@@ -1174,6 +1175,7 @@ def run_cloud_cli(root: Path, args: argparse.Namespace) -> int:
             return _run_sync_megaplan(root, args, spec, provider)
 
         if action == "launch-epic":
+            _reject_noncanonical_launch_input(root, args, action="launch-epic")
             with _materialized_deploy_dir(spec):
                 return _run_launch_epic_wrapper(root, args, spec, provider)
 
@@ -5945,6 +5947,35 @@ def _run_watchdog_tracking_verification(provider, ctx: ChainLaunchContext) -> di
     return payload
 
 
+def _reject_noncanonical_launch_input(
+    root: Path, args: argparse.Namespace, *, action: str
+) -> None:
+    """Reject loose ordinary launch input before deploy-cache materialization."""
+    if bool(getattr(args, "prepare_only", False)):
+        return
+    input_value = getattr(args, "spec", None) if action == "chain" else getattr(args, "spec_or_dir", None)
+    source = Path(input_value).expanduser().resolve()
+    source_spec = source if source.is_file() else source / "chain.yaml"
+    source_root = _chain_project_root(source_spec, root)
+    if source_spec.exists() and is_canonical_chain_spec(source_spec, source_root):
+        return
+    if action == "chain":
+        message = (
+            "cloud chain launch requires an already-canonical initiative; "
+            "run `cloud chain <input> --prepare-only` first to materialize loose input"
+        )
+    else:
+        message = (
+            "cloud launch-epic requires an already-canonical initiative; "
+            "run `cloud launch-epic <input> --prepare-only` first to materialize loose input"
+        )
+    raise CliError(
+        "chain_spec_not_canonical",
+        message,
+        extra={"spec": str(source_spec), "project_root": str(source_root)},
+    )
+
+
 def _run_authoritative_chain_wrapper(root: Path, args: argparse.Namespace, spec: CloudSpec, provider) -> int:
     """Prepare remote inputs, then invoke the co-located launch engine once.
 
@@ -5957,25 +5988,7 @@ def _run_authoritative_chain_wrapper(root: Path, args: argparse.Namespace, spec:
     from arnold_pipelines.megaplan.cloud.chain_drive import build_launch_request
 
     if not bool(getattr(args, "_canonicalized_epic", False)):
-        # Launch mode must not canonicalize loose input as a side effect of
-        # attempting a launch.  ``--prepare-only`` is the explicit preparation
-        # boundary; an already canonical initiative is safe to inspect and
-        # launch without materialization.
-        source = Path(args.spec).expanduser().resolve()
-        source_spec = source if source.is_file() else source / "chain.yaml"
-        source_root = _chain_project_root(source_spec, root)
-        if not bool(getattr(args, "prepare_only", False)) and not (
-            source_spec.exists() and is_canonical_chain_spec(source_spec, source_root)
-        ):
-            raise CliError(
-                "chain_spec_not_canonical",
-                (
-                    "cloud chain launch requires an already-canonical initiative; "
-                    "run `cloud chain <input> --prepare-only` first to materialize "
-                    "loose input"
-                ),
-                extra={"spec": str(source_spec), "project_root": str(source_root)},
-            )
+        _reject_noncanonical_launch_input(root, args, action="chain")
         materialized = _materialize_canonical_epic_input(root=root, spec=spec, spec_or_dir=args.spec)
         args = argparse.Namespace(
             **{
@@ -6127,22 +6140,8 @@ def _prepare_chain_inputs(root, args, spec, provider, local_spec_path, project_r
 def _run_chain_wrapper(root: Path, args: argparse.Namespace, spec: CloudSpec, provider) -> int:
     return _run_authoritative_chain_wrapper(root, args, spec, provider)
 def _run_launch_epic_wrapper(root: Path, args: argparse.Namespace, spec: CloudSpec, provider) -> int:
-    source = Path(args.spec_or_dir).expanduser().resolve()
-    source_spec = source if source.is_file() else source / "chain.yaml"
-    source_root = _chain_project_root(source_spec, root)
+    _reject_noncanonical_launch_input(root, args, action="launch-epic")
     prepare_only = bool(getattr(args, "prepare_only", False))
-    if not prepare_only and not (
-        source_spec.exists() and is_canonical_chain_spec(source_spec, source_root)
-    ):
-        raise CliError(
-            "chain_spec_not_canonical",
-            (
-                "cloud launch-epic requires an already-canonical initiative; "
-                "run `cloud launch-epic <input> --prepare-only` first to "
-                "materialize loose input"
-            ),
-            extra={"spec": str(source_spec), "project_root": str(source_root)},
-        )
     materialized = _materialize_canonical_epic_input(
         root=root,
         spec=spec,
