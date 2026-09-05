@@ -387,6 +387,134 @@ LivenessProbe = Callable[[Mapping[str, Any]], dict[str, Any]]
 # --- public API ------------------------------------------------------------
 
 
+def render_maintenance_observation(
+    envelope: Any,
+    *,
+    comparison: Any | None = None,
+    projection: Any | None = None,
+) -> dict[str, Any]:
+    """Render a deterministic, read-only Maintenance observation sibling.
+
+    Inputs are immutable evidence already captured by the caller.  This
+    renderer never rereads mutable sources and never infers progress from
+    process, activity, status, or repair evidence.
+    """
+    from arnold_pipelines.megaplan.maintenance.identity import canonical_digest
+
+    if comparison is None:
+        bucket = None
+        reasons: list[str] = []
+        stale_projection = False
+        digest_mismatch = False
+        missing_denominator = None
+        denominator = None
+        covered_count = None
+        coverage = None
+        projection_name = None
+        projection_source_digest = None
+        projection_output_digest = None
+    else:
+        bucket = (
+            comparison.bucket.value
+            if hasattr(comparison.bucket, "value")
+            else comparison.bucket
+        )
+        reasons = list(comparison.reasons)
+        stale_projection = comparison.stale_projection
+        digest_mismatch = comparison.digest_mismatch
+        missing_denominator = comparison.missing_denominator
+        denominator = comparison.denominator
+        covered_count = comparison.covered_count
+        coverage = comparison.coverage
+        projection_name = comparison.projection_name
+        projection_source_digest = comparison.projection_source_digest
+        projection_output_digest = comparison.projection_output_digest
+
+    projection_freshness = None
+    if projection is not None:
+        projection_freshness = getattr(projection, "freshness", None)
+        if hasattr(projection_freshness, "value"):
+            projection_freshness = projection_freshness.value
+
+    # Only an explicitly fresh projection supports a positive verdict.  A
+    # missing or novel freshness value is unknown and therefore fails closed.
+    projection_green = projection_freshness == "fresh" and not stale_projection
+    envelope_eligible = bool(envelope.is_eligible)
+    comparison_match = comparison is not None and bucket == "match"
+    eligible = bool(envelope_eligible and projection_green and comparison_match)
+    green = bool(eligible and comparison.green)
+    terminal = bool(eligible and comparison.terminal)
+    dispatchable = bool(eligible and comparison.dispatchable)
+
+    vectors = [
+        {
+            "owner": vector.owner,
+            "source": vector.source,
+            "environment": (
+                vector.environment.root if vector.environment is not None else None
+            ),
+            "before": vector.before,
+            "after": vector.after,
+        }
+        for vector in envelope.version_vectors
+    ]
+
+    payload = {
+        "schema_version": 1,
+        "envelope": {
+            "schema_version": envelope.schema_version,
+            "observed_at": envelope.observed_at.root.isoformat(),
+            "environment": (
+                envelope.environment.root if envelope.environment is not None else None
+            ),
+            "tenant": envelope.tenant.root if envelope.tenant is not None else None,
+            "run": envelope.run.root if envelope.run is not None else None,
+            "chain": envelope.chain.root if envelope.chain is not None else None,
+            "plan": envelope.plan.root if envelope.plan is not None else None,
+            "stage": envelope.stage.root if envelope.stage is not None else None,
+            "model": envelope.model.root if envelope.model is not None else None,
+            "profile": envelope.profile.root if envelope.profile is not None else None,
+            "attempt": envelope.attempt.root if envelope.attempt is not None else None,
+            "digest": canonical_digest(envelope),
+        },
+        "states": {
+            "completeness": envelope.completeness.value,
+            "freshness": envelope.freshness.value,
+            "coherence": envelope.coherence.value,
+            "coherence_reasons": [reason.value for reason in envelope.coherence_reasons],
+        },
+        "cross_environment": bool(envelope.cross_environment),
+        "source_version_vectors": vectors,
+        "projection": {
+            "name": projection_name,
+            "freshness": projection_freshness,
+            "source_digest": projection_source_digest,
+            "output_digest": projection_output_digest,
+        },
+        "comparison": {
+            "present": comparison is not None,
+            "bucket": bucket,
+            "reasons": reasons,
+            "stale_projection": stale_projection,
+            "digest_mismatch": digest_mismatch,
+            "missing_denominator": missing_denominator,
+            "denominator": denominator,
+            "covered_count": covered_count,
+            "coverage": coverage,
+        },
+        "verdict": {
+            "green": green,
+            "terminal": terminal,
+            "dispatchable": dispatchable,
+            "eligible": eligible,
+        },
+        "progress_inferred_from_process": False,
+    }
+    view_hash = hashlib.sha256(canonical_json(payload).encode("utf-8")).hexdigest()
+    payload["view_hash"] = view_hash
+    return payload
+
+
 def build_cloud_status_snapshot(
     *,
     marker_dir: Path | None = None,
@@ -397,6 +525,7 @@ def build_cloud_status_snapshot(
     liveness_probe: LivenessProbe | None = None,
     history_path: Path | str | None = None,
     source_cursor_vector: Mapping[str, Any] | None = None,
+    maintenance_observation: Any | None = None,
 ) -> dict[str, Any]:
     """Build the canonical cloud status snapshot from local observation only.
 
@@ -474,6 +603,10 @@ def build_cloud_status_snapshot(
         "degraded": {"reasons": degraded_reasons} if degraded_reasons else None,
         "source_cursor_vector": _format_source_cursor(source_cursor_vector),
     }
+    if maintenance_observation is not None:
+        snapshot["maintenance_observation"] = render_maintenance_observation(
+            maintenance_observation
+        )
     if watchdog_report is not None:
         snapshot["watchdog_generated_at"] = watchdog_report.get("timestamp_utc") or ""
         snapshot["watchdog_sessions_seen"] = watchdog_report.get("sessions_seen")

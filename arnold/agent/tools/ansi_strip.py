@@ -1,6 +1,6 @@
 """Strip ANSI escape sequences from subprocess output.
 
-Used by terminal_tool, code_execution_tool, and process_registry to clean
+Used by terminal_tool and code_execution_tool to clean
 command output before returning it to the model.  This prevents ANSI codes
 from entering the model's context — which is the root cause of models
 copying escape sequences into file writes.

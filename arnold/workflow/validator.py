@@ -34,7 +34,6 @@ from typing import Any, Mapping
 
 from arnold.pipeline.contracts import BindResult, RepairGradient, bind
 from arnold.pipeline.declaration_lowering import lower_stage_declarations
-from arnold.agent.costing.model_resource_capabilities import prove_stage_required_capabilities
 from arnold.pipeline.types import Port, PortRef, ReadRef, WriteRef
 from arnold.workflow.invocation_validation import (
     DefaultInvocationRegistryView,
@@ -52,7 +51,6 @@ CONTRACT_ERROR_CODE_MAP: dict[str, str] = {
 DECLARATION_DRIFT_CODE = "contract.declaration_drift"
 MISSING_BINDING_CODE = "dataflow.missing_binding"
 UNKNOWN_ADAPTER_CODE = "invocation.unknown_adapter"
-UNSATISFIED_CAPABILITY_CODE = "capability.unsatisfied"
 MALFORMED_NATIVE_BUNDLE_CODE = "execution.native_bundle_malformed"
 PLACEHOLDER_EXECUTION_RESOURCE_CODE = "execution.placeholder_resource"
 NATIVE_MANIFEST_MISSING_EXECUTION_CODE = "manifest.native_execution_missing"
@@ -820,23 +818,12 @@ def validate_manifest_context(
 # ── Dataflow validation ───────────────────────────────────────────────────
 
 
-def _capability_evidence_details(proof: Any) -> list[dict[str, Any]]:
-    return [
-        {
-            "capability": item.capability,
-            "source": item.source,
-            "details": dict(item.details),
-        }
-        for item in proof.evidence
-    ]
-
-
 def validate_invocation_requirements(
     pipeline: Any,
     *,
     adapter_registry: InvocationRegistryView | None = None,
 ) -> Diagnostics:
-    """Validate invocation kinds and fail-closed required capabilities.
+    """Validate invocation kinds against the supplied adapter registry.
 
     When *adapter_registry* is ``None`` a fresh fail-closed default registry
     is constructed so existing callers get the same reserved-``model``-only
@@ -868,42 +855,6 @@ def validate_invocation_requirements(
                         "registered_kinds": list(registry.registered_kinds),
                     },
                 )
-
-        required_capabilities = tuple(getattr(stage, "required_capabilities", ()) or ())
-        if not required_capabilities:
-            continue
-
-        proof = prove_stage_required_capabilities(stage, pipeline)
-        if proof.ok:
-            continue
-
-        message_parts: list[str] = []
-        if proof.unsatisfied_capabilities:
-            message_parts.append(
-                f"unproven capabilities {list(proof.unsatisfied_capabilities)!r}"
-            )
-        if proof.unknown_required_capabilities:
-            message_parts.append(
-                f"unknown required capabilities {list(proof.unknown_required_capabilities)!r}"
-            )
-        diag.add_defect(
-            f"stage {stage_name!r}: required capabilities are not satisfied "
-            f"({'; '.join(message_parts)})",
-            code=UNSATISFIED_CAPABILITY_CODE,
-            stage=stage_name,
-            details={
-                "required_capabilities": list(proof.required_capabilities),
-                "proven_capabilities": list(proof.proven_capabilities),
-                "unsatisfied_capabilities": list(proof.unsatisfied_capabilities),
-                "unknown_required_capabilities": list(
-                    proof.unknown_required_capabilities
-                ),
-                "unknown_provided_capabilities": list(
-                    proof.unknown_provided_capabilities
-                ),
-                "evidence": _capability_evidence_details(proof),
-            },
-        )
 
     return diag
 

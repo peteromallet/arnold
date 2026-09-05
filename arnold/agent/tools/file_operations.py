@@ -2,8 +2,8 @@
 """
 File Operations Module
 
-Provides file manipulation capabilities (read, write, patch, search) that work
-across all terminal backends (local, docker, singularity, ssh, modal, daytona).
+Provides file manipulation capabilities (read, write, patch, search) over the
+canonical local terminal environment.
 
 The key insight is that all file operations can be expressed as shell commands,
 so we wrap the terminal backend's execute() interface to provide a unified file API.
@@ -319,8 +319,7 @@ class ShellFileOperations(FileOperations):
     """
     File operations implemented via shell commands.
 
-    Works with ANY terminal backend that has execute(command, cwd) method.
-    This includes local, docker, singularity, ssh, modal, and daytona environments.
+    Works with the canonical local terminal environment.
     """
 
     def __init__(self, terminal_env, cwd: str = None):
@@ -334,11 +333,7 @@ class ShellFileOperations(FileOperations):
         """
         self.env = terminal_env
         # Determine cwd from various possible sources.
-        # IMPORTANT: do NOT fall back to os.getcwd() -- that's the HOST's local
-        # path which doesn't exist inside container/cloud backends (modal, docker).
-        # If nothing provides a cwd, use "/" as a safe universal default.
-        self.cwd = cwd or getattr(terminal_env, 'cwd', None) or \
-                   getattr(getattr(terminal_env, 'config', None), 'cwd', None) or "/"
+        self.cwd = cwd or getattr(terminal_env, 'cwd', None) or os.getcwd()
 
         # Cache for command availability checks
         self._command_cache: Dict[str, bool] = {}

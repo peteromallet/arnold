@@ -1,4 +1,4 @@
-"""Base class for all omp execution environment backends."""
+"""Base class for the supported local execution environment."""
 
 from abc import ABC, abstractmethod
 import os
@@ -9,11 +9,7 @@ from arnold.agent.hermes_cli.config import get_hermes_home
 
 
 def get_sandbox_dir() -> Path:
-    """Return the host-side root for all sandbox storage (Docker workspaces,
-    Singularity overlays/SIF cache, etc.).
-
-    Configurable via TERMINAL_SANDBOX_DIR. Defaults to {HERMES_HOME}/sandboxes/.
-    """
+    """Return the host-side root reserved for local terminal scratch data."""
     custom = os.getenv("TERMINAL_SANDBOX_DIR")
     if custom:
         p = Path(custom)
@@ -68,8 +64,8 @@ class BaseEnvironment(ABC):
             (transformed_command, sudo_stdin) — see _transform_sudo_command
             for the full contract.  Callers that drive a subprocess directly
             should prepend sudo_stdin (when not None) to any stdin_data they
-            pass to Popen.  Callers that embed stdin via heredoc (modal,
-            daytona) handle sudo_stdin in their own execute() method.
+            pass to Popen.  The local environment consumes the returned private
+            stdin value.
         """
         from arnold.agent.tools.terminal_tool import _transform_sudo_command
         return _transform_sudo_command(command)

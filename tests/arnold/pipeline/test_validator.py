@@ -41,7 +41,6 @@ from arnold.workflow.validator import (
     NATIVE_MANIFEST_MISSING_EXECUTION_CODE,
     PLACEHOLDER_EXECUTION_RESOURCE_CODE,
     UNKNOWN_ADAPTER_CODE,
-    UNSATISFIED_CAPABILITY_CODE,
     _decision_enum_from_suspension_schema,
     _step_prompt_key,
     contract_diagnostic_code,
@@ -1310,114 +1309,6 @@ class TestFullValidateIntegration:
             "args": ["src"],
         }
 
-    @pytest.mark.parametrize(
-        ("required_capability", "invocation"),
-        [
-            (
-                "model:text",
-                StepInvocation.model(adapter_config={"prompt": "write a draft"}),
-            ),
-            (
-                "model:vision",
-                StepInvocation.model(
-                    adapter_config={
-                        "media": [{"mime_type": "image/png", "descriptor": "diagram"}]
-                    }
-                ),
-            ),
-            (
-                "decoder:image",
-                StepInvocation.model(adapter_config={"capabilities": ["decoder:image"]}),
-            ),
-        ],
-    )
-    def test_validate_accepts_satisfied_required_capabilities(
-        self,
-        required_capability: str,
-        invocation: StepInvocation,
-    ) -> None:
-        stage = Stage(
-            name="review",
-            step=_PromptStep(name="review"),
-            invocation=invocation,
-            required_capabilities=(required_capability,),
-            edges=(Edge(label="halt", target="halt"),),
-        )
-
-        diag = validate(_pipeline(stages={"review": stage}, entry="review"))
-
-        assert diag.ok, diag.issues
-
-    @pytest.mark.parametrize(
-        "required_capability",
-        ["model:text", "model:vision", "decoder:image"],
-    )
-    def test_validate_reports_unsatisfied_required_capabilities(
-        self,
-        required_capability: str,
-    ) -> None:
-        stage = Stage(
-            name="review",
-            step=_PromptStep(name="review"),
-            invocation=StepInvocation.model(adapter_config={}),
-            required_capabilities=(required_capability,),
-            edges=(Edge(label="halt", target="halt"),),
-        )
-
-        diag = validate(_pipeline(stages={"review": stage}, entry="review"))
-
-        _assert_issue(
-            diag,
-            code=UNSATISFIED_CAPABILITY_CODE,
-            stage="review",
-            detail_items={
-                "required_capabilities": [required_capability],
-                "proven_capabilities": [],
-                "unsatisfied_capabilities": [required_capability],
-                "unknown_required_capabilities": [],
-            },
-            message_contains="required capabilities are not satisfied",
-        )
-
-    def test_validate_reports_unknown_required_capabilities(self) -> None:
-        stage = Stage(
-            name="review",
-            step=_PromptStep(name="review"),
-            invocation=StepInvocation.model(adapter_config={"prompt": "write a review"}),
-            required_capabilities=("model:text", "model:audio"),
-            edges=(Edge(label="halt", target="halt"),),
-        )
-
-        diag = validate(_pipeline(stages={"review": stage}, entry="review"))
-
-        _assert_issue(
-            diag,
-            code=UNSATISFIED_CAPABILITY_CODE,
-            stage="review",
-            detail_items={
-                "required_capabilities": ["model:text", "model:audio"],
-                "proven_capabilities": ["model:text"],
-                "unsatisfied_capabilities": [],
-                "unknown_required_capabilities": ["model:audio"],
-            },
-            message_contains="unknown required capabilities",
-        )
-
-    def test_validate_accepts_capabilities_proven_from_pipeline_metadata(self) -> None:
-        stage = Stage(
-            name="draft",
-            step=_PromptStep(name="draft"),
-            invocation=StepInvocation.model(adapter_config={"prompt": "write a draft"}),
-            required_capabilities=("model:text", "decoder:image"),
-            edges=(Edge(label="halt", target="halt"),),
-        )
-        pipeline = _pipeline(stages={"draft": stage}, entry="draft")
-        object.__setattr__(pipeline, "metadata", {"supported_capabilities": ["decoder:image"]})
-
-        diag = validate(pipeline)
-
-        assert diag.ok, diag.issues
-
     def test_contract_diagnostic_code_maps_required_m7_categories(self) -> None:
         assert CONTRACT_ERROR_CODE_MAP == {
             "no_match": "contract.no_match",
@@ -1433,7 +1324,6 @@ class TestFullValidateIntegration:
         assert contract_diagnostic_code("schema_mismatch") == "contract.schema_mismatch"
         assert DECLARATION_DRIFT_CODE == "contract.declaration_drift"
         assert UNKNOWN_ADAPTER_CODE == "invocation.unknown_adapter"
-        assert UNSATISFIED_CAPABILITY_CODE == "capability.unsatisfied"
 
 
 # ── T4: Non-model adapter registry tests ──────────────────────────────────

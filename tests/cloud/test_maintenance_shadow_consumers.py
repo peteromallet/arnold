@@ -34,7 +34,14 @@ Every test asserts:
 
 from __future__ import annotations
 
+import ast
+import hashlib
+import inspect
+import shutil
+import tempfile
+import textwrap
 from datetime import datetime, timezone
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
@@ -52,6 +59,7 @@ from arnold_pipelines.megaplan.cloud.six_hour_auditor import (
     build_six_hour_audit_report_event,
     six_hour_audit_legacy_verdict,
 )
+import arnold_pipelines.megaplan.cloud.status_snapshot as status_snapshot_module
 from arnold_pipelines.megaplan.cloud.status_snapshot import (
     build_cloud_status_snapshot,
     render_maintenance_observation,
@@ -78,6 +86,7 @@ from arnold_pipelines.megaplan.maintenance.contracts import (
     ObservationEnvelope,
     SourceVersionVector,
 )
+from arnold_pipelines.run_authority import canonical_json
 from arnold_pipelines.megaplan.maintenance.events import event_digest
 from arnold_pipelines.megaplan.maintenance.identity import EnvironmentId
 
@@ -144,6 +153,16 @@ def _eligible_non_dispatchable_envelope() -> ObservationEnvelope:
         terminal=False,
         green=True,
         dispatchable=False,
+    )
+
+
+def _unknown_envelope() -> ObservationEnvelope:
+    return ObservationEnvelope.build(
+        observed_at=_ts(),
+        completeness=CompletenessState.UNKNOWN,
+        freshness=FreshnessState.UNKNOWN,
+        coherence=CoherenceState.UNKNOWN,
+        coherence_reasons=(CoherenceReason.UNKNOWN,),
     )
 
 
@@ -522,14 +541,17 @@ def test_render_maintenance_observation_is_deterministic_and_explicit() -> None:
         terminal=False,
         dispatchable=False,
     )
+    envelope = _eligible_envelope()
     first = render_maintenance_observation(
-        _eligible_envelope(), comparison=comparison, projection=_projection()
+        envelope, comparison=comparison, projection=_projection()
     )
     second = render_maintenance_observation(
-        _eligible_envelope(), comparison=comparison, projection=_projection()
+        envelope, comparison=comparison, projection=_projection()
     )
+    unsigned = {key: value for key, value in first.items() if key != "view_hash"}
+    recomputed = hashlib.sha256(canonical_json(unsigned).encode("utf-8")).hexdigest()
     assert first == second
-    assert first["view_hash"] == second["view_hash"]
+    assert first["view_hash"] == second["view_hash"] == recomputed
     assert len(first["view_hash"]) == 64
     assert first["verdict"]["green"] is True
     assert first["comparison"]["bucket"] == "match"
@@ -537,7 +559,22 @@ def test_render_maintenance_observation_is_deterministic_and_explicit() -> None:
     assert first["comparison"]["covered_count"] == 87
     assert first["comparison"]["coverage"] == pytest.approx(0.87)
     assert first["progress_inferred_from_process"] is False
-    assert first["envelope"]["digest"] == canonical_digest(_eligible_envelope())
+    assert first["envelope"]["digest"] == canonical_digest(envelope)
+
+    reordered = ObservationEnvelope.build(
+        observed_at=_ts(),
+        environment="production",
+        version_vectors=[
+            _vector("wbc", "production", "b" * 64),
+            _vector("run_authority", "production", "a" * 64),
+        ],
+        completeness=CompletenessState.COMPLETE,
+        freshness=FreshnessState.FRESH,
+        coherence=CoherenceState.COHERENT,
+    )
+    assert render_maintenance_observation(
+        reordered, comparison=comparison, projection=_projection()
+    ) == first
 
 
 def test_render_maintenance_observation_stale_projection_is_never_green() -> None:
@@ -594,43 +631,184 @@ def test_render_maintenance_observation_missing_denominator_stays_explicit() -> 
     assert rendered["verdict"]["green"] is False
 
 
-def test_build_cloud_status_snapshot_sibling_preserves_legacy_fields(
-    tmp_path: Any,
+def test_render_maintenance_observation_missing_evidence_stays_unknown() -> None:
+    rendered = render_maintenance_observation(_unknown_envelope())
+
+    assert rendered["states"] == {
+        "completeness": "unknown",
+        "freshness": "unknown",
+        "coherence": "unknown",
+        "coherence_reasons": ["unknown"],
+    }
+    assert rendered["comparison"]["present"] is False
+    assert rendered["comparison"]["denominator"] is None
+    assert rendered["comparison"]["covered_count"] is None
+    assert rendered["comparison"]["coverage"] is None
+    assert rendered["projection"]["source_digest"] is None
+    assert rendered["projection"]["output_digest"] is None
+    assert all(rendered["verdict"][key] is False for key in (
+        "eligible",
+        "green",
+        "terminal",
+        "dispatchable",
+    ))
+
+
+def test_render_maintenance_observation_contradictions_never_promote() -> None:
+    comparison = SimpleNamespace(
+        bucket=SimpleNamespace(value="match"),
+        reasons=(),
+        stale_projection=False,
+        digest_mismatch=False,
+        missing_denominator=False,
+        denominator=10,
+        covered_count=10,
+        coverage=1.0,
+        projection_name="efficiency_analysis",
+        projection_source_digest="a" * 64,
+        projection_output_digest="b" * 64,
+        green=True,
+        terminal=True,
+        dispatchable=True,
+    )
+    rendered = render_maintenance_observation(
+        _incoherent_envelope(
+            (CoherenceReason.CONTRADICTORY_EVIDENCE, CoherenceReason.CROSS_ENVIRONMENT),
+            cross_env=True,
+        ),
+        comparison=comparison,
+        projection=_projection(),
+    )
+
+    assert rendered["states"]["coherence"] == "incoherent"
+    assert rendered["states"]["coherence_reasons"] == [
+        "contradictory_evidence",
+        "cross_environment",
+    ]
+    assert rendered["cross_environment"] is True
+    assert all(rendered["verdict"][key] is False for key in (
+        "eligible",
+        "green",
+        "terminal",
+        "dispatchable",
+    ))
+
+
+def test_render_maintenance_observation_is_pure_and_sibling_call_is_scoped(
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    marker_dir = tmp_path / "markers"
-    repair_dir = tmp_path / "repair-data"
-    marker_dir.mkdir()
-    repair_dir.mkdir()
-    now = _ts()
-
-    def probe(marker: dict[str, Any]) -> dict[str, Any]:
-        return {"tmux": False, "process": False}
-
-    baseline = build_cloud_status_snapshot(
-        marker_dir=marker_dir,
-        repair_data_dir=repair_dir,
-        workspace_root=tmp_path,
-        now=now,
-        liveness_probe=probe,
+    renderer_tree = ast.parse(
+        textwrap.dedent(inspect.getsource(render_maintenance_observation))
     )
-    with_observation = build_cloud_status_snapshot(
-        marker_dir=marker_dir,
-        repair_data_dir=repair_dir,
-        workspace_root=tmp_path,
-        now=now,
-        liveness_probe=probe,
-        maintenance_observation=_eligible_envelope(),
+    called_names = {
+        node.func.id
+        for node in ast.walk(renderer_tree)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+    }
+    forbidden = {
+        "write_cloud_status_snapshot",
+        "build_and_write_snapshot",
+        "_compose_repair_decision_projection",
+        "classify_repair_dispatch",
+        "project_repair_custody",
+        "schedule",
+        "claim",
+        "receipt",
+        "ticket",
+        "control_plane",
+    }
+    assert called_names.isdisjoint(forbidden)
+
+    builder_tree = ast.parse(
+        textwrap.dedent(inspect.getsource(build_cloud_status_snapshot))
     )
-    # The sibling key appears only when supplied; every legacy key is
-    # byte-identical in both snapshots.
-    assert "maintenance_observation" not in baseline
-    assert "maintenance_observation" in with_observation
-    # Fail-closed rendering: without a shadow comparison the observation is
-    # non-green (green requires an eligible envelope whose comparison is a
-    # match); the sibling key is still present and every legacy key identical.
-    assert with_observation["maintenance_observation"]["verdict"]["green"] is False
-    for key, value in baseline.items():
-        assert with_observation[key] == value, f"legacy key {key!r} changed"
+    sibling_calls = {
+        node.func.id
+        for node in ast.walk(builder_tree)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+    }
+    assert "render_maintenance_observation" in sibling_calls
+    assert sibling_calls.isdisjoint(forbidden)
+
+    calls: list[str] = []
+
+    def boom(name: str) -> Any:
+        def _raise(*args: Any, **kwargs: Any) -> Any:
+            calls.append(name)
+            raise AssertionError(f"{name} must not be reached by renderer")
+
+        return _raise
+
+    for name in forbidden:
+        if hasattr(status_snapshot_module, name):
+            monkeypatch.setattr(status_snapshot_module, name, boom(name))
+    render_maintenance_observation(_eligible_envelope())
+    assert calls == []
+
+    root = Path(tempfile.mkdtemp(prefix="mrc-t1.1-test-", dir="/tmp")).resolve()
+    assert root.is_relative_to(Path("/tmp").resolve())
+    try:
+        snapshot = build_cloud_status_snapshot(
+            marker_dir=root / "markers",
+            repair_data_dir=root / "repair-data",
+            workspace_root=root,
+            now=_ts(),
+            liveness_probe=lambda marker: {"tmux": False, "process": False},
+            maintenance_observation=_eligible_envelope(),
+        )
+        assert "maintenance_observation" in snapshot
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_build_cloud_status_snapshot_sibling_preserves_legacy_fields() -> None:
+    root = Path(tempfile.mkdtemp(prefix="mrc-t1.1-test-", dir="/tmp")).resolve()
+    forbidden_roots = {
+        Path.cwd().resolve(),
+        Path(__file__).resolve().parents[2],
+        Path("/workspace").resolve(),
+    }
+    assert root.is_relative_to(Path("/tmp").resolve())
+    assert all(
+        root != candidate and not root.is_relative_to(candidate)
+        for candidate in forbidden_roots
+    )
+    try:
+        marker_dir = root / "markers"
+        repair_dir = root / "repair-data"
+        marker_dir.mkdir()
+        repair_dir.mkdir()
+        now = _ts()
+
+        def probe(marker: dict[str, Any]) -> dict[str, Any]:
+            return {"tmux": False, "process": False}
+
+        baseline = build_cloud_status_snapshot(
+            marker_dir=marker_dir,
+            repair_data_dir=repair_dir,
+            workspace_root=root,
+            now=now,
+            liveness_probe=probe,
+        )
+        with_observation = build_cloud_status_snapshot(
+            marker_dir=marker_dir,
+            repair_data_dir=repair_dir,
+            workspace_root=root,
+            now=now,
+            liveness_probe=probe,
+            maintenance_observation=_eligible_envelope(),
+        )
+        # The sibling key appears only when supplied; every legacy key is
+        # byte-identical in both snapshots.
+        assert "maintenance_observation" not in baseline
+        assert "maintenance_observation" in with_observation
+        # Without a shadow comparison the observation is non-green; every
+        # legacy field remains unchanged.
+        assert with_observation["maintenance_observation"]["verdict"]["green"] is False
+        for key, value in baseline.items():
+            assert with_observation[key] == value, f"legacy key {key!r} changed"
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
 
 
 # ---------------------------------------------------------------------------

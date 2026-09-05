@@ -164,7 +164,7 @@ def _target_class(path: str, symbol: str, action: str, functions: tuple[str, ...
         return "validation-shard"
     if path == "scripts/simulate_watchdog_end_to_end.py":
         return "simulation"
-    if path == "arnold_pipelines/megaplan/agent/tools/terminal_tool.py":
+    if path == "arnold/agent/tools/terminal_tool.py":
         return "external-sandbox-cleanup"
     if path == "arnold_pipelines/megaplan/bakeoff/handlers.py":
         return "external-bakeoff-cleanup"
@@ -289,11 +289,10 @@ arnold/runtime/process.py|process.terminate|signal|runtime-support|_fallback_kil
 arnold_pipelines/megaplan/_core/phase_runtime.py|os.kill|probe|liveness-probe|_pid_alive/try:body/1
 arnold_pipelines/megaplan/_core/phase_runtime.py|os.kill|probe|liveness-probe|_process_start_identity/try:handlers/try:body/1
 arnold_pipelines/megaplan/_core/state.py|os.kill|probe|liveness-probe|_pid_is_live/try:body/1
-arnold_pipelines/megaplan/agent/tools/terminal_tool.py|process.terminate|signal|external-sandbox-cleanup|_cleanup_inactive_envs/for:body/try:body/if:orelse/if:orelse/if:body/1
-arnold_pipelines/megaplan/agent/tools/terminal_tool.py|process.terminate|signal|external-sandbox-cleanup|cleanup_vm/try:body/if:orelse/if:orelse/if:body/1
 arnold_pipelines/megaplan/auto.py|kill_group|signal|neutral-process-group|_supervise_subprocess/if:body/1
 arnold_pipelines/megaplan/bakeoff/handlers.py|process.terminate|signal|external-bakeoff-cleanup|_tail_many/try:finalbody/for:body/if:body/1
-arnold_pipelines/megaplan/cloud/babysitter/launch.py|os.kill|probe|liveness-probe|_pid_live/try:body/1
+arnold_pipelines/megaplan/cloud/recovered_prechain_admission.py|os.kill|probe|liveness-probe|_pid_dead/try:body/1
+arnold_pipelines/megaplan/incident/chain_control.py|os.kill|probe|liveness-probe|_migration_pid_alive/try:body/1
 arnold_pipelines/megaplan/cloud/current_target.py|os.kill|probe|liveness-probe|_pid_is_live_probe/try:body/1
 arnold_pipelines/megaplan/cloud/current_target.py|os.kill|probe|liveness-probe|_pid_is_live_probe/try:handlers/try:body/1
 arnold_pipelines/megaplan/cloud/current_target_liveness.py|os.kill|probe|liveness-probe|_pid_live/try:body/1

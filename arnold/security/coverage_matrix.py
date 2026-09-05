@@ -85,7 +85,7 @@ def get_coverage_matrix() -> List[CoverageEntry]:
             ),
         ),
         CoverageEntry(
-            credential_surface="terminal_tool.py / arnold_pipelines.megaplan.agent.tools.terminal_tool — git push via SSH keys or gh keychain",
+                credential_surface="arnold.agent.tools.terminal_tool — git push via SSH keys or gh keychain",
             credential_type="SSH key / gh CLI token",
             m2_status=CoverageStatus.DEFERRED,
             residual_risk=ResidualRisk.HIGH,

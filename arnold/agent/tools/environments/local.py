@@ -200,7 +200,6 @@ def _find_bash() -> str:
     )
 
 
-# Backward compat — process_registry.py imports this name
 _find_shell = _find_bash
 
 

@@ -30,9 +30,6 @@ from dataclasses import dataclass, field
 from typing import Any, Mapping, Sequence
 
 from arnold.pipeline.declaration_lowering import lower_stage_declarations
-from arnold.agent.costing.model_resource_capabilities import (
-    prove_stage_required_capabilities,
-)
 from arnold.pipeline.schema_registry import (
     AcceptedVersionRange,
     SchemaRegistryError,
@@ -530,43 +527,6 @@ def _pass_schema_versions(
             )
 
 
-def _pass_required_capabilities(pipeline: Any, findings: list[StaticCheckFinding]) -> None:
-    for stage_id, stage in _iter_stages(pipeline):
-        required_capabilities = tuple(getattr(stage, "required_capabilities", ()) or ())
-        if not required_capabilities:
-            continue
-        proof = prove_stage_required_capabilities(stage, pipeline)
-        if proof.ok:
-            continue
-        aliases = [
-            f"{raw}->{normalized}"
-            for raw, normalized in zip(
-                proof.required_capabilities,
-                proof.normalized_required_capabilities,
-            )
-            if raw != normalized
-        ]
-        detail_parts: list[str] = []
-        if proof.unsatisfied_capabilities:
-            detail_parts.append(
-                f"unproven capabilities {list(proof.unsatisfied_capabilities)!r}"
-            )
-        if proof.unknown_required_capabilities:
-            detail_parts.append(
-                f"unknown required capabilities {list(proof.unknown_required_capabilities)!r}"
-            )
-        if aliases:
-            detail_parts.append(f"aliases normalized {aliases!r}")
-        findings.append(
-            StaticCheckFinding(
-                "capabilities",
-                "required_capabilities_unsatisfied",
-                f"stage:{stage_id}",
-                "; ".join(detail_parts),
-            )
-        )
-
-
 def _pass_call_sites(
     pipeline: Any,
     findings: list[StaticCheckFinding],
@@ -694,7 +654,6 @@ def run_c4_static_checks(
     _pass_schemas(pipeline, findings)
     _pass_structural_subset(pipeline, findings)
     _pass_schema_versions(pipeline, findings, registry=registry)
-    _pass_required_capabilities(pipeline, findings)
     _pass_call_sites(pipeline, findings, registry=registry)
     _pass_media_pricing(pipeline, warnings)
     return StaticCheckReport(findings=findings, warnings=warnings)

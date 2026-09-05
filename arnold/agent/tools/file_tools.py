@@ -38,25 +38,15 @@ _read_tracker: dict = {}
 
 
 def _get_file_ops(task_id: str = "default") -> ShellFileOperations:
-    """Get or create ShellFileOperations for a terminal environment.
-
-    Respects the TERMINAL_ENV setting -- if the task_id doesn't have an
-    environment yet, creates one using the configured backend (local, docker,
-    modal, etc.) rather than always defaulting to local.
-
-    Thread-safe: uses the same per-task creation locks as terminal_tool to
-    prevent duplicate sandbox creation from concurrent tool calls.
-    """
+    """Get file operations over the canonical local terminal factory."""
     from arnold.agent.tools.terminal_tool import (
-        _active_environments, _env_lock, _create_environment,
-        _get_env_config, _last_activity, _start_cleanup_thread,
-        _check_disk_usage_warning,
-        _creation_locks, _creation_locks_lock,
+        _active_environments,
+        _env_lock,
+        _environment_for,
+        _last_activity,
     )
     import time
 
-    # Fast path: check cache -- but also verify the underlying environment
-    # is still alive (it may have been killed by the cleanup thread).
     with _file_ops_lock:
         cached = _file_ops_cache.get(task_id)
     if cached is not None:
@@ -64,98 +54,10 @@ def _get_file_ops(task_id: str = "default") -> ShellFileOperations:
             if task_id in _active_environments:
                 _last_activity[task_id] = time.time()
                 return cached
-            else:
-                # Environment was cleaned up -- invalidate stale cache entry
-                with _file_ops_lock:
-                    _file_ops_cache.pop(task_id, None)
+        with _file_ops_lock:
+            _file_ops_cache.pop(task_id, None)
 
-    # Need to ensure the environment exists before building file_ops.
-    # Acquire per-task lock so only one thread creates the sandbox.
-    with _creation_locks_lock:
-        if task_id not in _creation_locks:
-            _creation_locks[task_id] = threading.Lock()
-        task_lock = _creation_locks[task_id]
-
-    with task_lock:
-        # Double-check: another thread may have created it while we waited
-        with _env_lock:
-            if task_id in _active_environments:
-                _last_activity[task_id] = time.time()
-                terminal_env = _active_environments[task_id]
-            else:
-                terminal_env = None
-
-        if terminal_env is None:
-            from arnold.agent.tools.terminal_tool import _task_env_overrides
-
-            config = _get_env_config()
-            env_type = config["env_type"]
-            overrides = _task_env_overrides.get(task_id, {})
-
-            if env_type == "docker":
-                image = overrides.get("docker_image") or config["docker_image"]
-            elif env_type == "singularity":
-                image = overrides.get("singularity_image") or config["singularity_image"]
-            elif env_type == "modal":
-                image = overrides.get("modal_image") or config["modal_image"]
-            elif env_type == "daytona":
-                image = overrides.get("daytona_image") or config["daytona_image"]
-            else:
-                image = ""
-
-            cwd = overrides.get("cwd") or config["cwd"]
-            logger.info("Creating new %s environment for task %s...", env_type, task_id[:8])
-
-            container_config = None
-            if env_type in ("docker", "singularity", "modal", "daytona"):
-                container_config = {
-                    "container_cpu": config.get("container_cpu", 1),
-                    "container_memory": config.get("container_memory", 5120),
-                    "container_disk": config.get("container_disk", 51200),
-                    "container_persistent": config.get("container_persistent", True),
-                    "docker_volumes": config.get("docker_volumes", []),
-                    "docker_mount_cwd_to_workspace": config.get("docker_mount_cwd_to_workspace", False),
-                    "docker_skip_home_overlay": config.get("docker_skip_home_overlay", False),
-                    "docker_skip_security_args": config.get("docker_skip_security_args", False),
-                    "docker_extra_args": config.get("docker_extra_args", []),
-                }
-
-            ssh_config = None
-            if env_type == "ssh":
-                ssh_config = {
-                    "host": config.get("ssh_host", ""),
-                    "user": config.get("ssh_user", ""),
-                    "port": config.get("ssh_port", 22),
-                    "key": config.get("ssh_key", ""),
-                    "persistent": config.get("ssh_persistent", False),
-                }
-
-            local_config = None
-            if env_type == "local":
-                local_config = {
-                    "persistent": config.get("local_persistent", False),
-                }
-
-            terminal_env = _create_environment(
-                env_type=env_type,
-                image=image,
-                cwd=cwd,
-                timeout=config["timeout"],
-                ssh_config=ssh_config,
-                container_config=container_config,
-                local_config=local_config,
-                task_id=task_id,
-                host_cwd=config.get("host_cwd"),
-            )
-
-            with _env_lock:
-                _active_environments[task_id] = terminal_env
-                _last_activity[task_id] = time.time()
-
-            _start_cleanup_thread()
-            logger.info("%s environment ready for task %s", env_type, task_id[:8])
-
-    # Build file_ops from the (guaranteed live) environment and cache it
+    terminal_env = _environment_for(task_id)
     file_ops = ShellFileOperations(terminal_env)
     with _file_ops_lock:
         _file_ops_cache[task_id] = file_ops

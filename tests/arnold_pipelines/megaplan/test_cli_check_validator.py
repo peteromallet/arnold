@@ -23,7 +23,6 @@ from arnold.workflow.validator import (
     Diagnostics,
     MISSING_BINDING_CODE,
     UNKNOWN_ADAPTER_CODE,
-    UNSATISFIED_CAPABILITY_CODE,
     ValidationIssue,
     contract_diagnostic_code,
     validate,
@@ -179,18 +178,17 @@ def test_m1_dispatch_substrate_validator_preserves_legacy_untyped_passthrough() 
     assert diag.ok, diag.issues
 
 
-# ── invocation and capability codes ────────────────────────────────────────
+# ── invocation codes ───────────────────────────────────────────────────────
 
 
-def test_m1_dispatch_substrate_validator_surfaces_invocation_and_capability_codes() -> None:
-    """M1 dispatch substrate proof: unknown adapter and unsatisfied capability are reported."""
+def test_m1_dispatch_substrate_validator_surfaces_invocation_code() -> None:
+    """M1 dispatch substrate proof: unknown adapter is reported."""
     pipeline = Pipeline(
         stages={
             "review": Stage(
                 name="review",
                 step=_NoopStep(),
                 invocation=StepInvocation(kind="custom-collector-v2"),
-                required_capabilities=("model:vision",),
                 edges=(Edge(label="halt", target="halt"),),
             ),
         },
@@ -209,18 +207,6 @@ def test_m1_dispatch_substrate_validator_surfaces_invocation_and_capability_code
         },
         message_contains="registered adapter",
     )
-    _assert_issue(
-        diag,
-        code=UNSATISFIED_CAPABILITY_CODE,
-        stage="review",
-        detail_items={
-            "required_capabilities": ["model:vision"],
-            "unsatisfied_capabilities": ["model:vision"],
-        },
-        message_contains="required capabilities are not satisfied",
-    )
-
-
 # ── graph structure validation ─────────────────────────────────────────────
 
 

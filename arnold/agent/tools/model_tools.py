@@ -128,7 +128,6 @@ def _discover_tools():
         "arnold.agent.tools.clarify_tool",
         "arnold.agent.tools.code_execution_tool",
         "arnold.agent.tools.delegate_tool",
-        "arnold.agent.tools.process_registry",
         "arnold.agent.tools.send_message_tool",
         "arnold.agent.tools.honcho_tools",
         "arnold.agent.tools.homeassistant_tool",

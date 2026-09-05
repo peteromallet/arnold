@@ -604,23 +604,6 @@ class TestSchemaVersionPass:
         assert "schema_version_not_accepted" in {f.code for f in report.findings}
 
 
-class TestCapabilityAliasPass:
-    def test_alias_normalization_surfaces_in_static_diagnostics(self) -> None:
-        stage = Stage(
-            name="vision-review",
-            step=_StubStep(name="vision-review"),
-            invocation=StepInvocation(kind="tool", metadata={}),
-            required_capabilities=("requires-vision-model",),
-        )
-        pipeline = Pipeline(stages={"vision-review": stage}, entry="vision-review")
-
-        report = run_c4_static_checks(pipeline)
-
-        finding = next(f for f in report.findings if f.pass_name == "capabilities")
-        assert finding.code == "required_capabilities_unsatisfied"
-        assert "requires-vision-model->model:vision" in finding.detail
-
-
 # ── T16: Warning infrastructure ───────────────────────────────────────────
 
 
