@@ -11,12 +11,15 @@ import hashlib
 import re
 import shutil
 import subprocess
+from collections.abc import Mapping
 from pathlib import Path
 
 from arnold_pipelines.megaplan.cloud.auth import on_box_git_credential_env
+from arnold_pipelines.megaplan.cloud import chain_drive
 from arnold_pipelines.megaplan.cloud.redact import redact_text
 from arnold_pipelines.megaplan.cloud.spec import CloudSpec
 from arnold_pipelines.megaplan.types import CliError
+from arnold.runtime.durable_ops import LaunchEnvelope, LaunchResult
 
 from .base import Provider
 
@@ -31,11 +34,113 @@ _GIT_AUTH_FAILURE_RE = re.compile(
 )
 
 
+def _unknown_launch_engine_response(reason: str, detail: str) -> dict[str, object]:
+    return {
+        "schema": "arnold.megaplan.cloud_launch_response.v1",
+        "result": LaunchResult.UNKNOWN.value,
+        "reason": reason,
+        "invoked": True,
+        "detail": detail,
+    }
+
+
+def _validate_launch_engine_response(
+    request: Mapping[str, object], raw: object
+) -> dict[str, object]:
+    """Validate the engine result without interpreting or redispatching it."""
+    if not isinstance(raw, Mapping):
+        return _unknown_launch_engine_response(
+            "malformed_engine_response", "authoritative engine returned a non-mapping"
+        )
+
+    payload = dict(raw)
+    if payload.get("schema") != "arnold.megaplan.cloud_launch_response.v1":
+        return _unknown_launch_engine_response(
+            "malformed_engine_response", "authoritative engine response has an invalid schema"
+        )
+    result = payload.get("result")
+    if not isinstance(result, str):
+        return _unknown_launch_engine_response(
+            "malformed_engine_response", "authoritative engine response has an invalid result"
+        )
+    try:
+        result_value = LaunchResult(result).value
+    except ValueError:
+        return _unknown_launch_engine_response(
+            "malformed_engine_response", "authoritative engine response has an unknown result"
+        )
+    reason = payload.get("reason")
+    if not isinstance(reason, str) or not reason:
+        return _unknown_launch_engine_response(
+            "malformed_engine_response",
+            "authoritative engine response has an invalid reason",
+        )
+
+    # ACCEPTED is also the engine's replay result (reason == "replay").
+    # Only those outcomes are actionable, so bind both identities to the
+    # request that was actually sent across this boundary.
+    if result_value == LaunchResult.ACCEPTED.value:
+        envelope = request.get("envelope")
+        if not isinstance(envelope, Mapping):
+            return _unknown_launch_engine_response(
+                "malformed_engine_response",
+                "launch request has no envelope identity",
+            )
+        try:
+            canonical_envelope = LaunchEnvelope.from_json(envelope)
+        except Exception as exc:
+            return _unknown_launch_engine_response(
+                "malformed_engine_response",
+                f"launch request envelope is invalid: {type(exc).__name__}: {exc}",
+            )
+        expected_operation_id = canonical_envelope.operation_id
+        expected_request_id = canonical_envelope.request_id
+        operation_id = payload.get("operation_id")
+        request_id = payload.get("request_id")
+        envelope_digest = payload.get("envelope_digest")
+        if (
+            operation_id != expected_operation_id
+            or request_id != expected_request_id
+            or not isinstance(envelope_digest, str)
+            or not envelope_digest
+            or envelope_digest != canonical_envelope.digest
+        ):
+            return _unknown_launch_engine_response(
+                "malformed_engine_response",
+                "accepted launch response identity does not match its request",
+            )
+
+    # A valid UNKNOWN belongs to the engine and is deliberately returned byte-
+    # for-byte at the mapping/value level; the provider must not reinterpret it
+    # as a transport failure or attempt a second dispatch.
+    return payload
+
+
 class OnBoxProvider(Provider):
     supports_session = True
 
     def __init__(self, spec: CloudSpec) -> None:
         self._spec = spec
+
+    def invoke_launch_engine(self, request: dict[str, object]) -> dict[str, object]:
+        """Invoke the authoritative engine directly in this process once.
+
+        On-box already is the engine venue: the operation store location is
+        loaded by ``chain_drive`` from AgentBoxConfig.  This boundary therefore
+        has no shell, transport, stdout parsing, fallback, or retry layer.
+        """
+        try:
+            response = chain_drive.execute_authoritative_launch(request)
+        except Exception as exc:
+            return _unknown_launch_engine_response(
+                "engine_exception", f"{type(exc).__name__}: {exc}"
+            )
+        try:
+            return _validate_launch_engine_response(request, response)
+        except Exception as exc:
+            return _unknown_launch_engine_response(
+                "malformed_engine_response", f"{type(exc).__name__}: {exc}"
+            )
 
     def _process_adapter_evidence_root(self) -> Path:
         """Return an external, deterministic control-plane evidence root.
