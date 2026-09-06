@@ -28,6 +28,10 @@ CODEX_ROUTING = "codex"
 OMP_CONTROLLER_MODEL = "omp:deepseek/deepseek-v4-flash"
 CODEX_CONTROLLER_MODEL = "codex:gpt-5.6-luna"
 CONTINUATION_MUSE_PROFILE = "all-muse-spark-openrouter"
+CONTINUATION_MUSE_SUCCESSOR_PROFILE = "all-muse-spark-1-3-contributor"
+CONTINUATION_MUSE_PROFILES = frozenset(
+    {CONTINUATION_MUSE_PROFILE, CONTINUATION_MUSE_SUCCESSOR_PROFILE}
+)
 CONTINUATION_MUSE_MODEL = "omp:openrouter/meta/muse-spark-1.3-contributor"
 CONTINUATION_MUSE_THINKING = "high"
 _CONTINUATION_MUSE_INPUT_THINKING = frozenset(
@@ -154,12 +158,12 @@ def resolve_babysitter_routing(
     requested_closed_profile = str(
         closed_profile if closed_profile is not None else values.get(CLOSED_PROFILE_ENV, "")
     ).strip()
-    if requested_closed_profile and requested_closed_profile != CONTINUATION_MUSE_PROFILE:
+    if requested_closed_profile and requested_closed_profile not in CONTINUATION_MUSE_PROFILES:
         raise ValueError(
             f"{CLOSED_PROFILE_ENV} must be {CONTINUATION_MUSE_PROFILE!r}; "
             f"got {requested_closed_profile!r}"
         )
-    if authoritative_profile and authoritative_profile != CONTINUATION_MUSE_PROFILE:
+    if authoritative_profile and authoritative_profile not in CONTINUATION_MUSE_PROFILES:
         if requested_closed_profile:
             raise ValueError(
                 f"closed fixer profile {requested_closed_profile!r} contradicts "
@@ -169,8 +173,8 @@ def resolve_babysitter_routing(
         raise ValueError(
             f"{CLOSED_PROFILE_ENV} requires authoritative {CHAIN_PROFILE_ENV}"
         )
-    continuation_route = authoritative_profile == CONTINUATION_MUSE_PROFILE
-    if continuation_route and requested_closed_profile != CONTINUATION_MUSE_PROFILE:
+    continuation_route = authoritative_profile in CONTINUATION_MUSE_PROFILES
+    if continuation_route and requested_closed_profile not in CONTINUATION_MUSE_PROFILES:
         raise ValueError(
             f"{session_value or 'continuation chain'} requires explicit "
             f"{CLOSED_PROFILE_ENV}={CONTINUATION_MUSE_PROFILE!r}"

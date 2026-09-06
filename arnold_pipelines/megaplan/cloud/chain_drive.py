@@ -32,12 +32,15 @@ from agentbox.config import load_agentbox_config
 from agentbox.operations import open_operation_store
 from agentbox.tmux import inspect_session, new_session_argv, run_tmux
 from arnold_pipelines.megaplan.cloud.runtime_manifest import (
+    DEPENDENCY_GENERATION_REQUIRED,
     EPIC_REQUIRED,
     ManifestError,
     MANIFEST_SCHEMA_VERSION,
     RuntimeManifest,
     TOP_LEVEL_REQUIRED,
 )
+from arnold_pipelines.megaplan.cloud.install_sync import compute_venv_digest
+from arnold_pipelines.megaplan.cloud.runtime_provenance import runtime_provenance
 
 
 class ChainDriveError(RuntimeError):
@@ -245,6 +248,13 @@ def _validate_launch_attestation(
         "manifest_path": binding["manifest_path"],
         "manifest_identity": binding["manifest_identity"],
     }
+    command = expected_packet["command"]
+    command_bytes = (
+        command.encode("utf-8")
+        if isinstance(command, str)
+        else json.dumps(command, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    )
+    expected_packet["command_sha256"] = hashlib.sha256(command_bytes).hexdigest()
     if any(packet.get(key) != value for key, value in expected_packet.items()):
         raise ValueError("launch attestation execution packet mismatch")
     expected_packet_digest = hashlib.sha256(
@@ -272,13 +282,63 @@ def _validate_launch_attestation(
     return dict(attestation)
 
 
+def _validate_live_runtime(binding: Mapping[str, Any]) -> None:
+    """Re-attest imports, source HEAD and the immutable dependency generation."""
+    try:
+        provenance = runtime_provenance(
+            expected_root=Path(binding["runtime_source"]),
+            expected_revision=str(binding["runtime_revision"]),
+        )
+    except Exception as exc:  # noqa: BLE001 - unknown physical fact blocks launch
+        raise ValueError(f"live runtime provenance probe failed: {type(exc).__name__}") from exc
+    if not isinstance(provenance, Mapping) or provenance.get("ok") is not True:
+        errors = provenance.get("errors") if isinstance(provenance, Mapping) else None
+        raise ValueError(f"live runtime provenance is not verified: {errors or 'unknown'}")
+
+    dependency = binding.get("dependency_generation")
+    try:
+        from arnold_pipelines.megaplan.cloud.runtime_manifest import validate_dependency_generation
+
+        proof = validate_dependency_generation(dependency)
+        interpreter = Path(str(proof["interpreter_path"])).expanduser().resolve(strict=False)
+        generation = interpreter.parent.parent
+        if not interpreter.is_file() or not os.access(interpreter, os.X_OK):
+            raise ValueError("dependency-generation interpreter is not executable")
+        if generation.name != str(proof["id"]):
+            raise ValueError("dependency-generation interpreter is not content-addressed")
+        if compute_venv_digest(interpreter) != str(proof["venv_digest"]):
+            raise ValueError("dependency-generation content digest mismatch")
+        if set(proof) < set(DEPENDENCY_GENERATION_REQUIRED):
+            raise ValueError("dependency-generation proof is incomplete")
+    except Exception as exc:  # noqa: BLE001 - unknown dependency state blocks launch
+        raise ValueError(f"live dependency generation probe failed: {exc}") from exc
+
+
 def _validate_launch_observations(
     observations: Mapping[str, Any],
     envelope: LaunchEnvelope,
     binding: Mapping[str, Any],
     attestation: Mapping[str, Any],
 ) -> None:
-    """Reject preflight rows that contradict the admitted runtime evidence."""
+    """Reject preflight rows that contradict live facts and the envelope.
+
+    The controller's rows are transport projections only.  In particular, a
+    caller cannot turn a declaration into source/dependency/authority or
+    collision evidence by changing JSON before it reaches the engine.
+    """
+    source = observations.get("source")
+    requested_source = str(envelope.launch_spec.get("source_revision") or "")
+    if not isinstance(source, Mapping) or source.get("status") != "current":
+        raise ValueError("source observation is not current")
+    if str(source.get("revision") or "") != binding["runtime_revision"]:
+        raise ValueError("source observation contradicts live runtime revision")
+    if requested_source and len(requested_source) == 40 and requested_source != binding["runtime_revision"]:
+        raise ValueError("requested source revision contradicts live runtime revision")
+
+    # These inspect the imports, Git HEAD and immutable dependency generation
+    # at the engine venue; manifest declarations alone are not sufficient.
+    _validate_live_runtime(binding)
+
     runtime = observations.get("runtime")
     if not isinstance(runtime, Mapping):
         raise ValueError("runtime observation is missing")
@@ -291,6 +351,38 @@ def _validate_launch_observations(
         != str(attestation["dependency_interpreter_identity"])
     ):
         raise ValueError("runtime observation contradicts launch attestation")
+
+    command = observations.get("command")
+    if (
+        not isinstance(command, Mapping)
+        or command.get("status") != "valid"
+        or command.get("argv") != envelope.launch_spec.get("command")
+        or command.get("cwd") != envelope.launch_spec.get("cwd")
+    ):
+        raise ValueError("execution packet observation contradicts launch envelope")
+
+    authority = observations.get("authority")
+    authority_evidence = authority.get("evidence") if isinstance(authority, Mapping) else None
+    if (
+        not isinstance(authority, Mapping)
+        or authority.get("status") != "current"
+        or not isinstance(authority_evidence, Mapping)
+        or authority_evidence.get("verified") is not True
+        or authority_evidence.get("source") != "operation-envelope"
+        or authority.get("grant") != envelope.operation_id
+        or authority.get("fence") != envelope.request_id
+        or authority.get("decision") != envelope.operation_id
+    ):
+        raise ValueError("authority observation is not bound to the launch envelope")
+
+    custody = observations.get("custody")
+    if (
+        not isinstance(custody, Mapping)
+        or custody.get("status") not in {"present", "current"}
+        or custody.get("custody_ref") != envelope.launch_spec.get("cwd")
+        or not str(custody.get("wbc_ref") or "")
+    ):
+        raise ValueError("custody observation is not bound to the launch envelope")
     collision = observations.get("collision")
     evidence = collision.get("evidence") if isinstance(collision, Mapping) else None
     if (
@@ -301,6 +393,19 @@ def _validate_launch_observations(
         != str(envelope.launch_spec.get("expected_session_name") or "")
     ):
         raise ValueError("collision observation is not verified for the envelope session")
+
+
+def _probe_live_collision(session: str) -> None:
+    """Probe the engine's live process namespace before durable admission."""
+    try:
+        status = inspect_session(session)
+    except Exception as exc:  # noqa: BLE001 - probe errors fail closed
+        raise ValueError(f"live collision probe failed: {type(exc).__name__}") from exc
+    if not getattr(status, "exists", False) and getattr(status, "state", "") in {"missing", "dead"}:
+        return
+    if getattr(status, "exists", False):
+        raise ValueError("launch session namespace is already occupied")
+    raise ValueError("live collision probe is unknown")
 
 
 def _json_response(
@@ -399,6 +504,27 @@ def execute_authoritative_launch(request: Mapping[str, Any]) -> dict[str, Any]:
             envelope_digest=envelope.digest,
             detail=str(exc),
         )
+    store = open_operation_store(config)
+    existing = inspect_launch(envelope, store=store)
+    if existing.result is LaunchResult.ACCEPTED:
+        return _json_response(
+            result=LaunchResult.ACCEPTED,
+            reason="replay",
+            operation_id=envelope.operation_id,
+            request_id=envelope.request_id,
+            envelope_digest=envelope.digest,
+        )
+    try:
+        _probe_live_collision(str(envelope.launch_spec.get("expected_session_name") or ""))
+    except ValueError as exc:
+        return _json_response(
+            result=LaunchResult.REJECTED,
+            reason="preflight_rejected",
+            operation_id=envelope.operation_id,
+            request_id=envelope.request_id,
+            envelope_digest=envelope.digest,
+            detail=str(exc),
+        )
     preflight = run_launch_preflight(envelope.launch_spec, observations)
     if not preflight.accepted:
         return _json_response(
@@ -419,7 +545,6 @@ def execute_authoritative_launch(request: Mapping[str, Any]) -> dict[str, Any]:
     session = envelope.launch_spec.get("expected_session_name")
     if not isinstance(cwd, str) or not cwd or not isinstance(session, str) or not session:
         raise ChainDriveError("cwd and session must be non-empty strings")
-    store = open_operation_store(config)
     identity = {
         "ARNOLD_LAUNCH_OPERATION_ID": envelope.operation_id,
         "ARNOLD_LAUNCH_REQUEST_ID": envelope.request_id,

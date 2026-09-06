@@ -713,6 +713,14 @@ def test_watchdog_maps_suppressed_babysitter_to_typed_report_without_schedule(
             0,
             True,
         ),
+        (
+            {
+                "babysitter_chain_profile": "all-muse-spark-1-3-contributor",
+                "babysitter_closed_profile": "all-muse-spark-1-3-contributor",
+            },
+            0,
+            True,
+        ),
         ({"babysitter_chain_profile": "all-muse-spark-openrouter"}, 1, False),
         ({"babysitter_closed_profile": "all-muse-spark-openrouter"}, 1, False),
         (
@@ -768,8 +776,9 @@ def test_watchdog_marker_binds_closed_fixer_before_child_spawn(
     result = _run_watchdog_shell(script)
     assert result.returncode == expected_rc, result.stderr
     if expect_child:
+        expected_profile = marker_fields["babysitter_chain_profile"]
         assert record.read_text(encoding="utf-8").strip() == (
-            "all-muse-spark-openrouter|all-muse-spark-openrouter|"
+            f"{expected_profile}|{expected_profile}|"
             "omp:openrouter/meta/muse-spark-1.3-contributor:high|"
             "omp:openrouter/meta/muse-spark-1.3-contributor:high|omp"
         )

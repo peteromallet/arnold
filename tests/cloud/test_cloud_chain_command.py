@@ -31,6 +31,8 @@ from arnold_pipelines.megaplan.cloud.cli import (
     _chain_runtime_probe_and_create_command,
     _chain_runtime_provenance_payload,
     _chain_runtime_marker_binding,
+    _chain_command_with_runtime_binding,
+    ChainLaunchContext,
     _chain_start_command,
     _cloud_launch_credentials_observation,
     _epic_chain_start_command,
@@ -428,6 +430,27 @@ printf '%s\\n' "$ARNOLD_CHAIN_GIT_HELPER" "$HOME" "$GIT_CONFIG_GLOBAL" "$PYTHONP
         "omp",
     ]
     assert "secret" not in result.stdout + result.stderr
+
+
+def test_shared_launch_boundary_accepts_successor_profile() -> None:
+    boundary = Path(__file__).resolve().parents[2] / (
+        "arnold_pipelines/megaplan/cloud/wrappers/arnold-launch-boundary"
+    )
+    result = subprocess.run(
+        [
+            "bash",
+            "-c",
+            f"source {shlex.quote(str(boundary))}; "
+            "export ARNOLD_BABYSITTER_CHAIN_PROFILE=all-muse-spark-1-3-contributor; "
+            "export ARNOLD_BABYSITTER_CLOSED_PROFILE=all-muse-spark-1-3-contributor; "
+            "arnold_materialize_launch_boundary successor /tmp /tmp",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "closed_profile_route_mismatch" not in result.stderr
 
 
 def test_chain_controller_delegates_to_canonical_engine() -> None:
@@ -1064,6 +1087,112 @@ def test_atomic_marker_writer_rejects_foreign_identity(tmp_path: Path) -> None:
 
     assert result.returncode != 0
     assert json.loads(marker.read_text(encoding="utf-8")) == original
+
+
+def test_atomic_marker_writer_rejects_incomplete_foreign_custody(tmp_path: Path) -> None:
+    marker = tmp_path / "markers" / "demo.json"
+    marker.parent.mkdir(parents=True)
+    marker.write_text(
+        json.dumps(
+            {
+                "recovery_command": "foreign-recovery",
+                "supervisor_start_identity": "foreign-supervisor",
+            }
+        ),
+        encoding="utf-8",
+    )
+    command = _atomic_marker_write_command(
+        str(marker),
+        {
+            "session": "demo",
+            "run_kind": "chain",
+            "operation_id": "new-operation",
+            "request_id": "new-request",
+            "envelope_digest": "new-envelope",
+        },
+    )
+
+    result = subprocess.run(
+        ["bash", "-lc", command], capture_output=True, text=True, check=False
+    )
+
+    assert result.returncode != 0
+    assert "foreign/incomplete occupant" in result.stderr
+    assert json.loads(marker.read_text(encoding="utf-8"))["recovery_command"] == "foreign-recovery"
+
+
+def test_atomic_marker_writer_replaces_matching_occupant_without_unknown_fields(
+    tmp_path: Path,
+) -> None:
+    marker = tmp_path / "markers" / "demo.json"
+    marker.parent.mkdir(parents=True)
+    original = {
+        "session": "demo",
+        "run_kind": "chain",
+        "operation_id": "op",
+        "request_id": "req",
+        "envelope_digest": "env",
+        "foreign_unknown": "must-not-merge",
+    }
+    marker.write_text(json.dumps(original), encoding="utf-8")
+    command = _atomic_marker_write_command(
+        str(marker),
+        {
+            "session": "demo",
+            "run_kind": "chain",
+            "operation_id": "op",
+            "request_id": "req",
+            "envelope_digest": "env",
+            "progress_identity": "new",
+        },
+    )
+
+    result = subprocess.run(
+        ["bash", "-lc", command], capture_output=True, text=True, check=False
+    )
+
+    assert result.returncode == 0, result.stderr
+    updated = json.loads(marker.read_text(encoding="utf-8"))
+    assert updated["progress_identity"] == "new"
+    assert "foreign_unknown" not in updated
+
+
+def test_bound_chain_marker_carries_deterministic_relaunch_command(tmp_path: Path) -> None:
+    ctx = ChainLaunchContext(
+        identity="demo",
+        slug="demo",
+        digest="d" * 64,
+        workspace="/workspace/demo",
+        remote_spec_path="/workspace/demo/chain.yaml",
+        session_name="demo-chain",
+        log_relative=".megaplan/cloud-chain.log",
+        log_path="/workspace/demo/.megaplan/cloud-chain.log",
+        state_path="/workspace/demo/.megaplan/state.json",
+        marker_path=str(tmp_path / "demo.json"),
+    )
+    binding = {
+        "manifest_path": "/workspace/.megaplan/demo.json",
+        "manifest_sha256": "a" * 64,
+        "manifest_identity": "a" * 64,
+        "runtime_id": "runtime-demo",
+        "runtime_source": "/workspace/runtime-demo",
+        "runtime_src": "/workspace/runtime-demo",
+        "runtime_revision": "b" * 40,
+        "runtime_identity": {"import_root": "/workspace/runtime-demo", "source_revision": "b" * 40},
+        "runtime_identity_raw": {},
+    }
+    command = _chain_command_with_runtime_binding(
+        "env MEGAPLAN_BOUND_RUNTIME_REVISION=bbbb chain start",
+        launch_ctx=ctx,
+        binding=binding,
+        operation_id="op",
+        request_id="req",
+    )
+
+    marker_match = re.search(r"payload = json.loads\('([^']+)'\)", command)
+    assert marker_match is not None
+    payload = json.loads(marker_match.group(1))
+    assert payload["relaunch_command"] == "env MEGAPLAN_BOUND_RUNTIME_REVISION=bbbb chain start"
 
 
 def test_tmux_chain_launch_command_is_valid_shell() -> None:
@@ -3395,6 +3524,10 @@ def test_composed_cli_on_box_chain_drive_dispatches_once_with_seed_binding(
     monkeypatch.setattr(chain_drive, "load_agentbox_config", lambda: config)
     monkeypatch.setenv("ARNOLD_RUNTIME_MANIFEST", "/ambient/contradictory.json")
     monkeypatch.setattr(chain_drive, "run_tmux", lambda argv: dispatches.append(list(argv)))
+    # This composition test uses a synthetic remote runtime fixture; the
+    # dedicated launch-door tests cover the real live provenance probe.
+    monkeypatch.setattr(chain_drive, "_validate_live_runtime", lambda binding: None)
+    monkeypatch.setattr(chain_drive, "_probe_live_collision", lambda session: None)
 
     def observe(session: str, expected_identity=None) -> SessionStatus:
         assert expected_identity is not None

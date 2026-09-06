@@ -52,6 +52,7 @@ from arnold_pipelines.megaplan.cloud.runtime_manifest import (
 )
 from arnold_pipelines.megaplan.cloud.babysitter.routing import (
     CONTINUATION_MUSE_MODEL,
+    CONTINUATION_MUSE_PROFILES,
     CONTINUATION_MUSE_PROFILE,
 )
 from arnold_pipelines.megaplan.profiles import (
@@ -3827,14 +3828,28 @@ identity_keys = (
     "run_id", "bootstrap_manifest_path", "manifest_sha256", "manifest_identity",
     "runtime_binding", "operation_id", "request_id", "envelope_digest",
 )
+custody_fields = (
+    "recovery_command", "recovery_identity", "recovery_owner",
+    "supervisor_start_identity", "supervisor_start_ticks", "supervisor_pid",
+    "supervisor_process_start_identity", "supervisor_identity",
+)
 if current:
     for key in identity_keys:
         if key in payload and key in current and current[key] != payload[key]:
             raise RuntimeError(f"managed launch marker identity conflict: {{key}}")
+    if any(key in current for key in custody_fields) and any(
+        key not in current for key in identity_keys if key in payload
+    ):
+        raise RuntimeError("managed launch marker is a foreign/incomplete occupant")
     if any(key in current for key in identity_keys) and any(
         key not in current for key in identity_keys if key in payload
     ):
         raise RuntimeError("managed launch marker is a foreign/incomplete occupant")
+    # A complete, matching occupant is replaced rather than merged.  The new
+    # envelope owns publication; the writer below derives fresh liveness and
+    # manifest fields for this process.  This also prevents unknown occupant
+    # fields from becoming part of the new custody projection.
+    current = {{}}
 current.update(payload)
 import hashlib, socket
 
@@ -5032,6 +5047,12 @@ def _launch_attestation(
         "manifest_path": str(binding["manifest_path"]),
         "manifest_identity": str(binding["manifest_identity"]),
     }
+    command_bytes = (
+        command.encode("utf-8")
+        if isinstance(command, str)
+        else json.dumps(command, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    )
+    packet["command_sha256"] = hashlib.sha256(command_bytes).hexdigest()
     packet_digest = hashlib.sha256(
         json.dumps(packet, sort_keys=True, separators=(",", ":")).encode("utf-8")
     ).hexdigest()
@@ -5095,6 +5116,10 @@ def _chain_command_with_runtime_binding(
         "manifest_identity": str(binding["manifest_identity"]),
         "progress_artifact": launch_ctx.log_path,
         "progress_identity": f"chain:{launch_ctx.identity}",
+        # The immutable runtime-bound launch command is also the deterministic
+        # recovery command used by revision rebind.  It carries no generated
+        # identity and can be replayed without inventing one.
+        "relaunch_command": command,
         "operation_id": str(operation_id or ""),
         "request_id": str(request_id or ""),
         # Filled from ARNOLD_LAUNCH_ENVELOPE_DIGEST by the managed writer.
@@ -5248,7 +5273,10 @@ def _tmux_chain_launch_command(
     chain_profile = str(marker_payload.get("babysitter_chain_profile") or "").strip()
     closed_profile = str(marker_payload.get("babysitter_closed_profile") or "").strip()
     if chain_profile or closed_profile:
-        if chain_profile != CONTINUATION_MUSE_PROFILE or closed_profile != CONTINUATION_MUSE_PROFILE:
+        if (
+            chain_profile not in CONTINUATION_MUSE_PROFILES
+            or closed_profile != chain_profile
+        ):
             raise CliError(
                 "closed_profile_route_mismatch",
                 "babysitter closed-route marker identity is invalid",
@@ -6533,8 +6561,8 @@ def _run_authoritative_chain_wrapper(root: Path, args: argparse.Namespace, spec:
         },
     }
     observations = {
-        "source": {"status": "current", "revision": str(spec.megaplan.ref), "ref": str(spec.megaplan.ref), "tree": str(project_root)},
-        "authority": {"status": "current", "grant": launch_ctx.identity, "fence": launch_ctx.identity, "decision": launch_ctx.identity, "evidence": {"verified": True, "source": "operation-envelope"}},
+        "source": {"status": "current", "revision": runtime_binding["runtime_revision"], "ref": str(spec.megaplan.ref), "tree": str(project_root)},
+        "authority": {"status": "current", "grant": operation_id, "fence": request_id, "decision": operation_id, "evidence": {"verified": True, "source": "operation-envelope"}},
         "custody": {"status": "present", "custody_ref": launch_ctx.workspace, "wbc_ref": launch_ctx.workspace},
         "credentials": _cloud_launch_credentials_observation(spec, provider),
         "runtime": {"status": "present", "interpreter": launch_attestation["dependency_interpreter_identity"] or spec.megaplan.runtime_python or "python", "import_root": runtime_binding["runtime_source"], "source_revision": runtime_binding["runtime_revision"], "manifest_identity": runtime_binding["manifest_identity"], "evidence": launch_attestation["provenance"]},
@@ -6900,8 +6928,8 @@ def _run_epic_chain_wrapper(root: Path, args: argparse.Namespace, spec: CloudSpe
         },
     }
     observations = {
-        "source": {"status": "current", "revision": str(spec.megaplan.ref), "ref": str(spec.megaplan.ref), "tree": str(project_root)},
-        "authority": {"status": "current", "grant": launch_ctx.identity, "fence": launch_ctx.identity, "decision": launch_ctx.identity, "evidence": {"verified": True, "source": "operation-envelope"}},
+        "source": {"status": "current", "revision": runtime_binding["runtime_revision"], "ref": str(spec.megaplan.ref), "tree": str(project_root)},
+        "authority": {"status": "current", "grant": operation_id, "fence": request_id, "decision": operation_id, "evidence": {"verified": True, "source": "operation-envelope"}},
         "custody": {"status": "present", "custody_ref": launch_ctx.workspace, "wbc_ref": launch_ctx.workspace},
         "credentials": _cloud_launch_credentials_observation(spec, provider),
         "runtime": {"status": "present", "interpreter": launch_attestation["dependency_interpreter_identity"] or spec.megaplan.runtime_python or "python", "import_root": runtime_binding["runtime_source"], "source_revision": runtime_binding["runtime_revision"], "manifest_identity": runtime_binding["manifest_identity"], "evidence": launch_attestation["provenance"]},

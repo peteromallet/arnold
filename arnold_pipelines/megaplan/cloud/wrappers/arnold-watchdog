@@ -2386,8 +2386,11 @@ def _closed_fixer_marker_identity() -> tuple[str, str] | None:
         return None
     if str(marker.get("session") or "").strip() != session:
         raise RuntimeError("closed_profile_marker_identity_mismatch")
-    expected = "all-muse-spark-openrouter"
-    if chain_profile != expected or closed_profile != expected:
+    expected_profiles = {
+        "all-muse-spark-openrouter",
+        "all-muse-spark-1-3-contributor",
+    }
+    if chain_profile not in expected_profiles or closed_profile != chain_profile:
         raise RuntimeError("closed_profile_marker_route_mismatch")
     return chain_profile, closed_profile
 

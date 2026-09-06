@@ -115,8 +115,12 @@ def _request(tmp_path: Path):
         "command": spec["command"],
         "cwd": spec["cwd"],
         "session": session,
-        "manifest_path": str(manifest),
+        "manifest_path": str(manifest.resolve()),
         "manifest_identity": manifest_hash,
+    }
+    packet_with_bytes = {
+        **packet,
+        "command_sha256": hashlib.sha256(spec["command"].encode()).hexdigest(),
     }
     spec["metadata"]["launch_attestation"] = {
         "schema": "arnold.megaplan.launch_attestation.v1",
@@ -133,15 +137,15 @@ def _request(tmp_path: Path):
         },
         "provenance": {"status": "verified", "root": str(runtime_source), "revision": "a" * 40},
         "execution_packet": {
-            **packet,
-            "sha256": hashlib.sha256(json.dumps(packet, sort_keys=True, separators=(",", ":")).encode()).hexdigest(),
+            **packet_with_bytes,
+            "sha256": hashlib.sha256(json.dumps(packet_with_bytes, sort_keys=True, separators=(",", ":")).encode()).hexdigest(),
         },
         "model_policy": {"status": "resolved", "route": "", "fallback": False, "roles": {}},
     }
     observations = {
-        "source": {"status": "current", "revision": "r", "ref": "r", "tree": "t"},
-        "authority": {"status": "current", "grant": "g", "fence": "f", "decision": "d", "evidence": {"verified": True}},
-        "custody": {"status": "present", "custody_ref": "c", "wbc_ref": "w"},
+        "source": {"status": "current", "revision": "a" * 40, "ref": "a" * 40, "tree": "t"},
+        "authority": {"status": "current", "grant": "op", "fence": "req", "decision": "op", "evidence": {"verified": True, "source": "operation-envelope"}},
+        "custody": {"status": "present", "custody_ref": str(tmp_path), "wbc_ref": "w"},
         "credentials": {"status": "available", "identity": "i", "transport": "local"},
         "runtime": {"status": "present", "interpreter": str(interpreter), "import_root": str(runtime_source), "source_revision": "a" * 40},
         "command": {"status": "valid", "argv": "echo chain", "cwd": str(tmp_path), "env": {}},
@@ -171,6 +175,8 @@ def _request(tmp_path: Path):
 
 def test_exact_replay_returns_authority_without_redispatch(tmp_path: Path, monkeypatch) -> None:
     config, request, envelope = _request(tmp_path)
+    monkeypatch.setattr(chain_drive, "_validate_live_runtime", lambda binding: None)
+    monkeypatch.setattr(chain_drive, "_probe_live_collision", lambda session: None)
     dispatches: list[object] = []
     monkeypatch.setattr(chain_drive, "load_agentbox_config", lambda: config)
     monkeypatch.setattr(chain_drive, "run_tmux", lambda argv: dispatches.append(argv))
@@ -300,6 +306,8 @@ def test_ambient_manifest_is_ignored_in_favor_of_envelope_binding(
     tmp_path: Path, monkeypatch
 ) -> None:
     config, request, envelope = _request(tmp_path)
+    monkeypatch.setattr(chain_drive, "_validate_live_runtime", lambda binding: None)
+    monkeypatch.setattr(chain_drive, "_probe_live_collision", lambda session: None)
     dispatches: list[object] = []
     request["command"] = "echo ambient-command"
     request["cwd"] = "/ambient/cwd"
@@ -331,6 +339,8 @@ def test_ambient_manifest_is_ignored_in_favor_of_envelope_binding(
 
 def test_identity_query_loss_is_unknown_without_replacement(tmp_path: Path, monkeypatch) -> None:
     config, request, _ = _request(tmp_path)
+    monkeypatch.setattr(chain_drive, "_validate_live_runtime", lambda binding: None)
+    monkeypatch.setattr(chain_drive, "_probe_live_collision", lambda session: None)
     dispatches: list[object] = []
     monkeypatch.setattr(chain_drive, "load_agentbox_config", lambda: config)
     monkeypatch.setattr(chain_drive, "run_tmux", lambda argv: dispatches.append(argv))
@@ -352,3 +362,58 @@ def test_identity_query_loss_is_unknown_without_replacement(tmp_path: Path, monk
         event.event_type == "launch.accepted"
         for event in store.list_operation_events("op")
     )
+
+
+def test_live_runtime_fixture_is_rejected_before_admission_or_dispatch(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Declarations cannot substitute for a real source/dependency probe."""
+    config, request, envelope = _request(tmp_path)
+    dispatches: list[object] = []
+    monkeypatch.setattr(chain_drive, "load_agentbox_config", lambda: config)
+    monkeypatch.setattr(chain_drive, "run_tmux", lambda argv: dispatches.append(argv))
+
+    result = chain_drive.execute_authoritative_launch(request)
+
+    assert result["result"] == "REJECTED"
+    assert dispatches == []
+    store = FileBackedDurableOpsStore(config.ops_store_root)
+    assert not any(run.operation_id == envelope.operation_id for run in store.list_operation_runs())
+
+
+def test_collision_probe_exception_is_zero_admission_and_dispatch(
+    tmp_path: Path, monkeypatch
+) -> None:
+    config, request, _ = _request(tmp_path)
+    dispatches: list[object] = []
+    monkeypatch.setattr(chain_drive, "_validate_live_runtime", lambda binding: None)
+    monkeypatch.setattr(chain_drive, "load_agentbox_config", lambda: config)
+    monkeypatch.setattr(chain_drive, "run_tmux", lambda argv: dispatches.append(argv))
+    monkeypatch.setattr(
+        chain_drive,
+        "_probe_live_collision",
+        lambda session: (_ for _ in ()).throw(ValueError("probe unavailable")),
+    )
+
+    result = chain_drive.execute_authoritative_launch(request)
+
+    assert result["result"] == "REJECTED"
+    assert dispatches == []
+    store = FileBackedDurableOpsStore(config.ops_store_root)
+    assert not store.list_operation_runs()
+
+
+def test_live_source_mismatch_is_rejected_even_when_runtime_probe_is_stubbed(
+    tmp_path: Path, monkeypatch
+) -> None:
+    config, request, _ = _request(tmp_path)
+    request["preflight_observations"]["source"]["revision"] = "declared-but-wrong"
+    dispatches: list[object] = []
+    monkeypatch.setattr(chain_drive, "_validate_live_runtime", lambda binding: None)
+    monkeypatch.setattr(chain_drive, "load_agentbox_config", lambda: config)
+    monkeypatch.setattr(chain_drive, "run_tmux", lambda argv: dispatches.append(argv))
+
+    result = chain_drive.execute_authoritative_launch(request)
+
+    assert result["result"] == "REJECTED"
+    assert dispatches == []

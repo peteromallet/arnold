@@ -43,8 +43,9 @@ arnold_materialize_launch_boundary() {
   local chain_profile="${ARNOLD_BABYSITTER_CHAIN_PROFILE:-}"
   local closed_profile="${ARNOLD_BABYSITTER_CLOSED_PROFILE:-}"
   if [[ -n "$chain_profile" || -n "$closed_profile" ]]; then
-    if [[ "$chain_profile" != "all-muse-spark-openrouter" || \
-          "$closed_profile" != "all-muse-spark-openrouter" ]]; then
+    if [[ ("$chain_profile" != "all-muse-spark-openrouter" && \
+           "$chain_profile" != "all-muse-spark-1-3-contributor") || \
+          "$closed_profile" != "$chain_profile" ]]; then
       echo "[arnold-launch] closed_profile_route_mismatch: invalid closed fixer identity" >&2
       return 78
     fi
