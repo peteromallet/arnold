@@ -499,7 +499,9 @@ def _reread_current_authority(binding: Mapping[str, Any]) -> None:
     reservation = store.get_global_effect_reservation(binding["wbc_attempt_id"], binding["glek"])
     if reservation is None or reservation.attempt_id != binding["wbc_attempt_id"]:
         raise ValueError("G5A_REMOTE_BLOCKED: WBC reservation is missing or stale")
-    lease = open_lease_store(locations["custody_lease_dir"]).current_lease(binding["custody_lease_id"])
+    lease = open_lease_store(Path(locations["custody_lease_dir"])).current_lease(
+        binding["custody_lease_id"]
+    )
     if lease is None or lease.is_expired:
         raise ValueError("G5A_REMOTE_BLOCKED: Custody lease is missing or expired")
     if (
