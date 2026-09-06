@@ -208,7 +208,7 @@ def _production_runtime_fixture(tmp_path: Path) -> tuple[str, str, Path, Path]:
     # a copied, isolated chain spec and persist that binding through the normal
     # ChainState writer so no repository control-plane state is touched.
     chain_spec_path = tmp_path / "chain.yaml"
-    shutil.copy2(root / ".megaplan" / "collection" / "chain.yaml", chain_spec_path)
+    shutil.copyfile(root / ".megaplan" / "collection" / "chain.yaml", chain_spec_path)
     save_chain_state(
         chain_spec_path,
         ChainState(

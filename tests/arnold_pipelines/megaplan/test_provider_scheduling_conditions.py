@@ -140,6 +140,12 @@ def _install_production_runtime(monkeypatch: pytest.MonkeyPatch, tmp_path: Path)
     manifest.write_text("nbf06-production-manifest", encoding="utf-8")
     seed = tmp_path / "runtime-seed.json"
     seed.write_text("nbf06-production-seed", encoding="utf-8")
+    for name in (
+        "ARNOLD_BABYSITTER_MARKER_PATH",
+        "ARNOLD_BABYSITTER_MANIFEST_IDENTITY",
+        "MEGAPLAN_RUNTIME_LAUNCH_SEED",
+    ):
+        monkeypatch.delenv(name, raising=False)
 
     class _SeedPath:
         def is_file(self) -> bool:
