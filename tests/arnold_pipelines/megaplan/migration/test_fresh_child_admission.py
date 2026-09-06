@@ -31,6 +31,7 @@ from arnold_pipelines.run_authority.contracts import (
     CoordinatorFence,
     Decision,
     EvidenceEnvelope,
+    IdempotencyKey,
     SubjectAttempt,
 )
 
@@ -176,13 +177,15 @@ def test_fresh_child_admission_binds_all_three_owners_before_first_phase() -> No
     admission, journal, wbc, custody = _admission()
     receipt = admission.admit(_request())
     receipt.assert_ready()
-    assert len(journal.records) == 6
+    assert len(journal.records) == 8
     assert isinstance(journal.records[0], EvidenceEnvelope)
     assert isinstance(journal.records[1], CoordinatorFence)
     assert isinstance(journal.records[2], CapabilityGrant)
     assert isinstance(journal.records[3], SubjectAttempt)
-    assert isinstance(journal.records[4], Claim)
-    assert isinstance(journal.records[5], Decision)
+    assert isinstance(journal.records[4], IdempotencyKey)
+    assert isinstance(journal.records[5], Claim)
+    assert isinstance(journal.records[6], IdempotencyKey)
+    assert isinstance(journal.records[7], Decision)
     assert receipt.authority.decision is not None
     assert receipt.authority.decision.outcome == "accepted"
     assert receipt.wbc.attempt_id == "attempt-child-001"
@@ -199,7 +202,7 @@ def test_replay_after_ack_loss_is_idempotent_and_does_not_reallocate() -> None:
         admission.admit(_request())
     receipt = admission.admit(_request())
     receipt.assert_ready()
-    assert len(journal.records) == 6
+    assert len(journal.records) == 8
     assert wbc.calls == 1
     assert custody.calls == 1
 

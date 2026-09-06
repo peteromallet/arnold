@@ -283,7 +283,13 @@ def _ssh_provider(spec: CloudSpec) -> Provider:
     from arnold.workflow.effect_protocol import EffectProtocol
     from arnold.workflow.ledger_outbox import SqliteLedgerOutbox
 
-    store = SqliteAttemptLedgerStore(":memory:")
+    # Before admission this is only a fail-closed inspection adapter.  The
+    # provider replaces it with the admitted canonical WBC path when the
+    # production authority context is bound; never use an in-memory ledger in
+    # the production factory.
+    staging_root = Path(tempfile.gettempdir()) / "arnold-process-adapter-wbc" / "ssh"
+    staging_root.mkdir(parents=True, exist_ok=True)
+    store = SqliteAttemptLedgerStore(staging_root / "prebind.sqlite3")
     protocol = EffectProtocol(store, SqliteLedgerOutbox(store))
     provider_holder: dict[str, Any] = {}
     adapter = open_ssh_effect_adapter(

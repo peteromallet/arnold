@@ -1,0 +1,14 @@
+provider: ssh
+mode: idle
+repo:
+  url: https://github.com/example/arnold.git
+  branch: main
+  workspace: /workspace/nbf-continuation
+megaplan:
+  ref: main
+  src_path: /workspace/arnold
+  runtime_python: /workspace/venv/bin/python
+ssh:
+  host: arnold-agentbox-01
+  workspace_dir: /workspace/nbf-continuation
+  container: nbf-continuation

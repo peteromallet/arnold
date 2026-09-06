@@ -25,9 +25,11 @@ from arnold_pipelines.megaplan._core import resolve_plan_dir
 from arnold_pipelines.megaplan._core.io import write_immutable_json
 from arnold_pipelines.megaplan.migration.fresh_child_admission import (
     FRESH_CHILD_SCHEMA,
+    FreshChildAuthorityContext,
     FreshChildAdmission,
     FreshChildAdmissionError,
     FreshChildRequest,
+    action_descriptor,
 )
 
 
@@ -174,6 +176,142 @@ def _owner_bundle(root: Path, spec: Any) -> tuple[Any, Any, Any]:
         raise FreshChildLaunchError(
             f"canonical fresh-child owners unavailable: {type(exc).__name__}: {exc}"
         ) from exc
+
+
+def provision_fresh_child_authority(
+    *,
+    root: Path,
+    spec_path: Path,
+    spec: Any,
+    launch_context: Mapping[str, Any],
+    provider: Any,
+    operation_id: str,
+    request_id: str,
+    upload_destinations: tuple[str, ...] = (),
+) -> tuple[Any, Any, dict[str, Any]]:
+    """Admit and bind the real launch authority before the first effect.
+
+    This is the production cloud seam.  It only appends the existing RA
+    records, WBC reservation, and Custody lease; repository/runtime/upload and
+    launch effects remain owned by the caller after this function returns.
+    """
+    if spec is None or not bool(getattr(spec, "enabled", False)):
+        raise FreshChildLaunchError("fresh_child_admission must be enabled for a production launch")
+    workspace = Path(root).resolve(strict=True)
+    chain_spec = Path(spec_path).resolve(strict=True)
+    chain_spec_digest = _sha256_regular(chain_spec, "chain spec")
+    approval_receipt = _required_config_text(spec, "approval_receipt")
+    approval_digest = approval_receipt.removeprefix("sha256:")
+    if len(approval_digest) != 64 or any(char not in "0123456789abcdefABCDEF" for char in approval_digest):
+        raise FreshChildLaunchError(
+            "fresh_child_admission.approval_receipt must be a sha256 approval receipt digest"
+        )
+    source_revision = _required_config_text(spec, "source_revision")
+    base_target = dict(launch_context)
+    base_target.update({"operation": operation_id, "request": request_id})
+    # Request and target identities are deterministic and do not require any
+    # repository/runtime effect.  The exact operation is admitted up front.
+    capabilities = tuple(
+        item
+        for item in (
+            "repository_prepare",
+            "file_upload" if upload_destinations else None,
+            "ssh_engine_invocation",
+            "launch_dispatch",
+        )
+        if item is not None
+    )
+    target_bindings: list[tuple[str, str, Mapping[str, Any]]] = [
+        ("repository_prepare", "controller", {**base_target, "boundary": "controller", "operation": "repository_prepare"}),
+    ]
+    target_bindings.extend(
+        ("file_upload", "controller", {**base_target, "boundary": "controller", "operation": "file_upload", "destination": destination})
+        for destination in upload_destinations
+    )
+    target_bindings.extend(
+        (
+            capability,
+            "controller",
+            {**base_target, "operation": operation_id, "boundary": boundary},
+        )
+        for capability, boundary in (("ssh_engine_invocation", "engine"), ("launch_dispatch", "dispatch"))
+    )
+    host = str(getattr(provider, "_validated_host", ""))
+    container = str(getattr(getattr(provider, "_ssh", None), "container", ""))
+    if host and container:
+        target_bindings.append(
+            (
+                "ssh_engine_invocation",
+                "dispatch",
+                {"boundary": "dispatch", "target_key": f"ssh:ssh_exec:{host}:{container}"},
+            )
+        )
+        target_bindings.extend(
+            (
+                "file_upload",
+                "dispatch",
+                {"boundary": "dispatch", "target_key": f"ssh:upload_file:{host}:{container}"},
+            )
+            for _destination in upload_destinations
+        )
+    descriptors = [
+        action_descriptor(capability=capability, boundary=boundary, target_binding=target)
+        for capability, boundary, target in target_bindings
+    ]
+    descriptors.sort(key=lambda item: item["descriptor_digest"])
+    chain_identity = _required_config_text(spec, "chain_identity")
+    run_revision = (getattr(spec, "run_revision", None) or source_revision).strip()
+    request = FreshChildRequest(
+        run_id=f"{chain_identity}:launch:{operation_id}",
+        run_revision=run_revision,
+        coordinator_attempt_id=f"{chain_identity}:launch-coordinator:1",
+        subject_id=f"{chain_identity}:launch",
+        subject_attempt_id=f"{chain_identity}:launch-attempt:1",
+        child_selector={
+            "schema": "arnold.megaplan.fresh_child_selector.v1",
+            "workspace": str(workspace),
+            "chain_spec": str(chain_spec),
+            "chain_spec_digest": chain_spec_digest,
+            "operation_id": operation_id,
+            "request_id": request_id,
+            "authorized_action_descriptors": descriptors,
+        },
+        environment=getattr(spec, "environment", "cloud"),
+        session=getattr(spec, "session", "megaplan"),
+        chain=getattr(spec, "chain", "chain"),
+        phase=getattr(spec, "phase", "launch"),
+        task=getattr(spec, "task", "launch"),
+        normalized_failure_kind=_required_config_text(spec, "normalized_failure_kind"),
+        blocker_or_phase_result_hash=_required_config_text(spec, "blocker_or_phase_result_hash"),
+        chain_identity=chain_identity,
+        plan_artifact_digest=_digest({"chain_spec": chain_spec_digest, "target": base_target}),
+        runtime_binding_digest=_digest({"source_revision": source_revision, "workspace": str(launch_context.get("workspace", "")), "operation_id": operation_id}),
+        source_revision=source_revision,
+        approval_receipt=approval_receipt,
+        approval_actor=_required_config_text(spec, "approval_actor"),
+        parent_occurrence_digest=_required_config_text(spec, "parent_occurrence_digest"),
+        capabilities=capabilities,
+    )
+    journal, wbc, custody = _owner_bundle(workspace, spec)
+    try:
+        receipt = FreshChildAdmission(journal=journal, wbc=wbc, custody=custody).admit(request)
+        context = FreshChildAuthorityContext(receipt=receipt, journal=journal, wbc=wbc, custody=custody)
+        authority = context.read(
+            capability="repository_prepare",
+            target_binding={**base_target, "operation": "repository_prepare"},
+        )
+        context.bind(authority)
+        binder = getattr(provider, "bind_authority_context", None)
+        if not callable(binder):
+            raise FreshChildLaunchError("provider cannot bind canonical fresh-child authority")
+        binder(context)
+    except FreshChildLaunchError:
+        raise
+    except FreshChildAdmissionError as exc:
+        raise FreshChildLaunchError(f"canonical launch authority admission failed: {exc}") from exc
+    except Exception as exc:
+        raise FreshChildLaunchError(f"canonical launch authority binding failed: {type(exc).__name__}: {exc}") from exc
+    return context, receipt, authority
 
 
 def _wbc_dict(reservation: Any) -> dict[str, Any]:
@@ -361,4 +499,5 @@ __all__ = [
     "FreshChildLaunchError",
     "RECEIPT_FILENAME",
     "admit_fresh_child",
+    "provision_fresh_child_authority",
 ]

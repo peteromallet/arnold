@@ -734,6 +734,27 @@ class SshProvider(Provider):
         if context is None or not callable(getattr(context, "read", None)):
             raise ValueError("canonical fresh-child authority context is required")
         self.fresh_child_authority_context = context
+        owner_paths = getattr(context, "owner_paths", {})
+        wbc_path = owner_paths.get("wbc_ledger") if isinstance(owner_paths, Mapping) else None
+        if not isinstance(wbc_path, str) or not wbc_path:
+            raise ValueError("canonical fresh-child authority context has no durable WBC path")
+        from arnold.workflow.attempt_ledger_store import SqliteAttemptLedgerStore
+        from arnold.workflow.effect_protocol import EffectProtocol
+        from arnold.workflow.ledger_outbox import SqliteLedgerOutbox
+        from arnold_pipelines.megaplan.cloud.ssh_effect_adapter import (
+            current_ssh_gate_check,
+            open_ssh_effect_adapter,
+        )
+
+        store = SqliteAttemptLedgerStore(wbc_path)
+        protocol = EffectProtocol(store, SqliteLedgerOutbox(store))
+        self._ssh_effect_adapter = open_ssh_effect_adapter(
+            protocol,
+            action_gate_check=current_ssh_gate_check(
+                lambda: self.fresh_child_authority_context
+            ),
+            production_enabled=True,
+        )
 
     def _target(self) -> str:
         if self._validated_user:

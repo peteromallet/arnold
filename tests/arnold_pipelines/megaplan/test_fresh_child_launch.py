@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import inspect
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -87,3 +88,109 @@ def test_supervisor_persists_cursor_before_fresh_child_owner_admission() -> None
     ensure = source.index("_ensure_fresh_child_for_plan", save)
     drive = source.index("driver.drive", ensure)
     assert save < ensure < drive
+
+
+def test_production_ssh_factory_binds_real_owners_and_closed_targets(tmp_path: Path) -> None:
+    """The supported factory reaches the real RA/WBC/Custody boundary."""
+    from arnold_pipelines.megaplan.chain.fresh_child_launch import (
+        provision_fresh_child_authority,
+    )
+    from arnold_pipelines.megaplan.chain.spec import FreshChildAdmissionSpec
+    from arnold_pipelines.megaplan.cloud.cli import _provider_for_action
+    from arnold_pipelines.megaplan.cloud.spec import (
+        CloudSpec,
+        CodexSpec,
+        MegaplanSpec,
+        RepoSpec,
+        ResourcesSpec,
+        SshSpec,
+    )
+    from arnold_pipelines.run_authority.journal import RunAuthorityJournal
+
+    owners = tmp_path / "owners"
+    owners.mkdir()
+    chain_path = tmp_path / "chain.yaml"
+    chain_path.write_text("milestones: []\n", encoding="utf-8")
+    admission = FreshChildAdmissionSpec(
+        enabled=True,
+        authority_journal_path="owners/authority.sqlite",
+        wbc_ledger_path="owners/wbc.sqlite",
+        custody_lease_dir="owners/leases",
+        approval_receipt="sha256:" + "a" * 64,
+        approval_actor="operator",
+        parent_occurrence_digest="sha256:" + "b" * 64,
+        blocker_or_phase_result_hash="sha256:" + "c" * 64,
+        normalized_failure_kind="blocked",
+        chain_identity="production-fixture",
+        source_revision="source-fixture",
+        session="fixture-session",
+        chain="fixture-chain",
+        phase="launch",
+        task="launch",
+    )
+    cloud = CloudSpec(
+        provider="ssh",
+        repo=RepoSpec(url="https://github.com/example/app.git", workspace="/workspace/app"),
+        agents={"default": "codex"},
+        codex=CodexSpec(),
+        mode="idle",
+        megaplan=MegaplanSpec(),
+        resources=ResourcesSpec(),
+        secrets=[],
+        ssh=SshSpec(host="fixture-host", container="fixture-container"),
+    )
+    provider = _provider_for_action(
+        cloud,
+        SimpleNamespace(on_box=False, cloud_action="chain", session=None),
+    )
+    common = {
+        "provider": "ssh",
+        "workspace": "/workspace/app",
+        "session": "fixture-session",
+        "source_revision": "source-fixture",
+        "boundary": "controller",
+        "chain_spec": str(chain_path),
+        "operation": "repository_prepare",
+        "request": "cloud-chain-request:fixture",
+        "provider_host": "fixture-host",
+        "provider_container": "fixture-container",
+    }
+    context, receipt, _authority = provision_fresh_child_authority(
+        root=tmp_path,
+        spec_path=chain_path,
+        spec=admission,
+        launch_context=common,
+        provider=provider,
+        operation_id="cloud-chain:fixture",
+        request_id="cloud-chain-request:fixture",
+        upload_destinations=("/workspace/app/idea.md",),
+    )
+    assert provider.fresh_child_authority_context is context
+    assert receipt.authority.grant.capabilities == (
+        "file_upload",
+        "launch_dispatch",
+        "repository_prepare",
+        "ssh_engine_invocation",
+    )
+    assert provider._ssh_effect_adapter._protocol._store._db_path == owners / "wbc.sqlite"
+    journal = RunAuthorityJournal(owners / "authority.sqlite")
+    assert journal.read_view(receipt.request.run_id, receipt.request.run_revision).cursor == 8
+
+    upload = {**common, "operation": "file_upload", "destination": "/workspace/app/idea.md"}
+    assert context.read(capability="file_upload", target_binding=upload)["capability"] == "file_upload"
+    with pytest.raises(Exception, match="target is not an admitted action descriptor"):
+        context.read(
+            capability="file_upload",
+            target_binding={**upload, "destination": "/workspace/app/wrong.md"},
+        )
+    provision_fresh_child_authority(
+        root=tmp_path,
+        spec_path=chain_path,
+        spec=admission,
+        launch_context=common,
+        provider=provider,
+        operation_id="cloud-chain:fixture",
+        request_id="cloud-chain-request:fixture",
+        upload_destinations=("/workspace/app/idea.md",),
+    )
+    assert journal.read_view(receipt.request.run_id, receipt.request.run_revision).cursor == 8

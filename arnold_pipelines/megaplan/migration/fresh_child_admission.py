@@ -46,6 +46,7 @@ from arnold_pipelines.run_authority.contracts import (
     CoordinatorFence,
     Decision,
     EvidenceEnvelope,
+    IdempotencyKey,
     SubjectAttempt,
     canonical_json,
     validate_relationships,
@@ -74,6 +75,19 @@ class FreshChildOwnerUnavailable(FreshChildAdmissionError):
 
 DEFAULT_FRESH_CHILD_CAPABILITIES = ("execute",)
 CURRENT_AUTHORITY_BINDING_SCHEMA = "arnold.megaplan.current_authority_binding.v1"
+ACTION_DESCRIPTOR_SCHEMA = "arnold.megaplan.fresh_child_action_descriptor.v1"
+
+
+def action_descriptor(*, capability: str, boundary: str, target_binding: Mapping[str, Any]) -> dict[str, Any]:
+    """Return one canonical, owner-admitted action target descriptor."""
+    body = {
+        "schema": ACTION_DESCRIPTOR_SCHEMA,
+        "capability": _required_text(capability, "capability"),
+        "boundary": _required_text(boundary, "boundary"),
+        "target_binding": _canonical(target_binding),
+    }
+    body["descriptor_digest"] = _digest(body)
+    return body
 
 
 @runtime_checkable
@@ -307,11 +321,20 @@ class FreshChildAuthorityContext:
         self.custody = custody
         self._expected: dict[str, Any] | None = None
 
+    @property
+    def owner_paths(self) -> dict[str, str]:
+        """Expose the already-opened canonical owner locations to binders."""
+        return {
+            "authority_journal": str(getattr(self.journal, "database", "")),
+            "wbc_ledger": str(getattr(getattr(self.wbc, "store", None), "_db_path", "")),
+            "custody_lease_dir": str(getattr(getattr(self.custody, "store", None), "base_dir", "")),
+        }
+
     def bind(self, authority: Mapping[str, Any]) -> None:
-        """Freeze the first owner observation for later effect re-reads."""
+        """Freeze only invariant owner identity for later effect re-reads."""
         if not isinstance(authority, Mapping) or authority.get("schema") != CURRENT_AUTHORITY_BINDING_SCHEMA:
             raise FreshChildOwnerUnavailable("cannot bind a malformed current authority observation")
-        self._expected = dict(authority)
+        self._expected = {key: authority[key] for key in _AUTHORITY_INVARIANT_KEYS if key in authority}
 
     def authorize(self, *, boundary: str, target_key: str, capability: str) -> Any:
         """Return the canonical gate verdict for one exact transport target."""
@@ -320,16 +343,12 @@ class FreshChildAuthorityContext:
         if not capability:
             return GateResult.BLOCKED_MISSING_GRANT
         try:
-            expected = self._expected
-            if expected is not None and not expected.get("target_binding"):
-                expected = dict(expected)
-                expected.pop("target_binding", None)
             observed = self.read(
                 capability=capability,
                 target_binding={"boundary": str(boundary), "target_key": target_key},
-                expected=expected,
+                expected=self._expected,
             )
-            if self._expected is None or not self._expected.get("target_binding"):
+            if self._expected is None:
                 self.bind(observed)
             return GateResult.AUTHORIZED
         except FreshChildAdmissionError:
@@ -350,6 +369,44 @@ class FreshChildAuthorityContext:
         from arnold_pipelines.megaplan.maintenance.sources import RunAuthorityAdapter
 
         request = self.receipt.request
+        if not isinstance(capability, str) or not capability:
+            raise FreshChildOwnerUnavailable("G5A_REMOTE_BLOCKED: capability is required")
+        if capability not in self.receipt.authority.grant.capabilities:
+            raise FreshChildOwnerUnavailable("G5A_REMOTE_BLOCKED: capability is not in the admitted grant")
+        if not isinstance(target_binding, Mapping) or not target_binding:
+            raise FreshChildOwnerUnavailable("G5A_REMOTE_BLOCKED: exact target binding is required")
+        boundary = str(target_binding.get("boundary") or "")
+        target_descriptor = action_descriptor(
+            capability=capability,
+            boundary=boundary,
+            target_binding=target_binding,
+        )
+        admitted = self.receipt.request.child_selector.get("authorized_action_descriptors", ())
+        if not isinstance(admitted, (tuple, list)):
+            raise FreshChildOwnerUnavailable("G5A_REMOTE_BLOCKED: admitted action descriptor set is missing")
+        def _valid_descriptor(item: Any) -> bool:
+            if not isinstance(item, Mapping) or not isinstance(item.get("descriptor_digest"), str):
+                return False
+            body = {key: item[key] for key in item if key != "descriptor_digest"}
+            return item["descriptor_digest"] == _digest(body)
+
+        # The controller supplies the full target binding.  The SSH effect
+        # gate supplies its stable transport key; both must independently be
+        # present in the owner-admitted closed set.
+        exact_match = any(_valid_descriptor(item) and item == target_descriptor for item in admitted)
+        if not exact_match and isinstance(target_binding.get("target_key"), str):
+            exact_match = any(
+                _valid_descriptor(item)
+                and item.get("capability") == capability
+                and item.get("boundary") == boundary
+                and item.get("target_binding") == {
+                    "boundary": boundary,
+                    "target_key": target_binding["target_key"],
+                }
+                for item in admitted
+            )
+        if not exact_match:
+            raise FreshChildOwnerUnavailable("G5A_REMOTE_BLOCKED: target is not an admitted action descriptor")
         raw = self.journal.read_view(request.run_id, request.run_revision)
         records = getattr(raw, "records", None)
         cursor = getattr(raw, "cursor", getattr(raw, "journal_cursor", None))
@@ -420,12 +477,9 @@ class FreshChildAuthorityContext:
             "custody_lease_id": lease.lease_id,
             "custody_epoch": lease.custody_epoch,
             "custody_ref": _contract_digest(lease),
-            "target_binding": dict(target_binding or {}),
-            "owner_paths": {
-                "authority_journal": str(getattr(self.journal, "database", "")),
-                "wbc_ledger": str(getattr(getattr(self.wbc, "store", None), "_db_path", "")),
-                "custody_lease_dir": str(getattr(getattr(self.custody, "store", None), "base_dir", "")),
-            },
+            "target_binding": _canonical(target_binding),
+            "target_descriptor": target_descriptor,
+            "owner_paths": self.owner_paths,
         }
         owner_paths = authority["owner_paths"]
         if not all(isinstance(value, str) and value for value in owner_paths.values()):
@@ -441,6 +495,15 @@ class FreshChildAuthorityContext:
                         f"G5A_REMOTE_BLOCKED: authority reference drift at {key}"
                     )
         return authority
+
+
+_AUTHORITY_INVARIANT_KEYS = (
+    "schema", "run_id", "run_revision", "coordinator_attempt_id", "subject_id",
+    "subject_attempt_id", "grant_id", "fence_token", "claim_id", "decision_id",
+    "journal_cursor", "view_hash", "grant_ref", "fence_ref", "attempt_ref",
+    "decision_ref", "wbc_attempt_id", "glek", "custody_lease_id", "custody_epoch",
+    "custody_ref", "owner_paths",
+)
 
 
 def _identity(request: FreshChildRequest) -> tuple[FreshChildIdentity, GlobalEffectIdentity]:
@@ -562,7 +625,7 @@ def _records(request: FreshChildRequest, identity: FreshChildIdentity) -> tuple[
         evidence=(evidence,),
         decision=decision,
     )
-    return evidence, fence, grant, attempt, claim, decision
+    return evidence, fence, grant, attempt, claim.idempotency, claim, decision.idempotency, decision
 
 
 def _record_key(record: Any, identity: FreshChildIdentity) -> str:
@@ -579,11 +642,18 @@ def _record_key(record: Any, identity: FreshChildIdentity) -> str:
         return record.idempotency_key
     if isinstance(record, Decision):
         return record.idempotency_key
+    if isinstance(record, IdempotencyKey):
+        return f"{prefix}:idempotency:{record.value}"
     raise TypeError(f"unsupported fresh-child record {type(record).__name__}")
 
 
 def _record_matches(record: Any, identity: FreshChildIdentity) -> bool:
     """Detect an occupied run ID before adding a fresh generation."""
+    if isinstance(record, IdempotencyKey):
+        return record.value in {
+            f"{identity.migration_idempotency_key}:claim",
+            f"{identity.migration_idempotency_key}:decision",
+        }
     if getattr(record, "run_id", None) != identity.run_id or getattr(record, "run_revision", None) != identity.run_revision:
         return False
     if isinstance(record, EvidenceEnvelope):
@@ -649,7 +719,7 @@ class FreshChildAdmission:
     def admit(self, request: FreshChildRequest) -> FreshChildAdmissionReceipt:
         identity, effect = _identity(request)
         records = _records(request, identity)
-        # These six records form the smallest complete admission chain.  A
+        # These eight records form the smallest complete admission chain.  A
         # crash after any append is replayed by the same idempotency keys.
         for record in records:
             self._append(request, identity, record)
@@ -658,9 +728,9 @@ class FreshChildAdmission:
             fence=records[1],
             grant=records[2],
             attempt=records[3],
-            claim=records[4],
+            claim=records[5],
             evidence=(records[0],),
-            decision=records[5],
+            decision=records[7],
         )
         authority.validate()
 
@@ -741,4 +811,6 @@ __all__ = [
     "FreshChildRequest",
     "DEFAULT_FRESH_CHILD_CAPABILITIES",
     "CURRENT_AUTHORITY_BINDING_SCHEMA",
+    "ACTION_DESCRIPTOR_SCHEMA",
+    "action_descriptor",
 ]

@@ -6546,19 +6546,10 @@ def _run_authoritative_chain_wrapper(root: Path, args: argparse.Namespace, spec:
         "workspace": launch_ctx.workspace,
         "session": launch_ctx.session_name,
         "source_revision": str(spec.megaplan.ref),
+        "boundary": "controller",
         "chain_spec": str(local_spec_path),
+        "operation": "repository_prepare",
     }
-    authority_binding = _read_current_launch_authority(
-        provider,
-        capability="repository_prepare",
-        target_binding=authority_target,
-    )
-    authority_identity = {
-        key: value
-        for key, value in authority_binding.items()
-        if key not in {"capability", "target_binding"}
-    }
-
     uploads: list[tuple[Path, str]] = []
     idea_dir = Path(args.idea_dir).expanduser().resolve() if args.idea_dir else local_spec_path.parent.resolve()
     for milestone in chain_spec.milestones:
@@ -6577,6 +6568,46 @@ def _run_authoritative_chain_wrapper(root: Path, args: argparse.Namespace, spec:
         )))
     for source, destination in _chain_anchor_uploads(local_spec_path, launch_ctx.remote_spec_path, chain_spec):
         _append_unique_upload(uploads, source, destination)
+    operation_id = f"cloud-chain:{launch_ctx.identity}"
+    request_id = f"cloud-chain-request:{launch_ctx.digest}"
+    authority_target.update({
+        "request": request_id,
+        "provider_host": str(getattr(getattr(spec, "ssh", None), "host", "")),
+        "provider_container": str(getattr(getattr(spec, "ssh", None), "container", "")),
+    })
+    authority_binding: dict[str, Any]
+    if chain_spec.fresh_child_admission is not None and chain_spec.fresh_child_admission.enabled:
+        from arnold_pipelines.megaplan.chain.fresh_child_launch import (
+            FreshChildLaunchError,
+            provision_fresh_child_authority,
+        )
+        try:
+            _context, _receipt, authority_binding = provision_fresh_child_authority(
+                root=project_root,
+                spec_path=local_spec_path,
+                spec=chain_spec.fresh_child_admission,
+                launch_context={
+                    **authority_target,
+                },
+                provider=provider,
+                operation_id=operation_id,
+                request_id=request_id,
+                upload_destinations=tuple(destination for _source, destination in uploads)
+                + (launch_ctx.remote_spec_path,),
+            )
+        except FreshChildLaunchError as exc:
+            raise CliError("G5A_REMOTE_BLOCKED", str(exc)) from exc
+    else:
+        authority_binding = _read_current_launch_authority(
+            provider,
+            capability="repository_prepare",
+            target_binding=authority_target,
+        )
+    authority_identity = {
+        key: value
+        for key, value in authority_binding.items()
+        if key not in {"capability", "target_binding", "target_descriptor"}
+    }
     # Runtime creation/probing is the sole binding producer and must complete
     # before the immutable launch envelope is assembled.  The exact binding is
     # then copied once into envelope metadata and projected into command/env.
@@ -6622,8 +6653,6 @@ def _run_authoritative_chain_wrapper(root: Path, args: argparse.Namespace, spec:
     }
     runtime_binding = dict(runtime_binding)
     runtime_binding["model_policy"] = model_policy
-    operation_id = f"cloud-chain:{launch_ctx.identity}"
-    request_id = f"cloud-chain-request:{launch_ctx.digest}"
     command = _chain_start_command(
         launch_ctx.remote_spec_path,
         project_dir=launch_ctx.workspace,
@@ -6650,6 +6679,12 @@ def _run_authoritative_chain_wrapper(root: Path, args: argparse.Namespace, spec:
         model_policy=model_policy,
     )
     collision_observation = _cloud_launch_collision_observation(provider, launch_ctx)
+    launch_dispatch_binding = _read_current_launch_authority(
+        provider,
+        capability="launch_dispatch",
+        target_binding={**authority_target, "boundary": "dispatch", "operation": operation_id},
+        expected=authority_identity,
+    )
     launch_spec = {
         "command": command,
         "cwd": launch_ctx.workspace,
@@ -6664,12 +6699,12 @@ def _run_authoritative_chain_wrapper(root: Path, args: argparse.Namespace, spec:
         "metadata": {
             "runtime_binding": _envelope_runtime_binding(runtime_binding),
             "launch_attestation": launch_attestation,
-            "authority_binding": authority_binding,
+            "authority_binding": launch_dispatch_binding,
         },
     }
     observations = {
         "source": {"status": "current", "revision": runtime_binding["runtime_revision"], "ref": str(spec.megaplan.ref), "tree": str(project_root)},
-        "authority": _authority_observation(authority_binding),
+        "authority": _authority_observation(launch_dispatch_binding),
         "custody": {"status": "present", "custody_ref": launch_ctx.workspace, "wbc_ref": launch_ctx.workspace},
         "credentials": _cloud_launch_credentials_observation(spec, provider),
         "runtime": {"status": "present", "interpreter": launch_attestation["dependency_interpreter_identity"] or spec.megaplan.runtime_python or "python", "import_root": runtime_binding["runtime_source"], "source_revision": runtime_binding["runtime_revision"], "manifest_identity": runtime_binding["manifest_identity"], "evidence": launch_attestation["provenance"]},
@@ -6694,21 +6729,21 @@ def _run_authoritative_chain_wrapper(root: Path, args: argparse.Namespace, spec:
         _read_current_launch_authority(
             provider,
             capability="file_upload",
-            target_binding={**authority_target, "destination": destination},
+            target_binding={**authority_target, "operation": "file_upload", "destination": destination},
             expected=authority_identity,
         )
         provider.upload_file(source, destination)
     _read_current_launch_authority(
         provider,
         capability="file_upload",
-        target_binding={**authority_target, "destination": launch_ctx.remote_spec_path},
+        target_binding={**authority_target, "operation": "file_upload", "destination": launch_ctx.remote_spec_path},
         expected=authority_identity,
     )
     provider.upload_file(local_spec_path, launch_ctx.remote_spec_path)
     _read_current_launch_authority(
         provider,
         capability="ssh_engine_invocation",
-        target_binding={**authority_target, "operation": operation_id},
+        target_binding={**authority_target, "boundary": "engine", "operation": operation_id},
         expected=authority_identity,
     )
     request = build_launch_request(
