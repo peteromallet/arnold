@@ -7,7 +7,6 @@ import shutil
 import subprocess
 import tempfile
 import venv
-from datetime import datetime, timezone
 from pathlib import Path
 
 from arnold_pipelines.megaplan.cloud.worker_dispatch import WorkerAdmissionRequest, _digest
@@ -139,9 +138,12 @@ def _production_runtime_fixture(tmp_path: Path) -> tuple[str, str, Path, Path]:
         ["git", "-C", str(root), "rev-parse", "HEAD"], text=True
     ).strip()
     branch = subprocess.check_output(
-        ["git", "-C", str(root), "branch", "--show-current"], text=True
+        ["git", "-C", str(root), "rev-parse", "--abbrev-ref", "HEAD"], text=True
     ).strip()
-    now = datetime.now(timezone.utc).isoformat()
+    # Keep repeated requests in one fixture rooted at the same immutable
+    # runtime bytes, so retry tests exercise durable idempotency rather than
+    # timestamp drift in this test-only manifest.
+    now = "2026-01-01T00:00:00+00:00"
 
     manifest_path = tmp_path / "runtime-manifest.json"
     manifest = RuntimeManifest(

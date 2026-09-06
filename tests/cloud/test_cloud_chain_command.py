@@ -44,6 +44,7 @@ from arnold_pipelines.megaplan.cloud.cli import (
     _cloud_chains_command,
     _cloud_session_plan_state,
     _derive_chain_launch_context,
+    _derive_epic_chain_launch_context,
     _durable_megaplan_uploads,
     _derive_bootstrap_session_name,
     _latest_failure_from_plan_status,
@@ -163,6 +164,39 @@ def _cloud_spec() -> CloudSpec:
         secrets=[],
         ssh=SshSpec(host="testhost"),
     )
+
+
+def _attach_real_fresh_child_admission(
+    project: Path,
+    spec_path: Path,
+    *,
+    source_revision: str = "main",
+    chain_identity: str = "cloud-test-child",
+) -> None:
+    """Opt the canonical fixture into the real RA/WBC/Custody boundary."""
+    owners = project / ".test-fresh-child-owners"
+    owners.mkdir(parents=True, exist_ok=True)
+    raw = yaml.safe_load(spec_path.read_text(encoding="utf-8")) or {}
+    raw["fresh_child_admission"] = {
+        "enabled": True,
+        "authority_journal_path": ".test-fresh-child-owners/authority.sqlite",
+        "wbc_ledger_path": ".test-fresh-child-owners/wbc.sqlite",
+        "custody_lease_dir": ".test-fresh-child-owners/leases",
+        "approval_receipt": "sha256:" + "a" * 64,
+        "approval_actor": "cloud-test-operator",
+        "parent_occurrence_digest": "sha256:" + "b" * 64,
+        "blocker_or_phase_result_hash": "sha256:" + "c" * 64,
+        "normalized_failure_kind": "blocked",
+        "chain_identity": chain_identity,
+        "source_revision": source_revision,
+        "run_revision": source_revision,
+        "environment": "cloud",
+        "session": "megaplan",
+        "chain": "chain",
+        "phase": "launch",
+        "task": "launch",
+    }
+    spec_path.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
 
 
 def _running_container_observation() -> dict[str, object]:
@@ -691,7 +725,7 @@ def test_successor_cloud_preflight_runs_exact_muse_probe(
     (spec_dir / "briefs").mkdir(parents=True)
     (project / ".megaplan").mkdir(exist_ok=True)
     (project / ".megaplan" / "profiles.toml").write_text(
-        "[profiles.successor-muse-alias]\n"
+        f"[profiles.{CONTINUATION_RUNTIME_PROFILE}]\n"
         + "\n".join(
             f"{phase} = \"{CONTINUATION_RUNTIME_MODEL_SPEC}\""
             for phase in (
@@ -726,7 +760,7 @@ def test_successor_cloud_preflight_runs_exact_muse_probe(
         "milestones:\n"
         "  - label: successor-c2\n"
         "    idea: .megaplan/initiatives/successor/briefs/m1.md\n"
-        "    profile: successor-muse-alias\n",
+        f"    profile: {CONTINUATION_RUNTIME_PROFILE}\n",
         encoding="utf-8",
     )
     probes: list[tuple[object, bool]] = []
@@ -756,9 +790,15 @@ def test_successor_cloud_preflight_runs_exact_muse_probe(
         SimpleNamespace(),
     )
     payload = json.loads(capsys.readouterr().out)
-    assert rc == 78, payload
-    assert payload["error"]["code"] == "closed_profile_route_mismatch"
-    assert probes == []
+    assert rc == 0, payload
+    assert len(probes) == 1
+    _provider, local = probes[0]
+    assert local is True
+    assert payload["closed_route"]["status"] == "ok"
+    assert payload["closed_route"]["model"] == CONTINUATION_RUNTIME_MODEL_SPEC
+    assert payload["closed_route"]["profile"] == CONTINUATION_RUNTIME_PROFILE
+    assert payload["closed_route"]["thinking"] == "high"
+    assert payload["closed_route"]["fallback"] is False
 
 
 def test_tmux_chain_projects_closed_profile_into_watchdog_environment() -> None:
@@ -3204,6 +3244,11 @@ class _LaunchEpicProvider:
         self.remote_files: set[str] = set()
         self.markers: dict[str, dict] = {}
         self.runtime_probe_calls = 0
+        self.fresh_child_authority_context = None
+
+    def bind_authority_context(self, context) -> None:
+        assert callable(getattr(context, "read", None))
+        self.fresh_child_authority_context = context
 
     def upload_file(self, src: Path, dest: str) -> None:
         self.uploads.append((src, dest))
@@ -3363,6 +3408,7 @@ def test_launch_epic_end_to_end_uploads_canonical_spec_and_tracks_watchdog(
     assert _run_launch_epic_wrapper(tmp_path, prepare_args, _cloud_spec(), provider) == 0
     canonical_spec = app / ".megaplan" / "initiatives" / "demo" / "chain.yaml"
     assert canonical_spec.is_file()
+    _attach_real_fresh_child_admission(app, canonical_spec)
     rc = _run_launch_epic_wrapper(
         tmp_path,
         argparse.Namespace(
@@ -3429,6 +3475,11 @@ def test_composed_cli_on_box_chain_drive_dispatches_once_with_seed_binding(
         milestone["profile"] = CONTINUATION_RUNTIME_PROFILE
     materialized.spec_path.write_text(
         yaml.safe_dump(canonical, sort_keys=False), encoding="utf-8"
+    )
+    _attach_real_fresh_child_admission(
+        materialized.project_root,
+        materialized.spec_path,
+        chain_identity="cloud-composed-child",
     )
 
     runtime_root = (tmp_path / "runtime-candidate").resolve()
@@ -4261,10 +4312,42 @@ def test_verify_configured_megaplan_ref_rejects_ambiguous_short_name(monkeypatch
     assert excinfo.value.code == "engine_ref_ambiguous"
 
 
+class _EpicAuthorityContextAdapter:
+    """Keep the epic wrapper's legacy target shape on the real context."""
+
+    def __init__(self, context) -> None:
+        self._context = context
+        self.receipt = context.receipt
+
+    def read(self, *, capability, target_binding, expected=None):
+        target = dict(target_binding)
+        child_selector = self.receipt.request.child_selector
+        target.setdefault("request", child_selector["request_id"])
+        if capability == "repository_prepare":
+            target.update(boundary="controller", operation="repository_prepare")
+        elif capability == "file_upload":
+            target.update(boundary="controller", operation="file_upload")
+        elif capability == "ssh_engine_invocation":
+            target.update(
+                boundary="engine",
+                operation=target.get("operation") or child_selector["operation_id"],
+            )
+        return self._context.read(
+            capability=capability,
+            target_binding=target,
+            expected=expected,
+        )
+
+
 class _RefFailureProvider:
     def __init__(self) -> None:
         self.uploads: list[tuple[Path, str]] = []
         self.markers: dict[str, dict] = {}
+        self.fresh_child_authority_context = None
+
+    def bind_authority_context(self, context) -> None:
+        assert callable(getattr(context, "read", None))
+        self.fresh_child_authority_context = _EpicAuthorityContextAdapter(context)
 
     def upload_file(self, src: Path, dest: str) -> None:
         self.uploads.append((src, dest))
@@ -4311,6 +4394,12 @@ def test_cloud_chain_persists_failed_launch_outcome_when_engine_ref_is_not_adver
         "  - label: m1\n"
         "    idea: .megaplan/initiatives/demo/briefs/m1.md\n",
         encoding="utf-8",
+    )
+    _attach_real_fresh_child_admission(
+        project,
+        spec_path,
+        source_revision="editible-install",
+        chain_identity="cloud-ref-chain",
     )
 
     monkeypatch.setattr("arnold_pipelines.megaplan.cloud.cli._ensure_repo_checkout", lambda *_a, **_k: None)
@@ -4385,6 +4474,12 @@ def test_cloud_epic_chain_persists_failed_launch_outcome_when_engine_ref_is_not_
         "    idea: .megaplan/initiatives/child/briefs/m1.md\n",
         encoding="utf-8",
     )
+    _attach_real_fresh_child_admission(
+        project,
+        child_spec,
+        source_revision="editible-install",
+        chain_identity="cloud-ref-epic-child",
+    )
     (parent_dir / "NORTHSTAR.md").write_text("parent north star\n", encoding="utf-8")
     epic_spec = parent_dir / "epic-chain.yaml"
     epic_spec.write_text(
@@ -4432,6 +4527,36 @@ def test_cloud_epic_chain_persists_failed_launch_outcome_when_engine_ref_is_not_
     cloud_spec = replace(
         _cloud_spec(),
         megaplan=MegaplanSpec(repo="https://github.com/example/arnold.git", ref="editible-install"),
+    )
+    from arnold_pipelines.megaplan.chain import epic_chain as epic_chain_module
+    from arnold_pipelines.megaplan.chain.fresh_child_launch import provision_fresh_child_authority
+
+    loaded_epic = epic_chain_module.load_epic_chain_spec(epic_spec)
+    loaded_child = chain_module.load_spec(child_spec)
+    launch_ctx = _derive_epic_chain_launch_context(
+        root=project,
+        spec=cloud_spec,
+        local_spec_path=epic_spec,
+        epic_chain_spec=loaded_epic,
+    )
+    authority_target = {
+        "provider": str(cloud_spec.provider),
+        "workspace": launch_ctx.workspace,
+        "session": launch_ctx.session_name,
+        "source_revision": str(cloud_spec.megaplan.ref),
+        "chain_spec": str(epic_spec.resolve()),
+        "boundary": "controller",
+        "operation": "repository_prepare",
+    }
+    provision_fresh_child_authority(
+        root=project,
+        spec_path=child_spec,
+        spec=loaded_child.fresh_child_admission,
+        launch_context=authority_target,
+        provider=provider,
+        operation_id=f"cloud-epic-chain:{launch_ctx.identity}",
+        request_id=f"cloud-epic-chain-request:{launch_ctx.digest}",
+        upload_destinations=(launch_ctx.workspace, launch_ctx.remote_spec_path),
     )
     with pytest.raises(CliError) as excinfo:
         _run_epic_chain_wrapper(

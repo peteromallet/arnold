@@ -3871,8 +3871,7 @@ def _start_identity(pid):
 workspace = pathlib.Path(current.get("workspace", "")).expanduser()
 manifest_path = pathlib.Path(current.get("bootstrap_manifest_path", ""))
 if manifest_path.is_file():
-    from arnold_pipelines.megaplan.cloud.runtime_manifest import manifest_bytes_sha256
-    manifest_identity = manifest_bytes_sha256(manifest_path)
+    manifest_identity = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
     expected_manifest_identity = str(
         current.get("manifest_sha256") or current.get("manifest_identity") or ""
     )
@@ -3884,11 +3883,19 @@ if manifest_path.is_file():
     current["manifest_sha256"] = manifest_identity
     current["manifest_identity"] = manifest_identity
     try:
-        from arnold_pipelines.megaplan.cloud.runtime_manifest import bootstrap_manifest
-        manifest = bootstrap_manifest(manifest_path)
-        current.setdefault("runtime_id", manifest.runtime_id)
-        current.setdefault("generation", manifest.generation)
-        current.setdefault("expected_head", manifest.epic["expected_head"])
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if not isinstance(manifest, dict):
+            raise ValueError("runtime manifest must be an object")
+        runtime_id = manifest.get("runtime_id")
+        generation = manifest.get("generation")
+        epic = manifest.get("epic")
+        expected_head = epic.get("expected_head") if isinstance(epic, dict) else None
+        if isinstance(runtime_id, str) and runtime_id:
+            current.setdefault("runtime_id", runtime_id)
+        if isinstance(generation, int) and not isinstance(generation, bool):
+            current.setdefault("generation", generation)
+        if isinstance(expected_head, str) and expected_head:
+            current.setdefault("expected_head", expected_head)
     except Exception:
         pass
 else:
