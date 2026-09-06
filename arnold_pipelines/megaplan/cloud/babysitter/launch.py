@@ -353,6 +353,8 @@ def _receipt_payload(ctx: dict[str, Any], *, status: str, **extra: Any) -> dict[
         "authority": "telemetry_only",
         "launched_at": ctx["launched_at"],
     }
+    if ctx.get("manifest_identity") is not None:
+        payload["manifest_identity"] = ctx["manifest_identity"]
     if ctx.get("marker_dir") is not None:
         payload["marker_dir"] = str(ctx["marker_dir"])
     if ctx.get("repair_data_dir") is not None:
@@ -378,6 +380,61 @@ def _receipt_payload(ctx: dict[str, Any], *, status: str, **extra: Any) -> dict[
         payload["provider_capability"] = ctx["provider_capability"]
     payload.update({key: value for key, value in extra.items() if value is not None})
     return payload
+
+
+def _manifest_identity_for_dispatch() -> str:
+    """Resolve the marker-bound manifest identity used by fixer admission.
+
+    The marker is the producer of the expected identity; the manifest bytes
+    are the authority checked here and again at the final launch door.  A
+    direct/unit invocation without a marker path may derive the identity from
+    its explicitly pinned manifest, but a marker-scoped repair must carry and
+    match both marker fields.
+    """
+    manifest_raw = str(os.environ.get("ARNOLD_RUNTIME_MANIFEST") or "").strip()
+    if not manifest_raw:
+        raise RuntimeError("babysitter manifest binding is missing")
+    manifest_path = Path(manifest_raw)
+    try:
+        from arnold_pipelines.megaplan.cloud.runtime_manifest import (
+            manifest_bytes_sha256,
+        )
+
+        observed = manifest_bytes_sha256(manifest_path)
+    except Exception as exc:
+        raise RuntimeError("babysitter manifest binding is unreadable") from exc
+
+    declared = str(
+        os.environ.get("ARNOLD_BABYSITTER_MANIFEST_IDENTITY") or ""
+    ).strip()
+    marker_raw = str(os.environ.get("ARNOLD_BABYSITTER_MARKER_PATH") or "").strip()
+    if marker_raw:
+        marker_path = Path(marker_raw)
+        try:
+            marker = json.loads(marker_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            raise RuntimeError("babysitter marker binding is unreadable") from exc
+        if not isinstance(marker, dict):
+            raise RuntimeError("babysitter marker binding is malformed")
+        marker_manifest = str(marker.get("bootstrap_manifest_path") or "").strip()
+        marker_sha = str(marker.get("manifest_sha256") or "").strip()
+        marker_identity = str(marker.get("manifest_identity") or "").strip()
+        if (
+            not marker_manifest
+            or not marker_sha
+            or not marker_identity
+            or Path(marker_manifest).resolve() != manifest_path.resolve()
+            or marker_sha != observed
+            or marker_identity != observed
+        ):
+            raise RuntimeError("babysitter marker manifest identity mismatch")
+        if declared and declared != marker_identity:
+            raise RuntimeError("babysitter manifest identity projection mismatch")
+        declared = marker_identity
+    elif declared and declared != observed:
+        raise RuntimeError("babysitter manifest identity mismatch")
+
+    return declared or observed
 
 
 def _write_receipts(ctx: dict[str, Any], payload: dict[str, Any]) -> None:
@@ -644,19 +701,17 @@ def _admit_managed_launch(ctx: dict[str, Any], spec: ManagedCommandSpec) -> int:
     plan = str(ctx.get("plan") or ctx["session"])
     identity = str(ctx.get("managed_run_id") or ctx["run_id"])
     seed_path = configured_seed_path()
-    manifest_path = str(os.environ.get("ARNOLD_RUNTIME_MANIFEST") or "")
     seed_identity = ""
-    manifest_identity = ""
+    manifest_identity = _manifest_identity_for_dispatch()
     try:
         if seed_path is not None and seed_path.is_file():
             seed_identity = hashlib.sha256(seed_path.read_bytes()).hexdigest()
-        if manifest_path and Path(manifest_path).is_file():
-            manifest_identity = hashlib.sha256(Path(manifest_path).read_bytes()).hexdigest()
     except OSError:
         # Keep the identity empty so the canonical gate returns a typed refusal
         # before the managed command is constructed or started.
         seed_identity = ""
         manifest_identity = ""
+    ctx["manifest_identity"] = manifest_identity
     provenance = runtime_provenance()
     configured_specs = tuple(ctx.get("configured_fallback_specs") or (model,))
     request = WorkerAdmissionRequest(

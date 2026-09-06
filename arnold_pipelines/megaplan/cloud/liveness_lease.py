@@ -87,6 +87,10 @@ def marker_binding(marker: Mapping[str, Any]) -> str:
             "attempt_id": str(marker.get("attempt_id") or ""),
             "incarnation_id": str(marker.get("incarnation_id") or ""),
             "pid": marker.get("pid"),
+            # The manifest identity is part of the immutable launch binding;
+            # a lease for a marker whose manifest bytes changed is not a lease
+            # for the same managed run.
+            "manifest_identity": str(marker.get("manifest_identity") or ""),
             "pid_namespace_id": str(marker.get("pid_namespace_id") or ""),
             "process_start_identity": str(marker.get("process_start_identity") or ""),
         }
@@ -212,7 +216,18 @@ def _refresh_authority_marker(payload: dict[str, Any]) -> dict[str, Any]:
         payload.setdefault("boot_identity", "unknown-boot")
     payload.setdefault("container_identity", os.environ.get("ARNOLD_CONTAINER_IDENTITY") or socket.gethostname())
     if manifest.is_file():
-        payload["manifest_sha256"] = hashlib.sha256(manifest.read_bytes()).hexdigest()
+        from arnold_pipelines.megaplan.cloud.runtime_manifest import (
+            manifest_bytes_sha256,
+        )
+
+        manifest_identity = manifest_bytes_sha256(manifest)
+        payload["manifest_sha256"] = manifest_identity
+        payload["manifest_identity"] = manifest_identity
+    else:
+        # Never retain a previous marker identity when the pinned manifest is
+        # gone; admission will fail closed on the missing binding.
+        payload.pop("manifest_sha256", None)
+        payload.pop("manifest_identity", None)
     if progress.is_file():
         payload["progress_content_digest"] = hashlib.sha256(progress.read_bytes()).hexdigest()
     tmux_keys = {

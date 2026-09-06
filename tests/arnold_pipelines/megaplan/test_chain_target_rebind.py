@@ -28,6 +28,11 @@ from arnold_pipelines.megaplan.cloud.runtime_cutover import (
     normalize_runtime_identity,
     update_marker_runtime,
 )
+from arnold_pipelines.megaplan.cloud.runtime_manifest import (
+    RuntimeManifest,
+    manifest_bytes_sha256,
+    write_manifest,
+)
 from arnold_pipelines.megaplan.chain.seed_rematerialize import (
     SEED_MANIFEST_SCHEMA,
     SEED_REMATERIALIZE_ERROR,
@@ -452,6 +457,7 @@ def _marker_rebind(
     source: Mapping[str, Any],
     target: Mapping[str, Any],
     direction: str,
+    manifest_path: Path,
 ) -> dict[str, Any]:
     return update_marker_runtime(
         marker,
@@ -465,7 +471,74 @@ def _marker_rebind(
         reason=f"{direction} integrated marker",
         actor="test",
         direction=direction,
+        manifest_path=manifest_path,
     )
+
+
+def _runtime_manifest(fixture: dict[str, Any]) -> Path:
+    """Create the authoritative, schema-valid manifest for marker cutovers."""
+
+    runtime_root = fixture["root"] / ".runtime"
+    revision = fixture["source"]
+    payload = {
+        "runtime_id": "target-rebind-runtime",
+        "schema": "1",
+        "generation": 1,
+        "epic_id": "target-rebind-epic",
+        "state": "active",
+        "owner": "test",
+        "base": {
+            "ref": M9_REF,
+            "commit": revision,
+            "editable_install_path": str(runtime_root / "base"),
+            "venv_path": str(runtime_root / "base" / "venv"),
+        },
+        "epic": {
+            "branch": M9_BRANCH,
+            "worktree_path": str(runtime_root),
+            "venv_path": str(runtime_root / "venv"),
+            "runtime_root": str(runtime_root),
+            "expected_head": revision,
+            "repair_bin": str(runtime_root / "venv" / "bin" / "arnold-babysitter"),
+            "deps_lockfile": str(runtime_root / "uv.lock"),
+        },
+        "indirection": {
+            "host_path": str(runtime_root),
+            "container_path": str(runtime_root),
+            "mount_table": [],
+            "execution_namespace": "target-rebind",
+            "verified_head": revision,
+            "last_verified_at": "2026-09-06T00:00:00Z",
+            "attestation": {
+                "module_file": str(runtime_root / "arnold_pipelines" / "__init__.py"),
+                "module_digest": "0" * 64,
+                "mount_id": "0:0",
+            },
+        },
+        "policy": {
+            "policy_sha": "0" * 64,
+            "model_policy_sha": "0" * 64,
+            "sync_policy": "disabled",
+        },
+        "promotions": [],
+        "timestamps": {
+            "created": "2026-09-06T00:00:00Z",
+            "updated": "2026-09-06T00:00:00Z",
+            "closed": "",
+        },
+        "gc_policy": "closed-only",
+        "commands": [],
+    }
+    path = fixture["root"].parent / "target-rebind-runtime-manifest.json"
+    write_manifest(RuntimeManifest.from_dict(payload), path)
+    return path
+
+
+def _assert_marker_manifest(marker: Path, manifest_path: Path) -> None:
+    payload = _load_json(marker)
+    expected = manifest_bytes_sha256(manifest_path)
+    assert payload["manifest_identity"] == expected
+    assert payload["manifest_sha256"] == expected
 
 
 def _seed_rollback(
@@ -1314,6 +1387,7 @@ def test_full_runtime_marker_target_seed_a_b_a_b_keeps_all_receipts(
 ) -> None:
     fixture = _fixture(tmp_path)
     runtime_a, runtime_b, marker = _runtime_fixture(fixture)
+    runtime_manifest_path = _runtime_manifest(fixture)
 
     # Bootstrap order is load-bearing: the external runtime and marker move
     # before target/seeds, and the still-new B interpreter supplies the
@@ -1329,7 +1403,9 @@ def test_full_runtime_marker_target_seed_a_b_a_b_keeps_all_receipts(
         source=runtime_a,
         target=runtime_b,
         direction="cutover",
+        manifest_path=runtime_manifest_path,
     )
+    _assert_marker_manifest(marker, runtime_manifest_path)
     _cutover(fixture, verified_external_runtime_identity=runtime_b)
     manifest_path = _seed_manifest(fixture)
     first_seed = _rematerialize(
@@ -1356,7 +1432,9 @@ def test_full_runtime_marker_target_seed_a_b_a_b_keeps_all_receipts(
         source=runtime_b,
         target=runtime_a,
         direction="rollback",
+        manifest_path=runtime_manifest_path,
     )
+    _assert_marker_manifest(marker, runtime_manifest_path)
     _target_rollback(
         fixture,
         verified_external_runtime_identity=runtime_a,
@@ -1385,7 +1463,9 @@ def test_full_runtime_marker_target_seed_a_b_a_b_keeps_all_receipts(
         source=runtime_a,
         target=runtime_b,
         direction="cutover",
+        manifest_path=runtime_manifest_path,
     )
+    _assert_marker_manifest(marker, runtime_manifest_path)
     _cutover(fixture, verified_external_runtime_identity=runtime_b)
     second_manifest = _seed_manifest(fixture)
     _rematerialize(
@@ -1424,6 +1504,7 @@ def test_full_runtime_marker_target_seed_a_b_a_b_keeps_all_receipts(
         == marker_runtime_identity(_load_json(marker))
         == runtime_b
     )
+    _assert_marker_manifest(marker, runtime_manifest_path)
 
 
 def test_target_rollback_can_escape_pre_seed_binding_drift(

@@ -92,6 +92,7 @@ def update_marker_runtime(
     source_branch: str = "",
     clear_fields: tuple[str, ...] = DEFAULT_OBSOLETE_FIELDS,
     expected_interpreter_path: str | None = None,
+    manifest_path: Path | None = None,
 ) -> dict[str, Any]:
     """Atomically update runtime custody only when marker and runtime guards match."""
 
@@ -113,7 +114,6 @@ def update_marker_runtime(
             "runtime_marker_relaunch_mismatch",
             "relaunch command does not bind the active content-addressed runtime",
         )
-
     marker_path = marker_path.resolve(strict=False)
     marker_path.parent.mkdir(parents=True, exist_ok=True)
     lock_path = marker_path.with_suffix(marker_path.suffix + ".runtime-cutover.lock")
@@ -135,6 +135,52 @@ def update_marker_runtime(
             raise CliError("runtime_marker_invalid", "marker is not valid JSON") from exc
         if not isinstance(marker, dict):
             raise CliError("runtime_marker_invalid", "marker must be a JSON object")
+        manifest_identity = None
+        candidates = [
+            str(marker.get(key) or "").strip()
+            for key in ("bootstrap_manifest_path", "manifest_path")
+            if str(marker.get(key) or "").strip()
+        ]
+        resolved_candidates = {
+            str(Path(value).expanduser().resolve(strict=False))
+            for value in candidates
+        }
+        if len(resolved_candidates) > 1:
+            raise CliError(
+                "runtime_marker_manifest_mismatch",
+                "marker carries conflicting authoritative manifest paths",
+            )
+        if not resolved_candidates and manifest_path is None:
+            raise CliError(
+                "runtime_marker_manifest_missing",
+                "authoritative manifest path is required and must be explicit for an unbound marker",
+            )
+        declared_target = (
+            Path(next(iter(resolved_candidates)))
+            if resolved_candidates
+            else manifest_path.expanduser().resolve(strict=False)
+        )
+        if manifest_path is None:
+            manifest_path = declared_target
+        elif manifest_path.expanduser().resolve(strict=False) != declared_target:
+            raise CliError(
+                "runtime_marker_manifest_mismatch",
+                "explicit manifest does not match the marker's pinned manifest",
+            )
+        try:
+            from arnold_pipelines.megaplan.cloud.runtime_manifest import (
+                manifest_bytes_sha256,
+            )
+
+            target_manifest = manifest_path.expanduser().resolve(strict=False)
+            manifest_identity = manifest_bytes_sha256(target_manifest)
+        except CliError:
+            raise
+        except Exception as exc:
+            raise CliError(
+                "runtime_marker_manifest_invalid",
+                f"cannot bind runtime marker to manifest {manifest_path}",
+            ) from exc
         previous = marker_runtime_identity(marker)
         if previous is None:
             raise CliError("runtime_marker_invalid", "marker has no content-addressable runtime")
@@ -179,6 +225,13 @@ def update_marker_runtime(
             "source": active["import_root"],
             "runtime_sha256": active["content_sha256"],
         }
+        if manifest_identity is not None:
+            # This is written in the same locked temp-file replacement as the
+            # runtime binding, so a cutover cannot expose a new runtime with
+            # the previous manifest identity.
+            marker["manifest_identity"] = manifest_identity
+            marker["manifest_sha256"] = manifest_identity
+            marker["bootstrap_manifest_path"] = str(target_manifest)
         marker["relaunch_command"] = relaunch_command
         marker["updated_at"] = changed_at
         for field in clear_fields:
@@ -211,6 +264,15 @@ def update_marker_runtime(
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--marker", type=Path, required=True)
+    parser.add_argument(
+        "--manifest",
+        type=Path,
+        default=None,
+        help=(
+            "authoritative runtime manifest; when omitted, the marker's "
+            "single bootstrap_manifest_path is used"
+        ),
+    )
     parser.add_argument("--expect-marker-sha256", required=True)
     parser.add_argument("--from-runtime-sha256", required=True)
     parser.add_argument("--runtime-identity", type=Path, required=True)
@@ -221,6 +283,31 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--source-branch", default="")
     parser.add_argument("--clear-field", action="append", default=list(DEFAULT_OBSOLETE_FIELDS))
     args = parser.parse_args(argv)
+    manifest_path = args.manifest
+    if manifest_path is None:
+        try:
+            marker = json.loads(args.marker.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise CliError(
+                "runtime_marker_manifest_missing",
+                "cannot derive authoritative manifest from marker",
+            ) from exc
+        if not isinstance(marker, dict):
+            raise CliError(
+                "runtime_marker_manifest_missing",
+                "marker is not a JSON object",
+            )
+        candidates = [
+            str(marker.get(key) or "").strip()
+            for key in ("bootstrap_manifest_path", "manifest_path")
+            if str(marker.get(key) or "").strip()
+        ]
+        if not candidates or len({str(Path(value).expanduser().resolve(strict=False)) for value in candidates}) != 1:
+            raise CliError(
+                "runtime_marker_manifest_missing",
+                "marker does not carry one unambiguous authoritative manifest path",
+            )
+        manifest_path = Path(candidates[0])
     identity = json.loads(args.runtime_identity.read_text(encoding="utf-8"))
     result = update_marker_runtime(
         args.marker,
@@ -233,6 +320,7 @@ def main(argv: list[str] | None = None) -> int:
         direction=args.direction,
         source_branch=args.source_branch,
         clear_fields=tuple(dict.fromkeys(args.clear_field)),
+        manifest_path=manifest_path,
     )
     print(json.dumps({"success": True, **result}, indent=2, sort_keys=True))
     return 0

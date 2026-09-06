@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import argparse
 import ast
+import copy
+import hashlib
 import json
 import os
 import re
@@ -77,6 +79,10 @@ from arnold_pipelines.megaplan.cloud.spec import (
     RepoSpec,
     ResourcesSpec,
     SshSpec,
+)
+from arnold_pipelines.megaplan.profiles import (
+    CONTINUATION_RUNTIME_MODEL_SPEC,
+    CONTINUATION_RUNTIME_PROFILE,
 )
 from arnold_pipelines.megaplan.types import CliError
 
@@ -520,6 +526,213 @@ def test_closed_profile_route_uses_authoritative_profile_not_session_generation(
     assert caught.value.code == "closed_profile_route_mismatch"
 
 
+def test_successor_closed_profile_route_requires_canonical_role_closure() -> None:
+    from arnold_pipelines.megaplan.cloud.cli import _validate_continuation_muse_routes
+
+    roles = {
+        role: {"spec": CONTINUATION_RUNTIME_MODEL_SPEC, "effort": "high"}
+        for role in (
+            "phase",
+            "tiebreaker_researcher",
+            "tiebreaker_challenger",
+            "oracle",
+            "researcher",
+            "fixer",
+            "babysitter",
+        )
+    }
+    summary = {
+        "milestones": [
+            {
+                "label": "successor-c2",
+                "profile": CONTINUATION_RUNTIME_PROFILE,
+                "resolved_phase_chains": {
+                    "plan": [CONTINUATION_RUNTIME_MODEL_SPEC],
+                    "tiebreaker_researcher": [CONTINUATION_RUNTIME_MODEL_SPEC],
+                },
+            }
+        ],
+        "runtime_model_binding": {
+            "profile": CONTINUATION_RUNTIME_PROFILE,
+            "spec": CONTINUATION_RUNTIME_MODEL_SPEC,
+            "backend": "omp",
+            "provider": "openrouter",
+            "model": "meta/muse-spark-1.3-contributor",
+            "effort": "high",
+            "roles": roles,
+        },
+    }
+    assert _validate_continuation_muse_routes(summary) == {
+        "status": "ok",
+        "model": CONTINUATION_RUNTIME_MODEL_SPEC,
+        "profile": CONTINUATION_RUNTIME_PROFILE,
+        "thinking": "high",
+        "fallback": False,
+    }
+    alias = copy.deepcopy(summary)
+    alias["milestones"][0]["profile"] = "successor-muse-alias"
+    assert _validate_continuation_muse_routes(alias)["profile"] == "successor-muse-alias"
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        lambda summary: summary["milestones"][0]["resolved_phase_chains"].update(
+            {"plan": [CONTINUATION_RUNTIME_MODEL_SPEC, "codex"]}
+        ),
+        lambda summary: summary["runtime_model_binding"]["roles"]["fixer"].update(
+            {"spec": "omp:deepseek/deepseek-v4-flash", "effort": "high"}
+        ),
+        lambda summary: summary["runtime_model_binding"]["roles"]["oracle"].update(
+            {"spec": CONTINUATION_RUNTIME_MODEL_SPEC, "effort": "low"}
+        ),
+        lambda summary: summary["runtime_model_binding"].update(
+            {"provider": "deepseek"}
+        ),
+        lambda summary: summary["runtime_model_binding"]["roles"].pop("babysitter"),
+    ],
+)
+def test_successor_closed_profile_route_fails_closed_on_route_or_role_drift(mutation) -> None:
+    from arnold_pipelines.megaplan.cloud.cli import _validate_continuation_muse_routes
+
+    roles = {
+        role: {"spec": CONTINUATION_RUNTIME_MODEL_SPEC, "effort": "high"}
+        for role in (
+            "phase",
+            "tiebreaker_researcher",
+            "tiebreaker_challenger",
+            "oracle",
+            "researcher",
+            "fixer",
+            "babysitter",
+        )
+    }
+    summary = {
+        "milestones": [
+            {
+                "label": "successor-c2",
+                "profile": CONTINUATION_RUNTIME_PROFILE,
+                "resolved_phase_chains": {"plan": [CONTINUATION_RUNTIME_MODEL_SPEC]},
+            }
+        ],
+        "runtime_model_binding": {
+            "profile": CONTINUATION_RUNTIME_PROFILE,
+            "spec": CONTINUATION_RUNTIME_MODEL_SPEC,
+            "backend": "omp",
+            "provider": "openrouter",
+            "model": "meta/muse-spark-1.3-contributor",
+            "effort": "high",
+            "roles": roles,
+        },
+    }
+    mutation(summary)
+    with pytest.raises(CliError, match="no fallback"):
+        _validate_continuation_muse_routes(summary)
+
+
+def test_successor_closed_profile_route_rejects_mixed_profiles() -> None:
+    from arnold_pipelines.megaplan.cloud.cli import _validate_continuation_muse_routes
+
+    summary = {
+        "milestones": [
+            {
+                "label": "successor-c2",
+                "profile": CONTINUATION_RUNTIME_PROFILE,
+                "resolved_phase_chains": {"plan": [CONTINUATION_RUNTIME_MODEL_SPEC]},
+            },
+            {
+                "label": "legacy-c2",
+                "profile": "all-muse-spark-openrouter",
+                "resolved_phase_chains": {
+                    "plan": ["omp:openrouter/meta/muse-spark-1.3-contributor"]
+                },
+            },
+        ],
+    }
+    with pytest.raises(CliError, match="every chain milestone"):
+        _validate_continuation_muse_routes(summary)
+
+
+def test_successor_cloud_preflight_runs_exact_muse_probe(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project = tmp_path / "successor"
+    spec_dir = project / ".megaplan" / "initiatives" / "successor"
+    (spec_dir / "briefs").mkdir(parents=True)
+    (project / ".megaplan").mkdir(exist_ok=True)
+    (project / ".megaplan" / "profiles.toml").write_text(
+        "[profiles.successor-muse-alias]\n"
+        + "\n".join(
+            f"{phase} = \"{CONTINUATION_RUNTIME_MODEL_SPEC}\""
+            for phase in (
+                "plan",
+                "prep",
+                "critique",
+                "critique_evaluator",
+                "revise",
+                "gate",
+                "finalize",
+                "execute",
+                "feedback",
+                "loop_plan",
+                "loop_execute",
+                "review",
+                "tiebreaker_researcher",
+                "tiebreaker_challenger",
+            )
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    (spec_dir / "NORTHSTAR.md").write_text(
+        "successor " + "launch contract " * 30,
+        encoding="utf-8",
+    )
+    (spec_dir / "briefs" / "m1.md").write_text("successor idea\n", encoding="utf-8")
+    spec_path = spec_dir / "chain.yaml"
+    spec_path.write_text(
+        "anchors:\n"
+        "  north_star: NORTHSTAR.md\n"
+        "milestones:\n"
+        "  - label: successor-c2\n"
+        "    idea: .megaplan/initiatives/successor/briefs/m1.md\n"
+        "    profile: successor-muse-alias\n",
+        encoding="utf-8",
+    )
+    probes: list[tuple[object, bool]] = []
+
+    def fake_probe(provider=None, *, local=False):
+        probes.append((provider, local))
+        return {
+            "status": "ok",
+            "provider": "openrouter",
+            "model": "meta/muse-spark-1.3-contributor",
+            "thinking": "high",
+            "fallback": False,
+        }
+
+    monkeypatch.setattr(
+        "arnold_pipelines.megaplan.cloud.cli._omp_openrouter_capability_check",
+        fake_probe,
+    )
+    rc = _run_preflight(
+        project,
+        argparse.Namespace(
+            spec=str(spec_path),
+            skip_remote=True,
+            allow_loose_chain_spec=False,
+        ),
+        _cloud_spec(),
+        SimpleNamespace(),
+    )
+    payload = json.loads(capsys.readouterr().out)
+    assert rc == 0, payload
+    assert payload["closed_route"]["profile"] == "successor-muse-alias"
+    assert probes == [(None, True)]
+
+
 def test_tmux_chain_projects_closed_profile_into_watchdog_environment() -> None:
     command = _tmux_chain_launch_command(
         "/workspace/project",
@@ -790,9 +1003,15 @@ def test_tmux_chain_launch_default_marker_records_run_kind() -> None:
 
 def test_atomic_marker_writer_can_be_followed_by_shell_operator(tmp_path: Path) -> None:
     marker = tmp_path / "markers" / "demo.json"
+    manifest = tmp_path / "runtime-manifest.json"
+    manifest.write_bytes(b"launch-created-successor-manifest\n")
     command = _atomic_marker_write_command(
         str(marker),
-        {"session": "demo", "run_kind": "chain"},
+        {
+            "session": "demo",
+            "run_kind": "chain",
+            "bootstrap_manifest_path": str(manifest),
+        },
     )
 
     result = subprocess.run(
@@ -808,6 +1027,9 @@ def test_atomic_marker_writer_can_be_followed_by_shell_operator(tmp_path: Path) 
     # lives in OperationRun and enriches the projection with custody facts.
     assert payload["run_kind"] == "chain"
     assert payload["session"] == "demo"
+    expected_manifest_identity = hashlib.sha256(manifest.read_bytes()).hexdigest()
+    assert payload["manifest_sha256"] == expected_manifest_identity
+    assert payload["manifest_identity"] == expected_manifest_identity
     assert payload["content_digest"]
 
 

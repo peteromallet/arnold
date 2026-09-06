@@ -181,6 +181,22 @@ class ManifestError(ValueError):
     """Raised when a runtime manifest is missing, corrupt, or schema-mismatched."""
 
 
+def manifest_bytes_sha256(path: Path) -> str:
+    """Return the identity of the exact bytes stored at *path*.
+
+    Launch custody is bound to the file bytes, not to a parsed/re-serialized
+    JSON representation.  Keeping this read in the manifest module gives the
+    cloud launch paths one authority and makes formatting-only changes
+    observable.  Missing/unreadable files fail closed with ``ManifestError``.
+    """
+    target = Path(path).expanduser().resolve(strict=False)
+    try:
+        raw = target.read_bytes()
+    except OSError as exc:
+        raise ManifestError(f"cannot read manifest {target}: {exc}") from exc
+    return hashlib.sha256(raw).hexdigest()
+
+
 class ForeignAuthoritativePointerConflict(ManifestError):
     """A valid authoritative pointer belongs to another epic.
 
@@ -1869,10 +1885,11 @@ def apply_runtime_manifest_cutover(
     transaction_lock.__enter__()
     try:
         try:
-            before_bytes = target.read_bytes()
-        except OSError as exc:
+            # The launch/rollback CAS uses the same exact-byte authority
+            # exposed to seed, marker, and worker admission paths.
+            observed_sha = manifest_bytes_sha256(target)
+        except ManifestError as exc:
             raise CliError(CUTOVER_ERROR, f"cannot read manifest: {target}") from exc
-        observed_sha = hashlib.sha256(before_bytes).hexdigest()
         if observed_sha != expect_manifest_sha256:
             raise CliError(
                 CUTOVER_ERROR,

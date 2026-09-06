@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+import os
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -10,6 +12,7 @@ import pytest
 from arnold.runtime.durable_ops import FileBackedDurableOpsStore, OperationState
 from dataclasses import replace
 from arnold_pipelines.megaplan.cloud.worker_dispatch import (
+    AdmissionRefusal,
     LaunchResult,
     ManagedCommandResult,
     dispatch_with_admission,
@@ -49,6 +52,39 @@ def test_physical_door_valid_admission_dispatches_once(door: str, tmp_path: Path
     assert len(resources) == 1
     assert resources[0].details["worker_identity"] == identity
     assert ledger.read_nbf_events() == []
+
+
+@pytest.mark.parametrize("mutation", ("missing", "tamper", "marker_mismatch"))
+def test_physical_door_manifest_binding_fails_closed(
+    mutation: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The raw production-door manifest check rejects missing or drifted pins."""
+    req = request(tmp_path)
+    receipt = replace(require_production_worker_dispatch_runtime(req), production_intent=True)
+    manifest_path = Path(os.environ["ARNOLD_RUNTIME_MANIFEST"])
+    marker_path = Path(os.environ["ARNOLD_BABYSITTER_MARKER_PATH"])
+    if mutation == "missing":
+        monkeypatch.delenv("ARNOLD_RUNTIME_MANIFEST")
+    elif mutation == "tamper":
+        manifest_path.write_bytes(b"tampered-runtime-manifest\n")
+    else:
+        marker = json.loads(marker_path.read_text(encoding="utf-8"))
+        marker["manifest_identity"] = "0" * 64
+        marker_path.write_text(json.dumps(marker) + "\n", encoding="utf-8")
+
+    launches: list[int] = []
+    result = dispatch_with_admission(
+        req,
+        lambda _context: launches.append(1),
+        gate=lambda _request: receipt,
+    )
+    assert isinstance(result, AdmissionRefusal)
+    assert result.code == "launch_rejected"
+    assert result.reason == "dispatch_rejected"
+    assert launches == []
+    store = FileBackedDurableOpsStore(tmp_path / "ops")
+    assert store.load_operation_run(receipt.operation_id).state is OperationState.PENDING
+    assert store.list_typed_resources(receipt.operation_id) == ()
 
 
 def test_physical_door_missing_process_incarnation_is_unknown_without_retry(tmp_path: Path) -> None:

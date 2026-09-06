@@ -78,6 +78,14 @@ def test_marker_rebind_invalidates_old_lease(tmp_path: Path):
     assert observed["live"] is False
 
 
+def test_manifest_identity_is_part_of_lease_marker_binding(tmp_path: Path):
+    marker = _marker(tmp_path)
+    marker["manifest_identity"] = "a" * 64
+    changed = dict(marker)
+    changed["manifest_identity"] = "b" * 64
+    assert ll.marker_binding(marker) != ll.marker_binding(changed)
+
+
 def test_tampered_lease_is_degraded(tmp_path: Path):
     marker = _marker(tmp_path)
     publisher = ll.LivenessLeasePublisher(

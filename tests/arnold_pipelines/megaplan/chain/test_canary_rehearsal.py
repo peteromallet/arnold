@@ -1263,13 +1263,16 @@ def test_canary_rehearsal_full_sequence_with_rollback_injection(
         encoding="utf-8",
     )
     marker_path = _write_cloud_marker(tmp_path, spec_path, old_root=old_root)
-    marker_sha_seeded = _sha256_file(marker_path)
     manifest_path = _write_runtime_manifest(
         tmp_path / "runtime-manifest.json",
         epic_id="demo",
         runtime_root=old_root,
         expected_head=old_revision,
     )
+    marker = json.loads(marker_path.read_text(encoding="utf-8"))
+    marker["bootstrap_manifest_path"] = str(manifest_path)
+    marker_path.write_text(json.dumps(marker, sort_keys=True) + "\n", encoding="utf-8")
+    marker_sha_seeded = _sha256_file(marker_path)
     monkeypatch.setenv("ARNOLD_RUNTIME_MANIFEST", str(manifest_path))
     queue = _enqueue_repair(tmp_path, identity)
     assert queue["status"] == "queued", queue
@@ -2274,6 +2277,7 @@ def test_canary_rehearsal_full_sequence_with_rollback_injection(
         relaunch_file.write_text(relaunch + "\n", encoding="utf-8")
         return [
             "--marker", str(marker_path),
+            "--manifest", str(manifest_path),
             "--expect-marker-sha256", _sha256_file(marker_path),
             "--from-runtime-sha256", previous_runtime_sha,
             "--runtime-identity", str(control_identity_path),
@@ -3066,6 +3070,7 @@ def test_canary_rehearsal_identityless_adoption_sequence(
     rc, payload = _marker_cli(
         [
             "--marker", str(marker_path),
+            "--manifest", str(manifest_path),
             "--expect-marker-sha256", _sha256_file(marker_path),
             "--from-runtime-sha256", previous_runtime_sha,
             "--runtime-identity", str(control_identity_path),

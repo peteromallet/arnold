@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import importlib.metadata
 import os
 import shutil
@@ -39,6 +40,7 @@ def _release_seed(
     marker = tmp_path / "marker.json"
     chain_spec = tmp_path / "chain.yaml"
     seed_doc = tmp_path / "NORTHSTAR.md"
+    manifest = tmp_path / "runtime-manifest.json"
     _write_json(
         receipt,
         {
@@ -76,6 +78,7 @@ def _release_seed(
     )
     chain_spec.write_text("milestones: []\n", encoding="utf-8")
     seed_doc.write_text("# North Star\n", encoding="utf-8")
+    manifest.write_bytes(b'{"schema":"1","generation":1}\n')
     provenance = {
         "ok": True,
         "ready": True,
@@ -182,6 +185,7 @@ def _release_seed(
         marker_path=marker,
         chain_spec_path=chain_spec,
         seed_doc_paths=[seed_doc],
+        manifest_path=manifest,
         **build_kwargs,
     )
     return seed, {
@@ -191,6 +195,7 @@ def _release_seed(
         "marker": marker,
         "chain_spec": chain_spec,
         "seed_doc": seed_doc,
+        "manifest": manifest,
         "wrapper": wrapper_dir / "arnold-watchdog",
     }
 
@@ -222,6 +227,22 @@ def test_release_seed_binds_full_runtime_and_seed_document_manifest(
         attestation.validate_runtime_launch_seed(seed, component="worker")["status"]
         == "ready"
     )
+
+
+def test_cloud_seed_manifest_identity_is_exact_bytes_and_rejects_format_drift(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seed, paths = _release_seed(tmp_path, monkeypatch)
+    expected = hashlib.sha256(paths["manifest"].read_bytes()).hexdigest()
+    assert seed["manifest_identity"] == expected
+    assert seed["manifest_sha256"] == expected
+
+    # Same JSON meaning, different bytes: the launch identity must still
+    # change, and the worker-side admission gate must reject before dispatch.
+    paths["manifest"].write_bytes(b'{"generation":1,"schema":"1"}\n')
+    with pytest.raises(CliError, match="manifest identity drifted"):
+        attestation.validate_runtime_launch_seed(seed, component="worker")
 
 
 def test_complete_loaded_module_vector_rejects_mixed_and_late_modules(
@@ -663,6 +684,8 @@ source = pathlib.Path(source)
 work = pathlib.Path(work)
 spec = work / "chain.yaml"
 spec.write_text("milestones: []\\n")
+manifest = work / "runtime-manifest.json"
+manifest.write_bytes(b'{"schema":"1","generation":1}\\n')
 identity = normalized_runtime_identity(
     runtime_provenance(expected_root=source, expected_revision=revision)
 )
@@ -693,6 +716,7 @@ seed = build_runtime_launch_seed(
     marker_path=marker,
     chain_spec_path=spec,
     seed_doc_paths=[doc],
+    manifest_path=manifest,
 )
 assert seed["ready"], seed["errors"]
 assert validate_runtime_launch_seed(seed, component="worker")["status"] == "ready"
@@ -801,10 +825,11 @@ def test_release_seed_accepts_supervisor_receipt_from_another_source(
         expected_revision="a" * 40,
         supervisor_receipt_path=paths["receipt"],
         hot_env_path=paths["hot_env"],
-        marker_path=paths["marker"],
-        chain_spec_path=paths["chain_spec"],
-        seed_doc_paths=[paths["seed_doc"]],
-    )
+            marker_path=paths["marker"],
+            chain_spec_path=paths["chain_spec"],
+            seed_doc_paths=[paths["seed_doc"]],
+            manifest_path=paths["manifest"],
+        )
     assert seed2["ready"] is True
     assert seed2["errors"] == []
     assert seed2["supervisor_receipt"]["source"] == str(
@@ -908,6 +933,7 @@ def _ensure_seed_env(
     identity = normalized_runtime_identity(_provenance())
     marker = json.loads(paths["marker"].read_text(encoding="utf-8"))
     marker["runtime_binding"]["current_identity"] = dict(identity)
+    marker["bootstrap_manifest_path"] = str(tmp_path / "runtime-manifest.json")
     marker["relaunch_command"] = (
         f"python -m arnold_pipelines.megaplan chain {root} {state['revision']}"
     )
@@ -979,6 +1005,11 @@ def _ensure_seed_env(
         )
 
     _write_manifest()
+    marker = json.loads(paths["marker"].read_text(encoding="utf-8"))
+    manifest_identity = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
+    marker["manifest_identity"] = manifest_identity
+    marker["manifest_sha256"] = manifest_identity
+    _write_json(paths["marker"], marker)
     seed_dir = tmp_path / "launch-seeds"
     return {
         "manifest": manifest_path,
@@ -1476,7 +1507,15 @@ def test_validate_pointerless_seed_without_manifest_fails_closed(
     a manifest/environment head - the seed is immutable evidence and is
     validated exactly as issued (no ARNOLD_ACCEPTED_RUNTIME_HEAD reinterpret).
     """
-    seed, _paths = _release_seed(tmp_path, monkeypatch)
+    original, _paths = _release_seed(tmp_path, monkeypatch)
+    seed = dict(original)
+    seed["input_paths"] = {**dict(original["input_paths"]), "manifest": ""}
+    seed["manifest_identity"] = ""
+    seed["manifest_sha256"] = ""
+    seed.pop("content_sha256", None)
+    seed["content_sha256"] = attestation._canonical_sha256(
+        {key: value for key, value in seed.items() if key != "content_sha256"}
+    )
     assert seed["input_paths"]["manifest"] == ""
     monkeypatch.delenv("ARNOLD_RUNTIME_MANIFEST", raising=False)
     monkeypatch.delenv("ARNOLD_ACCEPTED_RUNTIME_HEAD", raising=False)
@@ -1486,7 +1525,7 @@ def test_validate_pointerless_seed_without_manifest_fails_closed(
 
     monkeypatch.setattr(attestation, "runtime_provenance", _drifted_provenance)
 
-    with pytest.raises(CliError, match="source_revision_mismatch"):
+    with pytest.raises(CliError, match="runtime launch seed manifest identity is missing"):
         attestation.validate_runtime_launch_seed(seed, component="worker")
 
     # Even with ARNOLD_RUNTIME_MANIFEST pointing at a NEWER accepted head, the
@@ -1504,7 +1543,7 @@ def test_validate_pointerless_seed_without_manifest_fails_closed(
         return prov
 
     monkeypatch.setattr(attestation, "runtime_provenance", _drifted_advanced)
-    with pytest.raises(CliError, match="source_revision_mismatch"):
+    with pytest.raises(CliError, match="runtime launch seed manifest identity is missing"):
         attestation.validate_runtime_launch_seed(seed, component="worker")
     # No accepted-head env was set by validation (follow removed).
     assert os.environ.get("ARNOLD_ACCEPTED_RUNTIME_HEAD") is None
@@ -1572,7 +1611,7 @@ def test_validate_seed_manifest_pointer_wins_over_environment(
         return {"ok": False, "errors": ["source_revision_mismatch"]}
 
     monkeypatch.setattr(attestation, "runtime_provenance", _env_only_provenance)
-    with pytest.raises(CliError, match="source_revision_mismatch"):
+    with pytest.raises(CliError, match="runtime launch seed manifest is unreadable"):
         attestation.validate_runtime_launch_seed(seed_broken, component="worker")
 
 
@@ -1984,6 +2023,7 @@ def test_launch_seed_current_rejects_cross_interpreter_ready_seed(
     store_dir = tmp_path / "seeds"
     store_dir.mkdir()
     manifest_pointer = tmp_path / "manifest-pointer.json"
+    manifest_pointer.write_bytes(paths["manifest"].read_bytes())
     revision = str(seed["expected_revision"])
 
     def _materialize(name: str, mutate) -> Path:

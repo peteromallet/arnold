@@ -25,6 +25,7 @@ from arnold_pipelines.megaplan.incident.ledger import IncidentLedger
 from arnold.runtime.durable_ops import FileBackedDurableOpsStore
 from arnold.runtime.durable_ops.launch import (
     LaunchEnvelope,
+    LaunchDispatchRejected,
     LaunchResult as DurableLaunchResult,
     launch_transaction,
 )
@@ -971,7 +972,7 @@ def _runtime_binding_proof(request: WorkerAdmissionRequest) -> Mapping[str, Any]
         "source_revision": seed.get("expected_revision"),
         "runtime_vector": seed.get("runtime_provenance"),
         "runtime_vector_sha256": validation.get("runtime_vector_sha256"),
-        "manifest_identity": seed.get("manifest_sha256"),
+        "manifest_identity": seed.get("manifest_identity"),
         "seed_identity": hashlib.sha256(seed_path.read_bytes()).hexdigest(),
         "seed_sha256": seed.get("content_sha256"),
         "dependency_interpreter_identity": (
@@ -1609,6 +1610,53 @@ def _canonical_worker_launch(
         # The closure is the sole physical door.  The engine invokes it once;
         # replay and reconciliation return before this callback.
         nonlocal physical_value
+        if receipt.production_intent:
+            manifest_raw = str(os.environ.get("ARNOLD_RUNTIME_MANIFEST") or "").strip()
+            if not manifest_raw:
+                raise LaunchDispatchRejected("runtime manifest binding is missing")
+            try:
+                from arnold_pipelines.megaplan.cloud.runtime_manifest import (
+                    manifest_bytes_sha256,
+                )
+
+                observed_manifest = manifest_bytes_sha256(Path(manifest_raw))
+            except Exception as exc:
+                raise LaunchDispatchRejected(
+                    "runtime manifest binding is unreadable"
+                ) from exc
+            if observed_manifest != receipt.manifest_identity:
+                raise LaunchDispatchRejected(
+                    "runtime manifest identity changed before dispatch"
+                )
+            marker_raw = str(
+                os.environ.get("ARNOLD_BABYSITTER_MARKER_PATH") or ""
+            ).strip()
+            if marker_raw:
+                try:
+                    marker = json.loads(
+                        Path(marker_raw).read_text(encoding="utf-8")
+                    )
+                except (OSError, ValueError) as exc:
+                    raise LaunchDispatchRejected(
+                        "runtime marker binding is unreadable"
+                    ) from exc
+                marker_manifest = (
+                    str(marker.get("bootstrap_manifest_path") or "").strip()
+                    if isinstance(marker, Mapping)
+                    else ""
+                )
+                if (
+                    not isinstance(marker, Mapping)
+                    or not marker_manifest
+                    or Path(marker_manifest).resolve() != Path(manifest_raw).resolve()
+                    or any(
+                        marker.get(name) != observed_manifest
+                        for name in ("manifest_sha256", "manifest_identity")
+                    )
+                ):
+                    raise LaunchDispatchRejected(
+                        "runtime marker manifest identity changed before dispatch"
+                    )
         prior_canonical = os.environ.get("ARNOLD_CANONICAL_LAUNCH_ACTIVE")
         os.environ["ARNOLD_CANONICAL_LAUNCH_ACTIVE"] = "1"
         try:

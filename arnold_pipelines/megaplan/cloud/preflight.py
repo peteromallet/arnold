@@ -186,6 +186,10 @@ def resolve_cloud_chain_runtime_dependencies(
     runtime_commands: set[str] = set()
     env_hints: set[str] = set()
     provider_requirements: list[dict[str, Any]] = []
+    # A closed Muse route is a property of the fully expanded model closure,
+    # not of a profile spelling.  Keep this independent of the canonical
+    # profile-name binding so explicit project aliases can still be proved.
+    all_milestones_resolve_to_continuation_muse = bool(chain_spec.milestones)
     continuation_profile_used = any(
         milestone.profile == CONTINUATION_RUNTIME_PROFILE
         for milestone in chain_spec.milestones
@@ -222,6 +226,11 @@ def resolve_cloud_chain_runtime_dependencies(
             fallback_routing,
         )
         resolved = _resolved_phase_map(resolved_phase_chains)
+        if not resolved_phase_chains or any(
+            tuple(chain.specs) != (CONTINUATION_RUNTIME_MODEL_SPEC,)
+            for chain in resolved_phase_chains.values()
+        ):
+            all_milestones_resolve_to_continuation_muse = False
         if milestone.profile == CONTINUATION_RUNTIME_PROFILE:
             for phase, chain in resolved_phase_chains.items():
                 if tuple(chain.specs) != (CONTINUATION_RUNTIME_MODEL_SPEC,):
@@ -300,16 +309,17 @@ def resolve_cloud_chain_runtime_dependencies(
         "provider_requirements": provider_requirements,
         "policy": policy,
     }
-    if continuation_model is not None:
+    if continuation_model is not None or all_milestones_resolve_to_continuation_muse:
+        runtime_binding_model = continuation_model or CONTINUATION_RUNTIME_MODEL_SPEC
         result["runtime_model_binding"] = {
             "profile": CONTINUATION_RUNTIME_PROFILE,
-            "spec": continuation_model,
+            "spec": runtime_binding_model,
             "backend": "omp",
             "provider": "openrouter",
             "model": "meta/muse-spark-1.3-contributor",
             "effort": "high",
             "roles": {
-                role: {"spec": continuation_model, "effort": "high"}
+                role: {"spec": runtime_binding_model, "effort": "high"}
                 for role in (
                     "phase",
                     "tiebreaker_researcher",

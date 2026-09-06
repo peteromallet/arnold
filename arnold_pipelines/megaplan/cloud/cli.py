@@ -54,6 +54,10 @@ from arnold_pipelines.megaplan.cloud.babysitter.routing import (
     CONTINUATION_MUSE_MODEL,
     CONTINUATION_MUSE_PROFILE,
 )
+from arnold_pipelines.megaplan.profiles import (
+    CONTINUATION_RUNTIME_MODEL_SPEC,
+    CONTINUATION_RUNTIME_PROFILE,
+)
 from arnold_pipelines.megaplan.fallback_chains import decode_phase_model_value, encode_phase_model_value
 from arnold_pipelines.megaplan.finite_canary_policy import (
     finite_canary_policy_is_exact,
@@ -110,6 +114,81 @@ _TEMPLATE_PLACEHOLDER_RE = re.compile(
     r"\bTODO(?:_[A-Z0-9]+)+\b|<box-ip>|TODO_SSH_HOST|TODO_REPO_URL"
 )
 _RAW_GIT_SHA_RE = re.compile(r"^[0-9a-fA-F]{7,40}$")
+
+# The successor profile is the canonical continuation identity.  The older
+# babysitter profile remains accepted only as an explicit, exact legacy route;
+# it must not become an alias for arbitrary ``all-muse-*`` profile names.
+_CONTINUATION_CLOSED_ROLES = frozenset(
+    {
+        "phase",
+        "tiebreaker_researcher",
+        "tiebreaker_challenger",
+        "oracle",
+        "researcher",
+        "fixer",
+        "babysitter",
+    }
+)
+
+
+def _continuation_role_route_failures(
+    binding: Any,
+    *,
+    expected_model: str,
+) -> list[dict[str, Any]]:
+    """Return failures in the canonical product-role model closure.
+
+    ``runtime_model_binding`` is emitted by cloud preflight and is the only
+    evidence that covers roles which are not represented by phase-model
+    entries (notably fixer, oracle, researcher, and babysitter).  Treat a
+    missing or malformed closure as a failure rather than silently treating
+    phase-only evidence as sufficient.
+    """
+    failures: list[dict[str, Any]] = []
+    if not isinstance(binding, Mapping):
+        return [{"role": "runtime_model_binding", "resolved": binding}]
+    expected_binding = {
+        "spec": expected_model,
+        "backend": "omp",
+        "provider": "openrouter",
+        "model": "meta/muse-spark-1.3-contributor",
+        "effort": "high",
+    }
+    for key, expected in expected_binding.items():
+        if binding.get(key) != expected:
+            failures.append(
+                {
+                    "role": f"runtime_model_binding.{key}",
+                    "resolved": binding.get(key),
+                    "expected": expected,
+                }
+            )
+    roles = binding.get("roles")
+    if not isinstance(roles, Mapping) or set(roles) != set(_CONTINUATION_CLOSED_ROLES):
+        failures.append(
+            {
+                "role": "runtime_model_binding.roles",
+                "resolved": sorted(roles) if isinstance(roles, Mapping) else roles,
+                "expected": sorted(_CONTINUATION_CLOSED_ROLES),
+            }
+        )
+        return failures
+    for role in sorted(_CONTINUATION_CLOSED_ROLES):
+        value = roles[role]
+        if not isinstance(value, Mapping):
+            failures.append({"role": role, "resolved": value})
+            continue
+        if value.get("spec") != expected_model or value.get("effort") != "high":
+            failures.append(
+                {
+                    "role": role,
+                    "resolved": dict(value),
+                    "expected": {"spec": expected_model, "effort": "high"},
+                }
+            )
+    return failures
+
+
 def _validate_continuation_muse_routes(
     preflight_summary: Mapping[str, Any], *, session: str = ""
 ) -> dict[str, Any] | None:
@@ -124,31 +203,87 @@ def _validate_continuation_muse_routes(
         if isinstance(item, Mapping)
     ]
     profiles = {str(item.get("profile") or "").strip() for item in milestones}
-    if CONTINUATION_MUSE_PROFILE not in profiles:
+    legacy_route = profiles == {CONTINUATION_MUSE_PROFILE}
+    canonical_model = CONTINUATION_RUNTIME_MODEL_SPEC
+    legacy_model = CONTINUATION_MUSE_MODEL
+    phase_failures: list[dict[str, Any]] = []
+    canonical_phase_seen = False
+    legacy_phase_seen = False
+    for milestone in milestones:
+        label = milestone.get("label", "")
+        phase_chains = milestone.get("resolved_phase_chains", {})
+        if not isinstance(phase_chains, Mapping) or not phase_chains:
+            phase_failures.append(
+                {"label": label, "phase": "<missing>", "resolved": phase_chains}
+            )
+            continue
+        for phase, chain in phase_chains.items():
+            if chain == [canonical_model]:
+                canonical_phase_seen = True
+            elif chain == [legacy_model]:
+                legacy_phase_seen = True
+            else:
+                phase_failures.append({"label": label, "phase": phase, "resolved": chain})
+
+    role_binding_present = "runtime_model_binding" in preflight_summary
+    canonical_signal = (
+        role_binding_present
+        or canonical_phase_seen
+        or CONTINUATION_RUNTIME_PROFILE in profiles
+    )
+    if not canonical_signal and not legacy_route:
         return None
-    if profiles != {CONTINUATION_MUSE_PROFILE}:
+
+    if legacy_route and not canonical_signal:
+        # Backward compatibility for the still-authoritative legacy chain.
+        # This branch is deliberately exact and has no profile-prefix or
+        # model alias matching.
+        if phase_failures or canonical_phase_seen or not legacy_phase_seen:
+            raise CliError(
+                "closed_profile_route_mismatch",
+                "closed Muse profile requires Muse Spark 1.3 Contributor/high with no fallback",
+                extra={"route_failures": phase_failures},
+            )
+        return {
+            "status": "ok",
+            "model": legacy_model,
+            "profile": CONTINUATION_MUSE_PROFILE,
+            "thinking": "high",
+            "fallback": False,
+        }
+
+    # Canonical eligibility is based on the fully resolved role closure, not
+    # on a profile allowlist.  A single alias is fine; mixed or missing
+    # profile identity is not, because it makes the authoritative route
+    # ambiguous at launch time.
+    if len(profiles) != 1 or not profiles or "" in profiles:
         raise CliError(
             "closed_profile_route_mismatch",
             "closed Muse profile must cover every chain milestone",
             extra={"profiles": sorted(profiles), "session": session},
         )
-    bad: list[dict[str, Any]] = []
-    for milestone in milestones:
-        label = milestone.get("label", "")
-        phase_chains = milestone.get("resolved_phase_chains", {})
-        for phase, chain in phase_chains.items():
-            if chain != [CONTINUATION_MUSE_MODEL]:
-                bad.append({"label": label, "phase": phase, "resolved": chain})
+    role_failures = _continuation_role_route_failures(
+        preflight_summary.get("runtime_model_binding"),
+        expected_model=canonical_model,
+    )
+    bad = phase_failures + role_failures
+    if legacy_phase_seen:
+        bad.append(
+            {
+                "phase": "<mixed-route>",
+                "resolved": "legacy and canonical Muse routes",
+            }
+        )
     if bad:
         raise CliError(
             "closed_profile_route_mismatch",
             "closed Muse profile requires Muse Spark 1.3 Contributor/high with no fallback",
-            extra={"route_failures": bad},
+            extra={"route_failures": bad, "profiles": sorted(profiles), "session": session},
         )
     return {
         "status": "ok",
-        "model": CONTINUATION_MUSE_MODEL,
-        "profile": CONTINUATION_MUSE_PROFILE,
+        "model": canonical_model,
+        "profile": next(iter(profiles)),
         "thinking": "high",
         "fallback": False,
     }
@@ -2269,7 +2404,16 @@ def _chain_project_root(local_spec_path: Path, fallback_root: Path) -> Path:
     project-relative, so validation and upload source resolution must use the
     spec's repository root, not the caller's current working directory.
     """
-    return _git_repo_root(local_spec_path) or fallback_root.expanduser().resolve()
+    fallback = fallback_root.expanduser().resolve()
+    # The caller may be operating on a durable project nested inside another
+    # checkout (for example, a test fixture under the Arnold worktree).  If the
+    # supplied root already gives the spec its canonical initiative layout,
+    # prefer that explicit project boundary over the enclosing checkout's Git
+    # root.  Loose or noncanonical specs still use Git discovery and therefore
+    # remain fail-closed at the location validator.
+    if is_canonical_chain_spec(local_spec_path, fallback):
+        return fallback
+    return _git_repo_root(local_spec_path) or fallback
 
 
 def _validate_chain_spec_location(
@@ -3678,7 +3822,10 @@ def _start_identity(pid):
 workspace = pathlib.Path(current.get("workspace", "")).expanduser()
 manifest_path = pathlib.Path(current.get("bootstrap_manifest_path", ""))
 if manifest_path.is_file():
-    current["manifest_sha256"] = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
+    from arnold_pipelines.megaplan.cloud.runtime_manifest import manifest_bytes_sha256
+    manifest_identity = manifest_bytes_sha256(manifest_path)
+    current["manifest_sha256"] = manifest_identity
+    current["manifest_identity"] = manifest_identity
     try:
         from arnold_pipelines.megaplan.cloud.runtime_manifest import bootstrap_manifest
         manifest = bootstrap_manifest(manifest_path)
@@ -3687,6 +3834,9 @@ if manifest_path.is_file():
         current.setdefault("expected_head", manifest.epic["expected_head"])
     except Exception:
         pass
+else:
+    current.pop("manifest_sha256", None)
+    current.pop("manifest_identity", None)
 progress_path = pathlib.Path(current.get("progress_artifact", ""))
 if progress_path.is_file():
     current["progress_content_digest"] = hashlib.sha256(progress_path.read_bytes()).hexdigest()

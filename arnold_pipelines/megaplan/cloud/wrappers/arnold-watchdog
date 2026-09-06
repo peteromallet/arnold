@@ -2392,6 +2392,35 @@ def _closed_fixer_marker_identity() -> tuple[str, str] | None:
     return chain_profile, closed_profile
 
 
+def _marker_manifest_binding() -> tuple[str, str] | None:
+    """Return the target marker's byte-verified manifest binding, if present."""
+    marker_path = marker_dir / f"{session}.json"
+    marker = _load_json(marker_path)
+    values = {
+        key: str(marker.get(key) or "").strip()
+        for key in ("bootstrap_manifest_path", "manifest_sha256", "manifest_identity")
+    }
+    # Older observational markers may retain only the manifest path.  They
+    # remain spawnable for compatibility, but the child receives the marker
+    # path and its admission gate fails closed until the digest pair exists.
+    if not values["manifest_sha256"] and not values["manifest_identity"]:
+        return None
+    if not all(values.values()):
+        raise RuntimeError("session marker manifest identity is incomplete")
+    manifest_path = Path(values["bootstrap_manifest_path"])
+    try:
+        from arnold_pipelines.megaplan.cloud.runtime_manifest import (
+            manifest_bytes_sha256,
+        )
+
+        observed = manifest_bytes_sha256(manifest_path)
+    except Exception as exc:
+        raise RuntimeError("session marker manifest is unreadable") from exc
+    if observed != values["manifest_sha256"] or observed != values["manifest_identity"]:
+        raise RuntimeError("session marker manifest identity mismatch")
+    return str(manifest_path), observed
+
+
 plan_name = str(plan_name or "").strip()
 state_path = None
 if plan_name:
@@ -2456,6 +2485,7 @@ planner_repair = meta.get("planner_repair")
 
 try:
     closed_marker_identity = _closed_fixer_marker_identity()
+    marker_manifest_binding = _marker_manifest_binding()
     if closed_marker_identity is not None:
         # Make the authoritative marker projection visible to the renderer and
         # child process.  The launch module independently validates the same
@@ -2535,6 +2565,12 @@ try:
     # session's own runtime_root is the engine; a leftover
     # ARNOLD_RUNTIME_MANIFEST would re-select the supervisor's epic.
     child_env.pop("ARNOLD_RUNTIME_MANIFEST", None)
+    child_env["ARNOLD_BABYSITTER_MARKER_PATH"] = str(
+        marker_dir / f"{session}.json"
+    )
+    if marker_manifest_binding is not None:
+        child_env["ARNOLD_RUNTIME_MANIFEST"] = marker_manifest_binding[0]
+        child_env["ARNOLD_BABYSITTER_MANIFEST_IDENTITY"] = marker_manifest_binding[1]
     child_env["ARNOLD_BABYSITTER_WORKSPACE"] = str(workspace)
     child_env["ARNOLD_BABYSITTER_PLAN"] = resolved_plan_name
     child_env["ARNOLD_BABYSITTER_RUN_KIND"] = run_kind
@@ -2614,6 +2650,8 @@ try:
             "suppression_reason": "automatic babysitter admission authority",
             "dispatch_outcome": inner_dispatch,
         }
+        if marker_manifest_binding is not None:
+            suppressed_receipt["manifest_identity"] = marker_manifest_binding[1]
         _atomic_write(
             repair_data_dir / f"{session}.babysitter-receipt.json",
             _json.dumps(suppressed_receipt, indent=2, sort_keys=True) + "\n",
@@ -2636,6 +2674,8 @@ try:
         ),
         "status": "launched",
     }
+    if marker_manifest_binding is not None:
+        receipt["manifest_identity"] = marker_manifest_binding[1]
     _atomic_write(
         repair_data_dir / f"{session}.babysitter-receipt.json",
         _json.dumps(receipt, indent=2, sort_keys=True) + "\n",

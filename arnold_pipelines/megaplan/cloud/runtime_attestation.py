@@ -53,6 +53,7 @@ STANDALONE_ATTESTATION_RECEIPT_SCHEMA = (
 )
 STANDALONE_RUNTIME_LAUNCH_RELATIVE = Path(".megaplan/resident/runtime-launch")
 RUNTIME_ATTESTATION_ERROR = "runtime_launch_attestation_mismatch"
+_FULL_SHA256 = re.compile(r"^[0-9a-f]{64}$")
 # Canonical box-side paths for the per-epic launch-seed build (G14): the
 # supervisor prepare receipt, the box hot-env file, and the launch-seed store
 # (mirrors ARNOLD_RUNTIME_MANIFEST_DIR, which defaults to /workspace/.megaplan).
@@ -676,6 +677,7 @@ def _marker_launch_binding(marker: Mapping[str, Any]) -> dict[str, Any]:
         ),
         "editable_source_branch": str(marker.get("editable_source_branch") or ""),
         "editable_source_head": str(marker.get("editable_source_head") or ""),
+        "manifest_identity": str(marker.get("manifest_identity") or ""),
         "runtime_identity": dict(identity),
     }
 
@@ -757,6 +759,23 @@ def build_runtime_launch_seed(
         *pth_errors,
         *wrapper_errors,
     ]
+    # The caller-provided compatibility argument is intentionally ignored:
+    # launch custody is always the SHA-256 of the exact manifest bytes at the
+    # pinned path.  A cloud seed without that path-derived identity is never
+    # release-ready and is rejected again by validation.
+    del manifest_sha256
+    manifest_identity = ""
+    if manifest_path is None:
+        errors.append("manifest_identity_missing")
+    else:
+        try:
+            from arnold_pipelines.megaplan.cloud.runtime_manifest import (
+                manifest_bytes_sha256,
+            )
+
+            manifest_identity = manifest_bytes_sha256(manifest_path)
+        except Exception:
+            errors.append(f"manifest_identity_unreadable:{manifest_path}")
     for path in document_paths:
         if not _file_identity(path).get("exists"):
             errors.append(f"seed_document_missing:{path}")
@@ -887,7 +906,10 @@ def build_runtime_launch_seed(
         # binding; dispatch never mutates them and validation never reads a
         # NEWER manifest to reinterpret them.
         "manifest_generation": manifest_generation,
-        "manifest_sha256": manifest_sha256 or "",
+        "manifest_identity": manifest_identity,
+        # Compatibility field: it is deliberately identical to the one
+        # canonical identity, never an independently supplied digest.
+        "manifest_sha256": manifest_identity,
         "dependency_generation": (
             dict(dependency_generation) if dependency_generation else {}
         ),
@@ -1115,7 +1137,28 @@ def _rebind_marker_if_stale(
             live_identity,
             expected_interpreter_path=expected_interpreter_path,
         )
-    if same_runtime and not command_manifest_stale and not command_interpreter_stale:
+    manifest_identity_stale = False
+    if expected_manifest_path and Path(expected_manifest_path).is_file():
+        try:
+            from arnold_pipelines.megaplan.cloud.runtime_manifest import (
+                manifest_bytes_sha256,
+            )
+
+            expected_manifest_identity = manifest_bytes_sha256(
+                Path(expected_manifest_path)
+            )
+            manifest_identity_stale = any(
+                str(marker.get(key) or "") != expected_manifest_identity
+                for key in ("manifest_identity", "manifest_sha256")
+            )
+        except Exception:
+            manifest_identity_stale = True
+    if (
+        same_runtime
+        and not command_manifest_stale
+        and not command_interpreter_stale
+        and not manifest_identity_stale
+    ):
         return
     if not relaunch_command:
         raise CliError(
@@ -1147,6 +1190,7 @@ def _rebind_marker_if_stale(
         direction="cutover",
         source_branch=source_branch,
         expected_interpreter_path=expected_interpreter_path,
+        manifest_path=Path(expected_manifest_path) if expected_manifest_path else None,
     )
 
 
@@ -1219,6 +1263,20 @@ def _launch_seed_current(
     if (
         Path(seed_manifest).expanduser().resolve(strict=False)
         != manifest_path.expanduser().resolve(strict=False)
+    ):
+        return False
+    try:
+        from arnold_pipelines.megaplan.cloud.runtime_manifest import (
+            manifest_bytes_sha256,
+        )
+
+        observed_manifest = manifest_bytes_sha256(manifest_path)
+    except Exception:
+        return False
+    if (
+        not _FULL_SHA256.fullmatch(str(seed.get("manifest_identity") or ""))
+        or seed.get("manifest_identity") != observed_manifest
+        or seed.get("manifest_sha256") != observed_manifest
     ):
         return False
     expected_marker = seed.get("marker")
@@ -1470,7 +1528,7 @@ def validate_standalone_runtime_launch_seed(
         raise CliError(RUNTIME_ATTESTATION_ERROR, "runtime launch seed authority is not standalone-resident")
     if component != "resident":
         raise CliError(RUNTIME_ATTESTATION_ERROR, "standalone runtime launch seed is resident-only")
-    for field in ("manifest_sha256", "marker", "supervisor_receipt", "supervisor_runtime", "hot_env", "chain_runtime_binding"):
+    for field in ("manifest_identity", "manifest_sha256", "marker", "supervisor_receipt", "supervisor_runtime", "hot_env", "chain_runtime_binding"):
         if seed.get(field):
             raise CliError(RUNTIME_ATTESTATION_ERROR, f"standalone seed contains cloud field: {field}")
     for field in ("expected_root", "expected_revision", "live_revision"):
@@ -1993,7 +2051,15 @@ def ensure_runtime_launch_seed(
         strict=False
     )
     generation = int(manifest.generation)
-    manifest_sha256 = _canonical_sha256(manifest.to_dict())
+    from arnold_pipelines.megaplan.cloud.runtime_manifest import manifest_bytes_sha256
+
+    try:
+        manifest_identity = manifest_bytes_sha256(manifest_path)
+    except ManifestError as exc:
+        raise CliError(
+            RUNTIME_ATTESTATION_ERROR,
+            f"runtime manifest {manifest_path} is unreadable: {exc}",
+        ) from exc
     dep_generation = manifest.epic.get("dependency_generation")
     dep_generation = (
         dict(dep_generation) if isinstance(dep_generation, Mapping) else None
@@ -2022,7 +2088,9 @@ def ensure_runtime_launch_seed(
         manifest_path=manifest_path,
         chain_runtime_identity=bound_identity,
         manifest_generation=generation,
-        manifest_sha256=manifest_sha256,
+        # Compatibility argument is ignored by the builder; both serialized
+        # fields are derived from these exact manifest bytes there.
+        manifest_sha256=manifest_identity,
         dependency_generation=dep_generation,
     )
     if not bool(payload.get("ready")):
@@ -2359,6 +2427,38 @@ def validate_runtime_launch_seed(
         return validate_standalone_runtime_launch_seed(seed, component=component)
     if authority != RUNTIME_LAUNCH_CLOUD_AUTHORITY:
         raise CliError(RUNTIME_ATTESTATION_ERROR, "runtime launch seed authority is invalid")
+    # Check the manifest binding before any other cloud evidence so a
+    # manifest-less or byte-drifted seed cannot fall through to another
+    # provenance/environment authority.
+    early_paths = seed.get("input_paths")
+    early_paths = early_paths if isinstance(early_paths, Mapping) else {}
+    early_manifest_raw = str(early_paths.get("manifest") or "").strip()
+    if not early_manifest_raw:
+        raise CliError(
+            RUNTIME_ATTESTATION_ERROR,
+            "runtime launch seed manifest identity is missing",
+        )
+    early_manifest_path = Path(early_manifest_raw).expanduser().resolve(strict=False)
+    try:
+        from arnold_pipelines.megaplan.cloud.runtime_manifest import (
+            manifest_bytes_sha256,
+        )
+
+        early_observed_manifest = manifest_bytes_sha256(early_manifest_path)
+    except Exception as exc:
+        raise CliError(
+            RUNTIME_ATTESTATION_ERROR,
+            "runtime launch seed manifest is unreadable",
+        ) from exc
+    if (
+        not _FULL_SHA256.fullmatch(str(seed.get("manifest_identity") or ""))
+        or seed.get("manifest_identity") != early_observed_manifest
+        or seed.get("manifest_sha256") != early_observed_manifest
+    ):
+        raise CliError(
+            RUNTIME_ATTESTATION_ERROR,
+            "runtime launch seed manifest identity drifted",
+        )
     if not bool(seed.get("ready")) or seed.get("errors"):
         raise CliError(
             RUNTIME_ATTESTATION_ERROR,

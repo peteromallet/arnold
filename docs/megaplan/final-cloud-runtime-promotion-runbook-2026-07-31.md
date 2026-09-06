@@ -54,6 +54,7 @@ export RELEASE_EVIDENCE_SHA256="${RELEASE_EVIDENCE_DOCUMENT}.sha256"
 export RUNTIME_IDENTITY="${RECEIPT_CONTAINER}/private/candidate-runtime-identity.json"
 export RUNTIME_PROVENANCE_RECEIPT="${RECEIPT_CONTAINER}/private/candidate-runtime-provenance.json"
 export AUTHORITATIVE_MARKER="${AUTHORITATIVE_MARKER:?current marker path in container}"
+export AUTHORITATIVE_MANIFEST="${AUTHORITATIVE_MANIFEST:?authoritative pinned runtime manifest path in container}"
 export AUTHORITATIVE_CHAIN_SPEC="${AUTHORITATIVE_CHAIN_SPEC:?current chain spec path in container}"
 export AUTHORITATIVE_CHAIN_STATE="${AUTHORITATIVE_CHAIN_STATE:?current chain state path in container}"
 export CHAIN_PREVIOUS_RUNTIME_SHA256="${CHAIN_PREVIOUS_RUNTIME_SHA256:?current chain runtime digest}"
@@ -439,6 +440,7 @@ python -m arnold_pipelines.megaplan cloud exec \
    PYTHONSAFEPATH=1 PYTHONPATH='${RUNTIME_SRC}' '${RUNTIME_PYTHON}' -P -m \
      arnold_pipelines.megaplan.cloud.runtime_cutover \
      --marker '${AUTHORITATIVE_MARKER}' \
+     --manifest '${AUTHORITATIVE_MANIFEST}' \
      --expect-marker-sha256 \"\$marker_sha\" \
      --from-runtime-sha256 '${MARKER_PREVIOUS_RUNTIME_SHA256}' \
      --runtime-identity '${RUNTIME_IDENTITY}' \

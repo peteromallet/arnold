@@ -27,6 +27,8 @@ from arnold_pipelines.megaplan.types import CliError
 
 
 def _write_marker(path: Path) -> dict:
+    manifest_path = path.with_name("runtime-manifest.json")
+    manifest_path.write_bytes(b'{"schema":"1","generation":1}\n')
     marker = {
         "session": "custody",
         "workspace": "/workspace/project",
@@ -40,6 +42,7 @@ def _write_marker(path: Path) -> dict:
         "engine_ref_check": {"status": "stale"},
         "launch_command": "old launch",
         "relaunch_command": "old relaunch",
+        "bootstrap_manifest_path": str(manifest_path),
     }
     path.write_text(json.dumps(marker, sort_keys=True) + "\n", encoding="utf-8")
     return marker
@@ -242,6 +245,77 @@ def test_marker_runtime_update_is_cas_guarded_and_clears_obsolete_fields(
         )
 
 
+def test_marker_runtime_cutover_atomically_rebinds_manifest_identity(
+    tmp_path: Path,
+) -> None:
+    marker_path = tmp_path / "custody.json"
+    marker = _write_marker(marker_path)
+    previous = marker_runtime_identity(marker)
+    assert previous is not None
+    manifest_path = tmp_path / "runtime-manifest.json"
+    manifest_path.write_bytes(b'{"schema":"1","generation":1}\n')
+
+    update_marker_runtime(
+        marker_path,
+        expected_marker_sha256=_sha(marker_path),
+        expected_previous_runtime_sha256=previous["content_sha256"],
+        active_runtime_identity=_runtime_b(),
+        relaunch_command=_runtime_b_relaunch(),
+        reason="manifest-bound runtime cutover",
+        manifest_path=manifest_path,
+    )
+    updated = json.loads(marker_path.read_text())
+    expected = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
+    assert updated["manifest_identity"] == expected
+    assert updated["manifest_sha256"] == expected
+
+
+def test_runtime_cutover_cli_binds_manifest_and_refuses_bad_authority_without_mutation(
+    tmp_path: Path,
+) -> None:
+    marker_path = tmp_path / "custody.json"
+    marker = _write_marker(marker_path)
+    previous = marker_runtime_identity(marker)
+    assert previous is not None
+    identity_path = tmp_path / "runtime-identity.json"
+    identity_path.write_text(json.dumps(_runtime_b()), encoding="utf-8")
+    command_path = tmp_path / "relaunch.txt"
+    command_path.write_text(_runtime_b_relaunch(), encoding="utf-8")
+    manifest_path = Path(str(marker["bootstrap_manifest_path"]))
+
+    argv = [
+        "--marker", str(marker_path),
+        "--manifest", str(manifest_path),
+        "--expect-marker-sha256", _sha(marker_path),
+        "--from-runtime-sha256", previous["content_sha256"],
+        "--runtime-identity", str(identity_path),
+        "--relaunch-command-file", str(command_path),
+        "--reason", "cli manifest-bound cutover",
+    ]
+    assert runtime_cutover.main(argv) == 0
+    updated = json.loads(marker_path.read_text())
+    expected = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
+    assert updated["manifest_identity"] == expected
+    assert updated["manifest_sha256"] == expected
+
+    for mutation in ("tamper", "missing", "mismatch"):
+        before = marker_path.read_bytes()
+        if mutation == "tamper":
+            manifest_path.write_bytes(b'{"schema":"1","generation":2}\n')
+            selected = manifest_path
+        elif mutation == "missing":
+            selected = tmp_path / "missing-runtime-manifest.json"
+        else:
+            selected = tmp_path / "other-runtime-manifest.json"
+            selected.write_bytes(b'{"schema":"1","generation":1}\n')
+        bad_argv = [*argv]
+        bad_argv[bad_argv.index("--manifest") + 1] = str(selected)
+        bad_argv[bad_argv.index("--expect-marker-sha256") + 1] = _sha(marker_path)
+        with pytest.raises(CliError):
+            runtime_cutover.main(bad_argv)
+        assert marker_path.read_bytes() == before
+
+
 def test_marker_runtime_update_failure_before_replace_leaves_original(
     tmp_path: Path,
     monkeypatch,
@@ -417,6 +491,8 @@ def test_chain_runtime_cutover_composes_with_marker_runtime_update(
     assert chain_new_identity["content_sha256"] == new_runtime["content_sha256"]
 
     marker_path = tmp_path / "custody.json"
+    manifest_path = tmp_path / "runtime-manifest.json"
+    manifest_path.write_bytes(b'{"schema":"1","generation":1}\n')
     marker_path.write_text(
         json.dumps(
             {
@@ -435,7 +511,8 @@ def test_chain_runtime_cutover_composes_with_marker_runtime_update(
                     "source": old_runtime["import_root"],
                     "runtime_sha256": old_runtime["content_sha256"],
                 },
-                "relaunch_command": "old relaunch",
+                    "relaunch_command": "old relaunch",
+                    "bootstrap_manifest_path": str(manifest_path),
             },
             sort_keys=True,
         )
@@ -449,6 +526,7 @@ def test_chain_runtime_cutover_composes_with_marker_runtime_update(
         active_runtime_identity=chain_new_identity,
         relaunch_command=_runtime_b_relaunch(),
         reason="marker follows chain cutover",
+        manifest_path=manifest_path,
     )
     assert (
         marker_result["runtime_binding"]["current_identity"]["content_sha256"]
@@ -604,6 +682,12 @@ def test_post_migration_update_marker_runtime_cas_succeeds_on_strong_form(
     assert previous["content_sha256"] == fixture["runtime"]["content_sha256"]
 
     new_runtime = _runtime_b()
+    manifest_path = tmp_path / "runtime-manifest.json"
+    manifest_path.write_bytes(b'{"schema":"1","generation":1}\n')
+    migrated["bootstrap_manifest_path"] = str(manifest_path)
+    fixture["marker_path"].write_text(
+        json.dumps(migrated, sort_keys=True) + "\n", encoding="utf-8"
+    )
     result = update_marker_runtime(
         fixture["marker_path"],
         expected_marker_sha256=_sha(fixture["marker_path"]),
@@ -611,6 +695,7 @@ def test_post_migration_update_marker_runtime_cas_succeeds_on_strong_form(
         active_runtime_identity=new_runtime,
         relaunch_command=_runtime_b_relaunch(),
         reason="post-migration marker cutover to the verified successor runtime",
+        manifest_path=manifest_path,
     )
     assert result["event"]["from_runtime_sha256"] == previous["content_sha256"]
     assert result["event"]["to_runtime_sha256"] == new_runtime["content_sha256"]
