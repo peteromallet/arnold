@@ -48,7 +48,7 @@ def _request(tmp_path: Path, *, session: str = "chain"):
     ), envelope
 
 
-def test_remote_engine_replay_never_redispatches(tmp_path, monkeypatch):
+def test_remote_engine_legacy_unaccepted_request_rejects_without_dispatch(tmp_path, monkeypatch):
     config, request, envelope = _request(tmp_path)
     calls: list[object] = []
     monkeypatch.setattr(chain_drive, "load_agentbox_config", lambda: config)
@@ -71,9 +71,11 @@ def test_remote_engine_replay_never_redispatches(tmp_path, monkeypatch):
     first = chain_drive.execute_authoritative_launch(request)
     second = chain_drive.execute_authoritative_launch(request)
 
-    assert first["result"] == "ACCEPTED"
-    assert second["reason"] == "replay"
-    assert len(calls) == 1
+    assert first["result"] == "REJECTED"
+    assert second["result"] == "REJECTED"
+    assert first["reason"] == "runtime_manifest_binding_invalid"
+    assert second["reason"] == "runtime_manifest_binding_invalid"
+    assert calls == []
 
 
 def test_remote_engine_preflight_rejects_before_store_admission(tmp_path, monkeypatch):
@@ -85,7 +87,7 @@ def test_remote_engine_preflight_rejects_before_store_admission(tmp_path, monkey
     result = chain_drive.execute_authoritative_launch(request)
 
     assert result["result"] == "REJECTED"
-    assert result["reason"] == "preflight_rejected"
+    assert result["reason"] == "runtime_manifest_binding_invalid"
     assert not (config.ops_store_root / "operation_runs.json").exists()
 
 
@@ -102,6 +104,6 @@ def test_identity_query_loss_is_unknown_without_replacement(tmp_path, monkeypatc
 
     result = chain_drive.execute_authoritative_launch(request)
 
-    assert result["result"] == "UNKNOWN"
-    assert result["reason"] == "dispatch_uncertain"
-    assert len(calls) == 1
+    assert result["result"] == "REJECTED"
+    assert result["reason"] == "runtime_manifest_binding_invalid"
+    assert calls == []

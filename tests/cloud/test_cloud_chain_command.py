@@ -85,6 +85,7 @@ from arnold_pipelines.megaplan.cloud.spec import (
 from arnold_pipelines.megaplan.profiles import (
     CONTINUATION_RUNTIME_MODEL_SPEC,
     CONTINUATION_RUNTIME_PROFILE,
+    VALID_PHASE_KEYS,
 )
 from arnold_pipelines.megaplan.types import CliError
 
@@ -1033,6 +1034,35 @@ def test_atomic_marker_writer_can_be_followed_by_shell_operator(tmp_path: Path) 
     assert payload["manifest_sha256"] == expected_manifest_identity
     assert payload["manifest_identity"] == expected_manifest_identity
     assert payload["content_digest"]
+
+
+def test_atomic_marker_writer_rejects_foreign_identity(tmp_path: Path) -> None:
+    marker = tmp_path / "markers" / "demo.json"
+    marker.parent.mkdir(parents=True)
+    original = {
+        "session": "demo",
+        "run_kind": "chain",
+        "operation_id": "old-operation",
+        "request_id": "old-request",
+        "envelope_digest": "old-envelope",
+    }
+    marker.write_text(json.dumps(original), encoding="utf-8")
+    command = _atomic_marker_write_command(
+        str(marker),
+        {
+            **original,
+            "operation_id": "new-operation",
+            "request_id": "new-request",
+            "envelope_digest": "new-envelope",
+        },
+    )
+
+    result = subprocess.run(
+        ["bash", "-lc", command], capture_output=True, text=True, check=False
+    )
+
+    assert result.returncode != 0
+    assert json.loads(marker.read_text(encoding="utf-8")) == original
 
 
 def test_tmux_chain_launch_command_is_valid_shell() -> None:
@@ -3059,6 +3089,21 @@ class _LaunchEpicProvider:
     def ssh_exec(self, command: str) -> subprocess.CompletedProcess[str]:
         if "MEGAPLAN_RESET" in command:
             return subprocess.CompletedProcess([], 0, "", "")
+        if "MEGAPLAN_PRELAUNCH_MARKER_GUARD" in command:
+            return subprocess.CompletedProcess(
+                [],
+                0,
+                json.dumps(
+                    {
+                        "session_alive": False,
+                        "marker_present": False,
+                        "identity_matches": False,
+                        "marker_read_error": "",
+                    }
+                )
+                + "\n",
+                "",
+            )
         if "MEGAPLAN_WATCHDOG_TRACKING" in command:
             marker = re.search(r"marker_path = pathlib\.Path\('([^']+)'\)", command).group(1)
             workspace = re.search(r"workspace = pathlib\.Path\('([^']+)'\)", command).group(1)
@@ -3237,12 +3282,30 @@ def test_composed_cli_on_box_chain_drive_dispatches_once_with_seed_binding(
     subprocess.run(["git", "init"], cwd=app, check=True, capture_output=True, text=True)
     (brief_dir / "NORTHSTAR.md").write_text("North star\n", encoding="utf-8")
     (brief_dir / "m1.md").write_text("M1\n", encoding="utf-8")
+    (app / ".megaplan" / "profiles.toml").write_text(
+        "[profiles.{}]\n".format(CONTINUATION_RUNTIME_PROFILE)
+        + "".join(
+            f'{phase} = "{CONTINUATION_RUNTIME_MODEL_SPEC}"\n'
+            for phase in VALID_PHASE_KEYS
+        ),
+        encoding="utf-8",
+    )
     materialized = _materialize_canonical_epic_input(
         root=tmp_path, spec=_cloud_spec(), spec_or_dir=str(brief_dir)
+    )
+    canonical = yaml.safe_load(materialized.spec_path.read_text(encoding="utf-8"))
+    for milestone in canonical["milestones"]:
+        milestone["profile"] = CONTINUATION_RUNTIME_PROFILE
+    materialized.spec_path.write_text(
+        yaml.safe_dump(canonical, sort_keys=False), encoding="utf-8"
     )
 
     runtime_root = (tmp_path / "runtime-candidate").resolve()
     runtime_root.mkdir()
+    interpreter = tmp_path / "runtime-venv" / "bin" / "python"
+    interpreter.parent.mkdir(parents=True)
+    interpreter.write_text("#!/bin/sh\n", encoding="utf-8")
+    interpreter.chmod(0o755)
     manifest_path = (tmp_path / "runtime-manifest.json").resolve()
     runtime_revision = "a" * 40
     manifest_payload = {
@@ -3261,6 +3324,13 @@ def test_composed_cli_on_box_chain_drive_dispatches_once_with_seed_binding(
             "expected_head": runtime_revision,
             "repair_bin": "",
             "deps_lockfile": "",
+            "dependency_generation": {
+                "id": "b" * 64,
+                "frozen_spec_sha256": "b" * 64,
+                "interpreter_path": str(interpreter),
+                "venv_digest": "c" * 64,
+                "created": "2026-01-01T00:00:00+00:00",
+            },
         },
         "indirection": {
             "host_path": "", "container_path": "", "mount_table": [],
@@ -3300,6 +3370,7 @@ def test_composed_cli_on_box_chain_drive_dispatches_once_with_seed_binding(
                     "manifest_identity": manifest_sha,
                     "runtime_identity": runtime_identity,
                     "runtime_identity_raw": raw_identity,
+                    "dependency_generation": manifest_payload["epic"]["dependency_generation"],
                 }
             )
             return subprocess.CompletedProcess([], 0, json.dumps(payload) + "\n", "")
@@ -3367,9 +3438,27 @@ def test_composed_cli_on_box_chain_drive_dispatches_once_with_seed_binding(
     assert marker_binding["manifest_sha256"] == manifest_sha
     assert marker_binding["current_identity"] == runtime_identity
     assert marker_binding["raw_identity"] == raw_identity
+    assert marker_binding["seed_identity"] == manifest_sha
+    assert marker["progress_artifact"] == str(
+        Path(provider.launch_request["envelope"]["launch_spec"]["cwd"])
+        / ".megaplan"
+        / f"cloud-chain-{provider.launch_request['session']}.log"
+    )
+    marker_policy = marker_binding["model_policy"]
+    assert marker_policy["route"] == "omp:openrouter/meta/muse-spark-1.3-contributor:high"
+    assert marker_policy["fallback"] is False
+    assert set(marker_policy["roles"]) == {
+        "babysitter", "fixer", "controller", "researcher", "oracle", "superfixer"
+    }
+    assert set(marker_policy["roles"].values()) == {
+        "omp:openrouter/meta/muse-spark-1.3-contributor:high"
+    }
     envelope_binding = provider.launch_request["envelope"]["launch_spec"]["metadata"]["runtime_binding"]
     assert envelope_binding["manifest_path"] == str(manifest_path)
     assert envelope_binding["manifest_identity"] == manifest_sha
+    attestation = provider.launch_request["envelope"]["launch_spec"]["metadata"]["launch_attestation"]
+    assert attestation["seed_identity"] == manifest_sha
+    assert attestation["manifest_identity"] == manifest_sha
 
 
 def test_remote_chain_upload_path_anchors_relative_initiatives_to_workspace() -> None:

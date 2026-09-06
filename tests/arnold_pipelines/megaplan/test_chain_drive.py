@@ -25,6 +25,10 @@ def _request(tmp_path: Path):
     session = "chain"
     runtime_source = (tmp_path / "runtime").resolve()
     runtime_source.mkdir()
+    interpreter = tmp_path / "runtime-venv" / "bin" / "python"
+    interpreter.parent.mkdir(parents=True)
+    interpreter.write_text("#!/bin/sh\n", encoding="utf-8")
+    interpreter.chmod(0o755)
     manifest = tmp_path / "runtime-manifest.json"
     manifest.write_text(
         json.dumps(
@@ -44,6 +48,13 @@ def _request(tmp_path: Path):
                     "expected_head": "a" * 40,
                     "repair_bin": "",
                     "deps_lockfile": "",
+                    "dependency_generation": {
+                        "id": "b" * 64,
+                        "frozen_spec_sha256": "b" * 64,
+                        "interpreter_path": str(interpreter),
+                        "venv_digest": "c" * 64,
+                        "created": "2026-01-01T00:00:00+00:00",
+                    },
                 },
                 "indirection": {"host_path": "", "container_path": "", "mount_table": [], "execution_namespace": "", "verified_head": "", "last_verified_at": "", "attestation": {"module_file": "", "module_digest": "", "mount_id": ""}},
                 "policy": {"policy_sha": "", "model_policy_sha": "", "sync_policy": ""},
@@ -51,7 +62,7 @@ def _request(tmp_path: Path):
                 "timestamps": {"created": "", "updated": "", "closed": ""},
                 "gc_policy": "",
                 "commands": [],
-            }
+                }
         ),
         encoding="utf-8",
     )
@@ -100,15 +111,42 @@ def _request(tmp_path: Path):
             }
         },
     }
+    packet = {
+        "command": spec["command"],
+        "cwd": spec["cwd"],
+        "session": session,
+        "manifest_path": str(manifest),
+        "manifest_identity": manifest_hash,
+    }
+    spec["metadata"]["launch_attestation"] = {
+        "schema": "arnold.megaplan.launch_attestation.v1",
+        "runtime_vector": runtime_identity,
+        "manifest_identity": manifest_hash,
+        "seed_identity": manifest_hash,
+        "dependency_interpreter_identity": str(interpreter),
+        "dependency_generation": {
+            "id": "b" * 64,
+            "frozen_spec_sha256": "b" * 64,
+            "interpreter_path": str(interpreter),
+            "venv_digest": "c" * 64,
+            "created": "2026-01-01T00:00:00+00:00",
+        },
+        "provenance": {"status": "verified", "root": str(runtime_source), "revision": "a" * 40},
+        "execution_packet": {
+            **packet,
+            "sha256": hashlib.sha256(json.dumps(packet, sort_keys=True, separators=(",", ":")).encode()).hexdigest(),
+        },
+        "model_policy": {"status": "resolved", "route": "", "fallback": False, "roles": {}},
+    }
     observations = {
         "source": {"status": "current", "revision": "r", "ref": "r", "tree": "t"},
-        "authority": {"status": "current", "grant": "g", "fence": "f", "decision": "d"},
+        "authority": {"status": "current", "grant": "g", "fence": "f", "decision": "d", "evidence": {"verified": True}},
         "custody": {"status": "present", "custody_ref": "c", "wbc_ref": "w"},
         "credentials": {"status": "available", "identity": "i", "transport": "local"},
-        "runtime": {"status": "present", "interpreter": "python", "import_root": "/x", "source_revision": "r"},
+        "runtime": {"status": "present", "interpreter": str(interpreter), "import_root": str(runtime_source), "source_revision": "a" * 40},
         "command": {"status": "valid", "argv": "echo chain", "cwd": str(tmp_path), "env": {}},
         "namespace": {"status": "valid", "name": session},
-        "collision": {"status": "none", "namespace": session},
+        "collision": {"status": "none", "namespace": session, "evidence": {"verified": True, "exists": False, "session": session}},
         "capacity": {"status": "available", "disk": "d", "inode": "i", "output": "o", "temp": "t"},
         "network": {"status": "available", "transport": "local"},
     }

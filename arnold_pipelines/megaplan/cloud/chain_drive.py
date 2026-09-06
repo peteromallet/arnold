@@ -12,6 +12,7 @@ import argparse
 import base64
 import hashlib
 import json
+import os
 from pathlib import Path
 import shlex
 from typing import Any, Mapping, Sequence
@@ -141,6 +142,8 @@ def _validate_runtime_manifest_binding(envelope: LaunchEnvelope) -> dict[str, An
         raise ValueError(f"runtime manifest binding schema invalid: {exc}") from exc
     if manifest.compatibility_only:
         raise ValueError("runtime manifest binding points to compatibility-only content")
+    if manifest.state != "active":
+        raise ValueError("runtime manifest binding is not active")
     epic = manifest.epic
     if not all(field in epic for field in EPIC_REQUIRED):
         raise ValueError("runtime manifest binding missing epic schema")
@@ -157,8 +160,11 @@ def _validate_runtime_manifest_binding(envelope: LaunchEnvelope) -> dict[str, An
         or manifest.runtime_id != runtime_id
         or not isinstance(runtime_source, str)
         or not Path(runtime_source).is_absolute()
+        or not Path(runtime_source).is_dir()
         or runtime_source != str(Path(epic["runtime_root"]).expanduser().resolve(strict=False))
         or not isinstance(runtime_revision, str)
+        or len(runtime_revision) != 40
+        or any(char not in "0123456789abcdef" for char in runtime_revision)
         or runtime_revision != epic["expected_head"]
     ):
         raise ValueError("runtime manifest binding runtime identity mismatch")
@@ -187,7 +193,114 @@ def _validate_runtime_manifest_binding(envelope: LaunchEnvelope) -> dict[str, An
         "runtime_revision": runtime_revision,
         "runtime_identity": dict(canonical),
         "runtime_identity_raw": expected_raw,
+        "dependency_generation": dict(epic.get("dependency_generation") or {}),
     }
+
+
+def _validate_launch_attestation(
+    envelope: LaunchEnvelope, binding: Mapping[str, Any]
+) -> dict[str, Any]:
+    """Validate the existing runtime/packet/model evidence before admission."""
+    metadata = envelope.launch_spec.get("metadata")
+    attestation = metadata.get("launch_attestation") if isinstance(metadata, Mapping) else None
+    if not isinstance(attestation, Mapping):
+        raise ValueError("launch attestation is missing")
+    if attestation.get("schema") != "arnold.megaplan.launch_attestation.v1":
+        raise ValueError("launch attestation schema mismatch")
+    if attestation.get("manifest_identity") != binding["manifest_identity"]:
+        raise ValueError("launch attestation manifest identity mismatch")
+    runtime_vector = attestation.get("runtime_vector")
+    if not isinstance(runtime_vector, Mapping) or _plain_json(runtime_vector) != _plain_json(binding["runtime_identity"]):
+        raise ValueError("launch attestation runtime vector mismatch")
+    provenance = attestation.get("provenance")
+    if not isinstance(provenance, Mapping) or provenance.get("status") != "verified":
+        raise ValueError("launch attestation provenance is not verified")
+    if (
+        str(provenance.get("root") or "") != binding["runtime_source"]
+        or str(provenance.get("revision") or "") != binding["runtime_revision"]
+    ):
+        raise ValueError("launch attestation provenance identity mismatch")
+    dependency = attestation.get("dependency_generation")
+    if not isinstance(dependency, Mapping) or not dependency:
+        raise ValueError("launch attestation dependency proof is missing")
+    manifest_dependency = binding.get("dependency_generation")
+    if isinstance(manifest_dependency, Mapping) and dict(dependency) != dict(manifest_dependency):
+        raise ValueError("launch attestation dependency proof mismatch")
+    interpreter = str(attestation.get("dependency_interpreter_identity") or "")
+    if not interpreter or str(dependency.get("interpreter_path") or "") != interpreter:
+        raise ValueError("launch attestation interpreter proof mismatch")
+    interpreter_path = Path(interpreter).expanduser().resolve(strict=False)
+    if not interpreter_path.is_absolute() or not interpreter_path.is_file() or not os.access(interpreter_path, os.X_OK):
+        raise ValueError("launch attestation interpreter is not executable")
+    seed_identity = str(attestation.get("seed_identity") or "")
+    if len(seed_identity) != 64 or any(char not in "0123456789abcdef" for char in seed_identity):
+        raise ValueError("launch attestation seed identity is invalid")
+    packet = attestation.get("execution_packet")
+    if not isinstance(packet, Mapping):
+        raise ValueError("launch attestation execution packet is missing")
+    expected_packet = {
+        "command": envelope.launch_spec.get("command"),
+        "cwd": envelope.launch_spec.get("cwd"),
+        "session": envelope.launch_spec.get("expected_session_name"),
+        "manifest_path": binding["manifest_path"],
+        "manifest_identity": binding["manifest_identity"],
+    }
+    if any(packet.get(key) != value for key, value in expected_packet.items()):
+        raise ValueError("launch attestation execution packet mismatch")
+    expected_packet_digest = hashlib.sha256(
+        json.dumps(expected_packet, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    if packet.get("sha256") != expected_packet_digest:
+        raise ValueError("launch attestation execution packet digest mismatch")
+    policy = attestation.get("model_policy")
+    if not isinstance(policy, Mapping) or policy.get("status") != "resolved":
+        raise ValueError("launch attestation model policy is missing")
+    route = str(policy.get("route") or "")
+    if route:
+        if route != "omp:openrouter/meta/muse-spark-1.3-contributor:high":
+            raise ValueError("launch attestation model policy route mismatch")
+        if policy.get("fallback") is not False:
+            raise ValueError("launch attestation model policy permits fallback")
+        roles = policy.get("roles")
+        required_roles = {
+            "babysitter", "fixer", "controller", "researcher", "oracle", "superfixer"
+        }
+        if not isinstance(roles, Mapping) or set(roles) != required_roles or any(
+            roles.get(role) != route for role in required_roles
+        ):
+            raise ValueError("launch attestation model policy role closure is incomplete")
+    return dict(attestation)
+
+
+def _validate_launch_observations(
+    observations: Mapping[str, Any],
+    envelope: LaunchEnvelope,
+    binding: Mapping[str, Any],
+    attestation: Mapping[str, Any],
+) -> None:
+    """Reject preflight rows that contradict the admitted runtime evidence."""
+    runtime = observations.get("runtime")
+    if not isinstance(runtime, Mapping):
+        raise ValueError("runtime observation is missing")
+    if (
+        str(runtime.get("import_root") or runtime.get("runtime_root") or "")
+        != binding["runtime_source"]
+        or str(runtime.get("source_revision") or runtime.get("revision") or "")
+        != binding["runtime_revision"]
+        or str(runtime.get("interpreter") or runtime.get("runtime_python") or "")
+        != str(attestation["dependency_interpreter_identity"])
+    ):
+        raise ValueError("runtime observation contradicts launch attestation")
+    collision = observations.get("collision")
+    evidence = collision.get("evidence") if isinstance(collision, Mapping) else None
+    if (
+        not isinstance(evidence, Mapping)
+        or evidence.get("verified") is not True
+        or evidence.get("exists") is not False
+        or str(evidence.get("session") or "")
+        != str(envelope.launch_spec.get("expected_session_name") or "")
+    ):
+        raise ValueError("collision observation is not verified for the envelope session")
 
 
 def _json_response(
@@ -248,6 +361,7 @@ def execute_authoritative_launch(request: Mapping[str, Any]) -> dict[str, Any]:
         )
     try:
         runtime_binding = _validate_runtime_manifest_binding(envelope)
+        launch_attestation = _validate_launch_attestation(envelope, runtime_binding)
     except ValueError as exc:
         # Pre-binding envelopes from an older engine may be replayed only when
         # durable custody already proves acceptance.  This is read-only and
@@ -274,6 +388,17 @@ def execute_authoritative_launch(request: Mapping[str, Any]) -> dict[str, Any]:
     observations = request["preflight_observations"]
     if not isinstance(observations, Mapping):
         raise ChainDriveError("preflight_observations must be an object")
+    try:
+        _validate_launch_observations(observations, envelope, runtime_binding, launch_attestation)
+    except ValueError as exc:
+        return _json_response(
+            result=LaunchResult.REJECTED,
+            reason="runtime_manifest_binding_invalid",
+            operation_id=envelope.operation_id,
+            request_id=envelope.request_id,
+            envelope_digest=envelope.digest,
+            detail=str(exc),
+        )
     preflight = run_launch_preflight(envelope.launch_spec, observations)
     if not preflight.accepted:
         return _json_response(

@@ -3805,10 +3805,36 @@ current = {{}}
 if path.exists():
     try:
         loaded = json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
-        loaded = {{}}
-    if isinstance(loaded, dict):
-        current.update(loaded)
+    except Exception as exc:
+        raise RuntimeError(f"managed launch marker is unreadable: {{path}}") from exc
+    if not isinstance(loaded, dict):
+        raise RuntimeError(f"managed launch marker is not an object: {{path}}")
+    current.update(loaded)
+# A marker is a projection of one admitted envelope, never a merge target for
+# an unrelated occupant.  The engine supplies this tuple through the managed
+# environment because embedding its digest in the command would make the
+# envelope digest self-referential.
+envelope_identity = {{
+    "operation_id": os.environ.get("ARNOLD_LAUNCH_OPERATION_ID", ""),
+    "request_id": os.environ.get("ARNOLD_LAUNCH_REQUEST_ID", ""),
+    "envelope_digest": os.environ.get("ARNOLD_LAUNCH_ENVELOPE_DIGEST", ""),
+}}
+for key, expected in envelope_identity.items():
+    if expected:
+        payload[key] = expected
+identity_keys = (
+    "session", "workspace", "remote_spec", "identity_digest", "run_kind",
+    "run_id", "bootstrap_manifest_path", "manifest_sha256", "manifest_identity",
+    "runtime_binding", "operation_id", "request_id", "envelope_digest",
+)
+if current:
+    for key in identity_keys:
+        if key in payload and key in current and current[key] != payload[key]:
+            raise RuntimeError(f"managed launch marker identity conflict: {{key}}")
+    if any(key in current for key in identity_keys) and any(
+        key not in current for key in identity_keys if key in payload
+    ):
+        raise RuntimeError("managed launch marker is a foreign/incomplete occupant")
 current.update(payload)
 import hashlib, socket
 
@@ -4577,6 +4603,7 @@ print(json.dumps({{
     "runtime_src": runtime_root,
     "runtime_source": runtime_root,
     "runtime_revision": runtime_revision,
+    "dependency_generation": dict(epic.get("dependency_generation") or {{}}),
     "manifest_path": str(path),
     "manifest_sha256": hashlib.sha256(raw).hexdigest(),
     "manifest_identity": hashlib.sha256(raw).hexdigest(),
@@ -4822,6 +4849,7 @@ def _parse_chain_runtime_binding(
         "runtime_id": runtime_id,
         "runtime_identity": dict(payload.get("runtime_identity") or {}),
         "runtime_identity_raw": dict(runtime_identity_raw),
+        "dependency_generation": dict(payload.get("dependency_generation") or {}),
         "manifest_path": manifest_path,
         "manifest_sha256": manifest_sha256,
         "manifest_identity": str(payload.get("manifest_identity") or manifest_sha256),
@@ -4945,7 +4973,7 @@ def _chain_runtime_marker_binding(binding: Mapping[str, Any]) -> dict[str, Any]:
             "chain_runtime_manifest_incomplete",
             "cloud chain runtime manifest declares no canonical runtime identity",
         )
-    return {
+    marker_binding = {
         "schema": "arnold.megaplan.marker_runtime_binding.v1",
         "manifest_path": str(binding["manifest_path"]),
         "manifest_sha256": str(binding.get("manifest_sha256") or ""),
@@ -4956,11 +4984,19 @@ def _chain_runtime_marker_binding(binding: Mapping[str, Any]) -> dict[str, Any]:
         "current_identity": dict(identity),
         "raw_identity": dict(binding.get("runtime_identity_raw") or {}),
     }
+    for key in ("dependency_generation", "seed_identity", "model_policy"):
+        value = binding.get(key)
+        if isinstance(value, Mapping):
+            marker_binding[key] = dict(value)
+        elif value is not None:
+            marker_binding[key] = value
+    marker_binding.setdefault("seed_identity", str(binding.get("manifest_identity") or binding.get("manifest_sha256") or ""))
+    return marker_binding
 
 
 def _envelope_runtime_binding(binding: Mapping[str, Any]) -> dict[str, Any]:
     """Return the one canonical immutable binding carried by the envelope."""
-    return {
+    result = {
         "manifest_path": str(binding["manifest_path"]),
         "manifest_sha256": str(binding.get("manifest_sha256") or ""),
         "manifest_identity": str(binding.get("manifest_identity") or binding.get("manifest_sha256") or ""),
@@ -4970,6 +5006,65 @@ def _envelope_runtime_binding(binding: Mapping[str, Any]) -> dict[str, Any]:
         "runtime_identity": dict(binding.get("runtime_identity") or {}),
         "runtime_identity_raw": dict(binding.get("runtime_identity_raw") or {}),
     }
+    for key in (
+        "dependency_generation", "runtime_attestation", "execution_packet",
+        "model_policy", "seed_identity", "dependency_interpreter_identity",
+        "runtime_vector", "provenance",
+    ):
+        if key in binding:
+            result[key] = dict(binding[key]) if isinstance(binding[key], Mapping) else binding[key]
+    return result
+
+
+def _launch_attestation(
+    binding: Mapping[str, Any],
+    *,
+    command: str,
+    cwd: str,
+    session: str,
+    model_policy: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Project existing runtime/packet/policy evidence into one envelope map."""
+    packet = {
+        "command": command,
+        "cwd": cwd,
+        "session": session,
+        "manifest_path": str(binding["manifest_path"]),
+        "manifest_identity": str(binding["manifest_identity"]),
+    }
+    packet_digest = hashlib.sha256(
+        json.dumps(packet, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    dependency = binding.get("dependency_generation")
+    dependency = dict(dependency) if isinstance(dependency, Mapping) else {}
+    provenance = binding.get("provenance")
+    provenance = dict(provenance) if isinstance(provenance, Mapping) else {
+        "status": "verified",
+        "root": str(binding.get("runtime_source") or binding.get("runtime_src") or ""),
+        "revision": str(binding.get("runtime_revision") or ""),
+    }
+    runtime_vector = binding.get("runtime_vector")
+    runtime_vector = dict(runtime_vector) if isinstance(runtime_vector, Mapping) else dict(binding.get("runtime_identity") or {})
+    # The launch seed is content-addressed by the same prepared manifest when
+    # the chain seed has not yet been materialized; later seed publication
+    # must retain this identity rather than selecting a new runtime.
+    seed_identity = str(binding.get("seed_identity") or binding["manifest_identity"])
+    interpreter = str(
+        binding.get("dependency_interpreter_identity")
+        or dependency.get("interpreter_path")
+        or ""
+    )
+    return {
+        "schema": "arnold.megaplan.launch_attestation.v1",
+        "runtime_vector": runtime_vector,
+        "manifest_identity": str(binding["manifest_identity"]),
+        "seed_identity": seed_identity,
+        "dependency_interpreter_identity": interpreter,
+        "dependency_generation": dependency,
+        "provenance": provenance,
+        "execution_packet": {**packet, "sha256": packet_digest},
+        "model_policy": dict(model_policy),
+    }
 
 
 def _chain_command_with_runtime_binding(
@@ -4977,6 +5072,8 @@ def _chain_command_with_runtime_binding(
     *,
     launch_ctx: ChainLaunchContext,
     binding: Mapping[str, Any],
+    operation_id: str | None = None,
+    request_id: str | None = None,
 ) -> str:
     """Project one validated runtime binding into the managed marker.
 
@@ -4990,16 +5087,35 @@ def _chain_command_with_runtime_binding(
         "remote_spec": launch_ctx.remote_spec_path,
         "identity_digest": launch_ctx.digest,
         "run_kind": "chain",
-        "run_id": str(uuid.uuid4()),
-        "started_at": datetime.now(timezone.utc).isoformat(),
+        # The launch identity is derived from the immutable envelope context;
+        # a replay must not mint a new UUID or timestamp.
+        "run_id": f"launch:{launch_ctx.digest}",
         "bootstrap_manifest_path": str(binding["manifest_path"]),
         "manifest_sha256": str(binding["manifest_sha256"]),
         "manifest_identity": str(binding["manifest_identity"]),
+        "progress_artifact": launch_ctx.log_path,
+        "progress_identity": f"chain:{launch_ctx.identity}",
+        "operation_id": str(operation_id or ""),
+        "request_id": str(request_id or ""),
+        # Filled from ARNOLD_LAUNCH_ENVELOPE_DIGEST by the managed writer.
+        "envelope_digest": "",
         "runtime_id": str(binding.get("runtime_id") or ""),
         "runtime_binding": _chain_runtime_marker_binding(binding),
     }
+    policy = binding.get("model_policy")
+    if isinstance(policy, Mapping) and str(policy.get("profile") or "").strip():
+        profile = str(policy["profile"]).strip()
+        marker_payload["babysitter_chain_profile"] = profile
+        marker_payload["babysitter_closed_profile"] = profile
+    policy_exports = ""
+    if marker_payload.get("babysitter_chain_profile"):
+        profile = shlex.quote(str(marker_payload["babysitter_chain_profile"]))
+        policy_exports = (
+            f"export ARNOLD_BABYSITTER_CHAIN_PROFILE={profile} "
+            f"ARNOLD_BABYSITTER_CLOSED_PROFILE={profile}; "
+        )
     return (
-        f"{_write_session_marker_command(launch_ctx.marker_path, marker_payload)} && "
+        f"{policy_exports}{_write_session_marker_command(launch_ctx.marker_path, marker_payload)} && "
         + command
     )
 
@@ -6212,6 +6328,31 @@ def _run_watchdog_tracking_verification(provider, ctx: ChainLaunchContext) -> di
     return payload
 
 
+def _cloud_launch_collision_observation(provider, ctx: "ChainLaunchContext") -> dict[str, Any]:
+    """Observe the target session/marker before building launch preflight."""
+    guard = _run_prelaunch_marker_guard(provider, ctx)
+    if not all(key in guard for key in ("session_alive", "marker_present", "identity_matches")):
+        return {
+            "status": "unknown",
+            "namespace": ctx.session_name,
+            "evidence": {"verified": False, "reason": "prelaunch_collision_guard_incomplete"},
+        }
+    occupied = bool(guard.get("session_alive")) or bool(
+        guard.get("marker_present") and not guard.get("identity_matches")
+    )
+    return {
+        "status": "conflict" if occupied else "none",
+        "namespace": ctx.session_name,
+        "evidence": {
+            "verified": True,
+            "exists": occupied,
+            "session": ctx.session_name,
+            "marker_path": ctx.marker_path,
+            "identity_matches": bool(guard.get("identity_matches")),
+        },
+    }
+
+
 def _reject_noncanonical_launch_input(
     root: Path, args: argparse.Namespace, *, action: str
 ) -> None:
@@ -6317,6 +6458,38 @@ def _run_authoritative_chain_wrapper(root: Path, args: argparse.Namespace, spec:
         launch_spec=spec,
         local_spec_path=local_spec_path,
     )
+    runtime_dependencies: dict[str, Any] = {}
+    closed_route: dict[str, Any] | None = None
+    if any(
+        getattr(milestone, "profile", None) == CONTINUATION_RUNTIME_PROFILE
+        for milestone in chain_spec.milestones
+    ):
+        from arnold_pipelines.megaplan.cloud.preflight import resolve_cloud_chain_runtime_dependencies
+        runtime_dependencies = resolve_cloud_chain_runtime_dependencies(
+            chain_spec,
+            project_dir=project_root,
+            cloud_default_agent=spec.agents.get("default"),
+        )
+        closed_route = _validate_continuation_muse_routes(
+            runtime_dependencies, session=launch_ctx.session_name
+        )
+    model_policy = {
+        "status": "resolved",
+        "profile": str((closed_route or {}).get("profile") or ""),
+        "route": str((closed_route or {}).get("model") or ""),
+        "fallback": bool((closed_route or {}).get("fallback", False)),
+        "roles": {
+            role: str((closed_route or {}).get("model") or "")
+            for role in (
+                "babysitter", "fixer", "controller", "researcher", "oracle", "superfixer"
+            )
+        },
+        "resolved": runtime_dependencies,
+    }
+    runtime_binding = dict(runtime_binding)
+    runtime_binding["model_policy"] = model_policy
+    operation_id = f"cloud-chain:{launch_ctx.identity}"
+    request_id = f"cloud-chain-request:{launch_ctx.digest}"
     command = _chain_start_command(
         launch_ctx.remote_spec_path,
         project_dir=launch_ctx.workspace,
@@ -6332,9 +6505,17 @@ def _run_authoritative_chain_wrapper(root: Path, args: argparse.Namespace, spec:
         command,
         launch_ctx=launch_ctx,
         binding=runtime_binding,
+        operation_id=operation_id,
+        request_id=request_id,
     )
-    operation_id = f"cloud-chain:{launch_ctx.identity}"
-    request_id = f"cloud-chain-request:{launch_ctx.digest}"
+    launch_attestation = _launch_attestation(
+        runtime_binding,
+        command=command,
+        cwd=launch_ctx.workspace,
+        session=launch_ctx.session_name,
+        model_policy=model_policy,
+    )
+    collision_observation = _cloud_launch_collision_observation(provider, launch_ctx)
     launch_spec = {
         "command": command,
         "cwd": launch_ctx.workspace,
@@ -6346,17 +6527,20 @@ def _run_authoritative_chain_wrapper(root: Path, args: argparse.Namespace, spec:
         "plan_id": launch_ctx.identity,
         "source_revision": str(spec.megaplan.ref),
         "configured_spec": str(local_spec_path),
-        "metadata": {"runtime_binding": _envelope_runtime_binding(runtime_binding)},
+        "metadata": {
+            "runtime_binding": _envelope_runtime_binding(runtime_binding),
+            "launch_attestation": launch_attestation,
+        },
     }
     observations = {
         "source": {"status": "current", "revision": str(spec.megaplan.ref), "ref": str(spec.megaplan.ref), "tree": str(project_root)},
-        "authority": {"status": "current", "grant": launch_ctx.identity, "fence": launch_ctx.identity, "decision": launch_ctx.identity},
+        "authority": {"status": "current", "grant": launch_ctx.identity, "fence": launch_ctx.identity, "decision": launch_ctx.identity, "evidence": {"verified": True, "source": "operation-envelope"}},
         "custody": {"status": "present", "custody_ref": launch_ctx.workspace, "wbc_ref": launch_ctx.workspace},
         "credentials": _cloud_launch_credentials_observation(spec, provider),
-        "runtime": {"status": "present", "interpreter": spec.megaplan.runtime_python or "python", "import_root": spec.megaplan.src_path, "source_revision": str(spec.megaplan.ref)},
+        "runtime": {"status": "present", "interpreter": launch_attestation["dependency_interpreter_identity"] or spec.megaplan.runtime_python or "python", "import_root": runtime_binding["runtime_source"], "source_revision": runtime_binding["runtime_revision"], "manifest_identity": runtime_binding["manifest_identity"], "evidence": launch_attestation["provenance"]},
         "command": {"status": "valid", "argv": command, "cwd": launch_ctx.workspace, "env": {}},
         "namespace": {"status": "valid", "name": launch_ctx.session_name},
-        "collision": {"status": "none", "namespace": launch_ctx.session_name},
+        "collision": collision_observation,
         "capacity": _cloud_launch_capacity_observation(provider, project_root),
         "network": _cloud_launch_network_observation(spec),
     }
@@ -6674,13 +6858,31 @@ def _run_epic_chain_wrapper(root: Path, args: argparse.Namespace, spec: CloudSpe
         launch_spec=spec,
         local_spec_path=local_spec_path,
     )
+    runtime_binding = dict(runtime_binding)
+    runtime_binding["model_policy"] = {
+        "status": "resolved",
+        "profile": "",
+        "route": "",
+        "fallback": False,
+        "roles": {},
+    }
+    operation_id = f"cloud-epic-chain:{launch_ctx.identity}"
+    request_id = f"cloud-epic-chain-request:{launch_ctx.digest}"
     command = _chain_command_with_runtime_binding(
         command,
         launch_ctx=launch_ctx,
         binding=runtime_binding,
+        operation_id=operation_id,
+        request_id=request_id,
     )
-    operation_id = f"cloud-epic-chain:{launch_ctx.identity}"
-    request_id = f"cloud-epic-chain-request:{launch_ctx.digest}"
+    launch_attestation = _launch_attestation(
+        runtime_binding,
+        command=command,
+        cwd=launch_ctx.workspace,
+        session=launch_ctx.session_name,
+        model_policy=runtime_binding["model_policy"],
+    )
+    collision_observation = _cloud_launch_collision_observation(provider, launch_ctx)
     launch_spec = {
         "command": command,
         "cwd": launch_ctx.workspace,
@@ -6692,17 +6894,20 @@ def _run_epic_chain_wrapper(root: Path, args: argparse.Namespace, spec: CloudSpe
         "plan_id": launch_ctx.identity,
         "source_revision": str(spec.megaplan.ref),
         "configured_spec": str(local_spec_path),
-        "metadata": {"runtime_binding": _envelope_runtime_binding(runtime_binding)},
+        "metadata": {
+            "runtime_binding": _envelope_runtime_binding(runtime_binding),
+            "launch_attestation": launch_attestation,
+        },
     }
     observations = {
         "source": {"status": "current", "revision": str(spec.megaplan.ref), "ref": str(spec.megaplan.ref), "tree": str(project_root)},
-        "authority": {"status": "current", "grant": launch_ctx.identity, "fence": launch_ctx.identity, "decision": launch_ctx.identity},
+        "authority": {"status": "current", "grant": launch_ctx.identity, "fence": launch_ctx.identity, "decision": launch_ctx.identity, "evidence": {"verified": True, "source": "operation-envelope"}},
         "custody": {"status": "present", "custody_ref": launch_ctx.workspace, "wbc_ref": launch_ctx.workspace},
         "credentials": _cloud_launch_credentials_observation(spec, provider),
-        "runtime": {"status": "present", "interpreter": spec.megaplan.runtime_python or "python", "import_root": spec.megaplan.src_path, "source_revision": str(spec.megaplan.ref)},
+        "runtime": {"status": "present", "interpreter": launch_attestation["dependency_interpreter_identity"] or spec.megaplan.runtime_python or "python", "import_root": runtime_binding["runtime_source"], "source_revision": runtime_binding["runtime_revision"], "manifest_identity": runtime_binding["manifest_identity"], "evidence": launch_attestation["provenance"]},
         "command": {"status": "valid", "argv": command, "cwd": launch_ctx.workspace, "env": {}},
         "namespace": {"status": "valid", "name": launch_ctx.session_name},
-        "collision": {"status": "none", "namespace": launch_ctx.session_name},
+        "collision": collision_observation,
         "capacity": _cloud_launch_capacity_observation(provider, project_root),
         "network": _cloud_launch_network_observation(spec),
     }
