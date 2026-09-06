@@ -52,7 +52,7 @@ arnold_materialize_launch_boundary() {
     export ARNOLD_BABYSITTER_CHAIN_PROFILE="$chain_profile"
     export ARNOLD_BABYSITTER_CLOSED_PROFILE="$closed_profile"
     export ARNOLD_BABYSITTER_MODEL='omp:openrouter/meta/muse-spark-1.3-contributor:high'
-    export ARNOLD_BABYSITTER_OMP_MODEL='omp:openrouter/meta/muse-spark-1.3-contributor'
+    export ARNOLD_BABYSITTER_OMP_MODEL='omp:openrouter/meta/muse-spark-1.3-contributor:high'
     unset ARNOLD_BABYSITTER_CODEX_MODEL ARNOLD_BABYSITTER_CODEX_INVESTIGATOR_MODEL
   else
     unset ARNOLD_BABYSITTER_CHAIN_PROFILE ARNOLD_BABYSITTER_CLOSED_PROFILE

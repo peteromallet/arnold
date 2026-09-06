@@ -203,8 +203,22 @@ def _refresh_authority_marker(payload: dict[str, Any]) -> dict[str, Any]:
     workspace = Path(str(payload.get("workspace") or "")).expanduser()
     provenance = payload.get("runtime_manifest")
     provenance_path = provenance.get("path") if isinstance(provenance, Mapping) else None
-    manifest = Path(str(provenance_path)).expanduser() if provenance_path else workspace / ".megaplan" / "runtime-manifest.json"
-    progress = workspace / ".megaplan" / "cloud-logs" / f"{payload.get('session', 'session')}.log"
+    # The launch marker/request already carries the admitted runtime and
+    # progress projections.  Keep those bindings authoritative across a
+    # liveness refresh; the workspace default is only a legacy bootstrap
+    # fallback for unprojected payloads.
+    manifest_path = (
+        payload.get("bootstrap_manifest_path")
+        or provenance_path
+        or workspace / ".megaplan" / "runtime-manifest.json"
+    )
+    manifest = Path(str(manifest_path)).expanduser()
+    progress_path = payload.get("progress_artifact")
+    progress = (
+        Path(str(progress_path)).expanduser()
+        if progress_path
+        else workspace / ".megaplan" / "cloud-logs" / f"{payload.get('session', 'session')}.log"
+    )
     payload.setdefault("bootstrap_manifest_path", str(manifest))
     payload.setdefault("progress_artifact", str(progress))
     payload.setdefault("progress_identity", f"run:{payload.get('run_id', '')}")

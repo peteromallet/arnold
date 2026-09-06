@@ -220,6 +220,35 @@ def test_real_chain_marker_producer_round_trips_through_authority(tmp_path: Path
             victim.kill(); victim.wait(timeout=3)
 
 
+def test_liveness_refresh_uses_explicit_marker_manifest_and_progress(tmp_path: Path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    manifest = _manifest(tmp_path / "pinned" / "runtime.json", workspace)
+    progress = tmp_path / "chain.log"
+    progress.write_text("chain progress\n", encoding="utf-8")
+    marker = {
+        "session": "chain-session",
+        "workspace": str(workspace),
+        "run_id": "launch:chain",
+        "runtime_manifest": {"path": str(workspace / ".megaplan" / "runtime-manifest.json")},
+        "bootstrap_manifest_path": str(manifest),
+        "progress_artifact": str(progress),
+        "progress_identity": "chain:projected-progress",
+        "manifest_sha256": "stale",
+        "manifest_identity": "stale",
+    }
+
+    liveness_lease._refresh_authority_marker(marker)
+
+    expected = hashlib.sha256(manifest.read_bytes()).hexdigest()
+    assert marker["bootstrap_manifest_path"] == str(manifest)
+    assert marker["manifest_sha256"] == expected
+    assert marker["manifest_identity"] == expected
+    assert marker["progress_artifact"] == str(progress)
+    assert marker["progress_identity"] == "chain:projected-progress"
+    assert marker["progress_content_digest"] == hashlib.sha256(progress.read_bytes()).hexdigest()
+
+
 @pytest.mark.skipif(__import__("shutil").which("tmux") is None, reason="tmux unavailable")
 def test_real_tmux_marker_binding_round_trips_and_replacement_is_rejected(tmp_path: Path, monkeypatch):
     """The producer's explicit socket/session/pane proof is runtime-validated."""

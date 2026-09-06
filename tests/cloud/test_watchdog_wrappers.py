@@ -741,10 +741,11 @@ def test_watchdog_marker_binds_closed_fixer_before_child_spawn(
     record = tmp_path / "child-env.txt"
     child.write_text(
         "#!/usr/bin/env bash\n"
-        "printf '%s|%s|%s|%s\\n' "
+        "printf '%s|%s|%s|%s|%s\\n' "
         "\"$ARNOLD_BABYSITTER_CHAIN_PROFILE\" "
         "\"$ARNOLD_BABYSITTER_CLOSED_PROFILE\" "
         "\"$ARNOLD_BABYSITTER_MODEL\" "
+        "\"$ARNOLD_BABYSITTER_OMP_MODEL\" "
         "\"$ARNOLD_BABYSITTER_ROUTING\" "
         f"> {shlex.quote(str(record))}\n",
         encoding="utf-8",
@@ -769,6 +770,7 @@ def test_watchdog_marker_binds_closed_fixer_before_child_spawn(
     if expect_child:
         assert record.read_text(encoding="utf-8").strip() == (
             "all-muse-spark-openrouter|all-muse-spark-openrouter|"
+            "omp:openrouter/meta/muse-spark-1.3-contributor:high|"
             "omp:openrouter/meta/muse-spark-1.3-contributor:high|omp"
         )
     else:

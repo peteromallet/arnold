@@ -413,7 +413,7 @@ export ARNOLD_BABYSITTER_ROUTING=codex
     export ARNOLD_BABYSITTER_CHAIN_PROFILE=all-muse-spark-openrouter
     export ARNOLD_BABYSITTER_CLOSED_PROFILE=all-muse-spark-openrouter
     arnold_materialize_launch_boundary native-build-forward-c2-780129da-20260903-r5 /tmp /tmp
-printf '%s\\n' "$ARNOLD_CHAIN_GIT_HELPER" "$HOME" "$GIT_CONFIG_GLOBAL" "$PYTHONPATH" "$ARNOLD_BABYSITTER_MODEL" "$ARNOLD_BABYSITTER_ROUTING"
+printf '%s\\n' "$ARNOLD_CHAIN_GIT_HELPER" "$HOME" "$GIT_CONFIG_GLOBAL" "$PYTHONPATH" "$ARNOLD_BABYSITTER_MODEL" "$ARNOLD_BABYSITTER_OMP_MODEL" "$ARNOLD_BABYSITTER_ROUTING"
 """
     result = subprocess.run(
         ["bash", "-c", script], capture_output=True, text=True, check=True
@@ -423,6 +423,7 @@ printf '%s\\n' "$ARNOLD_CHAIN_GIT_HELPER" "$HOME" "$GIT_CONFIG_GLOBAL" "$PYTHONP
         "/hostile/home",
         "/hostile/config",
         "/tmp",  # runtime boundary pins imports
+        "omp:openrouter/meta/muse-spark-1.3-contributor:high",
         "omp:openrouter/meta/muse-spark-1.3-contributor:high",
         "omp",
     ]
