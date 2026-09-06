@@ -717,6 +717,9 @@ class SshProvider(Provider):
         self._scp_binary = shutil.which("scp")
         self._rsync_binary = shutil.which("rsync")
         self._ssh_effect_adapter = ssh_effect_adapter
+        # Bound only after the fresh-child owner read.  The adapter gate reads
+        # this object for every transport effect; a missing value is denial.
+        self.fresh_child_authority_context: Any | None = None
         self._consumed_zero_recovery_transactions: set[str] = set()
         if self._ssh_binary is None:
             _missing_cli_error("ssh", INSTALL_LINK.removeprefix("Install: "))
@@ -725,6 +728,12 @@ class SshProvider(Provider):
 
     def authoritative_store_root(self) -> str:
         return "/workspace/ops"
+
+    def bind_authority_context(self, context: Any) -> None:
+        """Bind the already-admitted canonical owner context to this provider."""
+        if context is None or not callable(getattr(context, "read", None)):
+            raise ValueError("canonical fresh-child authority context is required")
+        self.fresh_child_authority_context = context
 
     def _target(self) -> str:
         if self._validated_user:

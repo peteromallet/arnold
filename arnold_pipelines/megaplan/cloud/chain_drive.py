@@ -60,6 +60,41 @@ def _envelope_has_runtime_binding(envelope: LaunchEnvelope) -> bool:
     return isinstance(metadata, Mapping) and "runtime_binding" in metadata
 
 
+def _authority_binding_from_envelope(envelope: LaunchEnvelope) -> Mapping[str, Any]:
+    metadata = envelope.launch_spec.get("metadata")
+    binding = metadata.get("authority_binding") if isinstance(metadata, Mapping) else None
+    if not isinstance(binding, Mapping):
+        raise ValueError("missing current authority binding")
+    required = {
+        "schema", "run_id", "run_revision", "coordinator_attempt_id",
+        "subject_id", "subject_attempt_id", "capability", "grant_id",
+        "fence_token", "claim_id", "decision_id", "journal_cursor",
+        "view_hash", "grant_ref", "fence_ref", "attempt_ref", "decision_ref",
+        "wbc_attempt_id", "glek", "custody_lease_id", "custody_epoch",
+        "custody_ref", "target_binding",
+    }
+    if binding.get("schema") != "arnold.megaplan.current_authority_binding.v1":
+        raise ValueError("current authority binding schema mismatch")
+    missing = sorted(key for key in required if key not in binding)
+    if missing:
+        raise ValueError("current authority binding missing fields: " + ", ".join(missing))
+    for key in (
+        "run_id", "run_revision", "coordinator_attempt_id", "subject_id",
+        "subject_attempt_id", "capability", "grant_id", "claim_id",
+        "decision_id", "view_hash", "grant_ref", "fence_ref", "attempt_ref",
+        "decision_ref", "wbc_attempt_id", "glek", "custody_lease_id", "custody_ref",
+    ):
+        if not isinstance(binding.get(key), str) or not binding[key]:
+            raise ValueError(f"current authority binding field {key} is invalid")
+    if not isinstance(binding.get("target_binding"), Mapping) or not binding["target_binding"]:
+        raise ValueError("current authority binding target is invalid")
+    if not isinstance(binding.get("journal_cursor"), int) or binding["journal_cursor"] < 0:
+        raise ValueError("current authority binding journal cursor is invalid")
+    if not isinstance(binding.get("custody_epoch"), int) or binding["custody_epoch"] < 0:
+        raise ValueError("current authority binding custody epoch is invalid")
+    return binding
+
+
 def _canonical_runtime_identity(runtime_source: str, runtime_revision: str) -> dict[str, Any]:
     identity: dict[str, Any] = {
         "import_root": runtime_source,
@@ -361,6 +396,7 @@ def _validate_launch_observations(
     ):
         raise ValueError("execution packet observation contradicts launch envelope")
 
+    binding = _authority_binding_from_envelope(envelope)
     authority = observations.get("authority")
     authority_evidence = authority.get("evidence") if isinstance(authority, Mapping) else None
     if (
@@ -368,12 +404,26 @@ def _validate_launch_observations(
         or authority.get("status") != "current"
         or not isinstance(authority_evidence, Mapping)
         or authority_evidence.get("verified") is not True
-        or authority_evidence.get("source") != "operation-envelope"
-        or authority.get("grant") != envelope.operation_id
-        or authority.get("fence") != envelope.request_id
-        or authority.get("decision") != envelope.operation_id
+        or authority_evidence.get("source") != "run-authority"
+        or authority.get("grant") != binding["grant_id"]
+        or str(authority.get("fence")) != str(binding["fence_token"])
+        or authority.get("decision") != binding["decision_id"]
+        or authority.get("attempt") != binding["subject_attempt_id"]
+        or authority.get("subject") != binding["subject_id"]
+        or authority.get("capability") != binding["capability"]
+        or authority_evidence.get("journal_cursor") != binding["journal_cursor"]
+        or authority_evidence.get("view_hash") != binding["view_hash"]
+        or authority_evidence.get("grant_ref") != binding["grant_ref"]
+        or authority_evidence.get("fence_ref") != binding["fence_ref"]
+        or authority_evidence.get("attempt_ref") != binding["attempt_ref"]
+        or authority_evidence.get("decision_ref") != binding["decision_ref"]
+        or authority_evidence.get("custody_ref") != binding["custody_ref"]
+        or authority_evidence.get("wbc_attempt_id") != binding["wbc_attempt_id"]
+        or authority_evidence.get("glek") != binding["glek"]
+        or authority_evidence.get("custody_lease_id") != binding["custody_lease_id"]
+        or authority_evidence.get("custody_epoch") != binding["custody_epoch"]
     ):
-        raise ValueError("authority observation is not bound to the launch envelope")
+        raise ValueError("authority observation is not bound to the current owner binding")
 
     custody = observations.get("custody")
     if (
@@ -393,6 +443,73 @@ def _validate_launch_observations(
         != str(envelope.launch_spec.get("expected_session_name") or "")
     ):
         raise ValueError("collision observation is not verified for the envelope session")
+
+
+def _reread_current_authority(binding: Mapping[str, Any]) -> None:
+    """Re-open the same RA/WBC/Custody owners immediately before admission."""
+    locations = binding.get("owner_paths")
+    if not isinstance(locations, Mapping) or not all(
+        isinstance(locations.get(key), str) and Path(locations[key]).is_absolute()
+        for key in ("authority_journal", "wbc_ledger", "custody_lease_dir")
+    ):
+        raise ValueError("current authority owner locations are missing")
+    from arnold.workflow.attempt_ledger_store import SqliteAttemptLedgerStore
+    from arnold_pipelines.megaplan.custody.lease_store import open_lease_store
+    from arnold_pipelines.megaplan.maintenance.sources import RunAuthorityAdapter
+    from arnold_pipelines.run_authority.current_source import CurrentSourceRequest
+    from arnold_pipelines.run_authority.journal import RunAuthorityJournal
+    from arnold_pipelines.run_authority.reducer import reduce_run_authority
+
+    journal = RunAuthorityJournal(locations["authority_journal"])
+    view = journal.read_view(binding["run_id"], binding["run_revision"])
+    reduced = reduce_run_authority(
+        view.records,
+        run_id=binding["run_id"],
+        run_revision=binding["run_revision"],
+        journal_cursor=view.cursor,
+    )
+    source_request = CurrentSourceRequest(
+        run_id=binding["run_id"],
+        run_revision=binding["run_revision"],
+        coordinator_attempt_id=binding["coordinator_attempt_id"],
+        grant_id=binding["grant_id"],
+        fence_token=str(binding["fence_token"]),
+        subject_attempt_id=binding["subject_attempt_id"],
+        decision_id=binding["decision_id"],
+        subject_id=binding["subject_id"],
+        capability=binding["capability"],
+    )
+    authority = RunAuthorityAdapter(lambda: reduced).read(source_request)
+    current = authority.current_source
+    if authority.torn or current is None or not current.satisfied:
+        raise ValueError("G5A_REMOTE_BLOCKED: current Run Authority read is denied or torn")
+    if authority.journal_cursor != binding["journal_cursor"] or authority.view_hash != binding["view_hash"]:
+        raise ValueError("G5A_REMOTE_BLOCKED: Run Authority cursor or view hash drifted")
+    refs = {ref.locator: ref.digest for ref in current.references}
+    expected_refs = {
+        f"grant://{binding['grant_id']}": binding["grant_ref"],
+        f"fence://{binding['coordinator_attempt_id']}/{binding['fence_token']}": binding["fence_ref"],
+        f"attempt://{binding['subject_attempt_id']}": binding["attempt_ref"],
+        f"decision://{binding['decision_id']}": binding["decision_ref"],
+    }
+    if any(refs.get(locator) != digest for locator, digest in expected_refs.items()):
+        raise ValueError("G5A_REMOTE_BLOCKED: Run Authority record digest drifted")
+
+    store = SqliteAttemptLedgerStore(locations["wbc_ledger"])
+    reservation = store.get_global_effect_reservation(binding["wbc_attempt_id"], binding["glek"])
+    if reservation is None or reservation.attempt_id != binding["wbc_attempt_id"]:
+        raise ValueError("G5A_REMOTE_BLOCKED: WBC reservation is missing or stale")
+    lease = open_lease_store(locations["custody_lease_dir"]).current_lease(binding["custody_lease_id"])
+    if lease is None or lease.is_expired:
+        raise ValueError("G5A_REMOTE_BLOCKED: Custody lease is missing or expired")
+    if (
+        lease.run_authority_grant_id != binding["grant_id"]
+        or str(lease.coordinator_fence_token) != str(binding["fence_token"])
+        or lease.wbc_attempt_reference != binding["wbc_attempt_id"]
+        or lease.custody_epoch != binding["custody_epoch"]
+        or lease.digest() != binding["custody_ref"]
+    ):
+        raise ValueError("G5A_REMOTE_BLOCKED: Custody owner identity drifted")
 
 
 def _probe_live_collision(session: str) -> None:
@@ -533,6 +650,17 @@ def execute_authoritative_launch(request: Mapping[str, Any]) -> dict[str, Any]:
             operation_id=envelope.operation_id,
             request_id=envelope.request_id,
             envelope_digest=envelope.digest,
+        )
+    try:
+        _reread_current_authority(_authority_binding_from_envelope(envelope))
+    except ValueError as exc:
+        return _json_response(
+            result=LaunchResult.REJECTED,
+            reason="G5A_REMOTE_BLOCKED",
+            operation_id=envelope.operation_id,
+            request_id=envelope.request_id,
+            envelope_digest=envelope.digest,
+            detail=str(exc),
         )
 
     # Request-side command/cwd/session fields are transport projections.  The

@@ -275,25 +275,27 @@ def _ssh_provider(spec: CloudSpec) -> Provider:
         open_ssh_effect_adapter,
     )
 
-    # Production construction installs the canonical effect protocol and the
-    # current action gate before the provider is reachable from preflight,
-    # deploy, or chain.  The in-memory store is deliberate: the M10 SSH gate
-    # is action-off, so a provider factory must not create a durable ledger (or
-    # any other state) merely by inspecting a cloud spec.  Should policy ever
-    # authorize a mutation, the adapter still requires the normal durable
-    # effect protocol path and never falls back to raw transport.
+    # Production construction installs the effect protocol and a gate that
+    # reads the provider's bound FreshChildAuthorityContext for every effect.
+    # The provider is created first so the gate cannot accidentally capture a
+    # synthetic operation/request projection.
     from arnold.workflow.attempt_ledger_store import SqliteAttemptLedgerStore
     from arnold.workflow.effect_protocol import EffectProtocol
     from arnold.workflow.ledger_outbox import SqliteLedgerOutbox
 
     store = SqliteAttemptLedgerStore(":memory:")
     protocol = EffectProtocol(store, SqliteLedgerOutbox(store))
+    provider_holder: dict[str, Any] = {}
     adapter = open_ssh_effect_adapter(
         protocol,
-        action_gate_check=current_ssh_gate_check(),
+        action_gate_check=current_ssh_gate_check(
+            lambda: getattr(provider_holder.get("provider"), "fresh_child_authority_context", None)
+        ),
         production_enabled=True,
     )
-    return SshProvider(spec, ssh_effect_adapter=adapter)
+    provider = SshProvider(spec, ssh_effect_adapter=adapter)
+    provider_holder["provider"] = provider
+    return provider
 
 
 _PROVIDER_FACTORIES: dict[str, ProviderFactory] = {

@@ -352,10 +352,10 @@ def test_authorized_gate_dispatches_with_apply_fn_and_protocol(
     assert apply_calls == [{"deploy_dir": "/tmp/deploy"}]
 
 
-def test_production_route_is_action_off_before_gate_protocol_or_apply(
+def test_production_route_dispatches_after_current_authorization(
     mock_protocol, build_target
 ):
-    """Production route denies before any effect or transport interaction."""
+    """Production route uses the same gated protocol after authorization."""
     gate = MagicMock(return_value=GateResult.AUTHORIZED)
     production = SshEffectAdapter(
         mock_protocol,
@@ -368,18 +368,14 @@ def test_production_route_is_action_off_before_gate_protocol_or_apply(
         target=build_target,
         intent_payload={"deploy_dir": "/tmp/deploy"},
         apply_fn=lambda payload: apply_calls.append(payload),
-        # This would be rejected by the stale-fence check if production mode
-        # were allowed to reach it; the action-off guard must come first.
-        fence_token=None,
+        fence_token=1,
     )
 
-    assert not result.ok
-    assert result.outcome_kind == OUTCOME_FAILED
-    assert result.error == "Production SSH dispatch is action-off in M10"
-    assert result.evidence == {"gate_verdict": "production_action_off"}
-    gate.assert_not_called()
-    mock_protocol.assert_not_called()
-    assert apply_calls == []
+    assert result.ok
+    assert result.outcome_kind == OUTCOME_COMPLETED
+    gate.assert_called_once()
+    mock_protocol.reserve_and_start.assert_called_once()
+    assert apply_calls == [{"deploy_dir": "/tmp/deploy"}]
 
 
 def test_adapter_effect_authorized_is_strict_authorized_only():
@@ -393,10 +389,10 @@ def test_adapter_effect_authorized_is_strict_authorized_only():
 # ── Action-off gate dispatch ────────────────────────────────────────────────
 
 
-def test_gate_dispatch_production_is_action_off_even_when_authorized(
+def test_gate_dispatch_production_runs_when_authorized(
     mock_protocol, build_target
 ):
-    """Production mode is action-off: an AUTHORIZED gate still denies."""
+    """Gate-only production dispatch is allowed by canonical authorization."""
     production = SshEffectAdapter(
         mock_protocol,
         action_gate_check=lambda _boundary, _target_key: GateResult.AUTHORIZED,
@@ -405,9 +401,8 @@ def test_gate_dispatch_production_is_action_off_even_when_authorized(
 
     result = production.gate_dispatch(build_target)
 
-    assert not result.ok
-    assert "Production SSH dispatch is action-off" in result.error
-    assert result.evidence["gate_verdict"] == "production_action_off"
+    assert result.ok
+    assert result.evidence["gate_verdict"] == GateResult.AUTHORIZED.value
     mock_protocol.reserve_and_start.assert_not_called()
 
 
@@ -544,8 +539,8 @@ def test_constructor_production_without_gate_raises(mock_protocol):
     assert gated._production_enabled is True
 
 
-def test_current_ssh_gate_check_always_denies():
-    """The production SSH gate is a denial gate, re-read at dispatch time."""
+def test_current_ssh_gate_check_requires_and_reads_current_context():
+    """The production SSH gate reads one exact owner context per dispatch."""
     from arnold_pipelines.megaplan.cloud.ssh_effect_adapter import (
         current_ssh_gate_check,
     )
@@ -554,6 +549,14 @@ def test_current_ssh_gate_check_always_denies():
     verdict = gate("dispatch", "ssh:ssh_exec:example.com:megaplan-cloud-agent")
     assert verdict == GateResult.BLOCKED_MISSING_GRANT
     assert adapter_effect_authorized(verdict) is False
+
+    class Context:
+        def authorize(self, **kwargs):
+            assert kwargs["capability"] == "ssh_engine_invocation"
+            return GateResult.AUTHORIZED
+
+    authorized = current_ssh_gate_check(Context())
+    assert authorized("dispatch", "ssh:ssh_exec:example.com:megaplan-cloud-agent") == GateResult.AUTHORIZED
 
 
 # ── Stale-fence negatives ────────────────────────────────────────────────────

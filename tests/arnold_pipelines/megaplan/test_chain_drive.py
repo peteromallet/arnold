@@ -21,6 +21,12 @@ from arnold.runtime.durable_ops import (
 from arnold_pipelines.megaplan.cloud import chain_drive
 
 
+@pytest.fixture(autouse=True)
+def _stub_current_owner_reread(monkeypatch):
+    """The engine tests use synthetic temp paths; owner integration is tested separately."""
+    monkeypatch.setattr(chain_drive, "_reread_current_authority", lambda binding: None)
+
+
 def _request(tmp_path: Path):
     session = "chain"
     runtime_source = (tmp_path / "runtime").resolve()
@@ -142,9 +148,40 @@ def _request(tmp_path: Path):
         },
         "model_policy": {"status": "resolved", "route": "", "fallback": False, "roles": {}},
     }
+    authority_binding = {
+        "schema": "arnold.megaplan.current_authority_binding.v1",
+        "run_id": "run",
+        "run_revision": "rev",
+        "coordinator_attempt_id": "coord",
+        "subject_id": "subject",
+        "subject_attempt_id": "attempt",
+        "capability": "launch_dispatch",
+        "grant_id": "grant",
+        "fence_token": 1,
+        "claim_id": "claim",
+        "decision_id": "decision",
+        "journal_cursor": 1,
+        "view_hash": "v" * 64,
+        "grant_ref": "g" * 64,
+        "fence_ref": "f" * 64,
+        "attempt_ref": "a" * 64,
+        "decision_ref": "d" * 64,
+        "wbc_attempt_id": "wbc",
+        "glek": "glek",
+        "custody_lease_id": "lease",
+        "custody_epoch": 1,
+        "custody_ref": "c" * 64,
+        "target_binding": {"provider": "ssh", "workspace": str(tmp_path)},
+        "owner_paths": {
+            "authority_journal": str(tmp_path / "authority.sqlite"),
+            "wbc_ledger": str(tmp_path / "wbc.sqlite"),
+            "custody_lease_dir": str(tmp_path / "leases"),
+        },
+    }
+    spec["metadata"]["authority_binding"] = authority_binding
     observations = {
         "source": {"status": "current", "revision": "a" * 40, "ref": "a" * 40, "tree": "t"},
-        "authority": {"status": "current", "grant": "op", "fence": "req", "decision": "op", "evidence": {"verified": True, "source": "operation-envelope"}},
+        "authority": {"status": "current", "grant": "grant", "fence": 1, "attempt": "attempt", "decision": "decision", "subject": "subject", "capability": "launch_dispatch", "evidence": {"verified": True, "source": "run-authority", "journal_cursor": 1, "view_hash": "v" * 64, "grant_ref": "g" * 64, "fence_ref": "f" * 64, "attempt_ref": "a" * 64, "decision_ref": "d" * 64, "custody_ref": "c" * 64, "wbc_attempt_id": "wbc", "glek": "glek", "custody_lease_id": "lease", "custody_epoch": 1}},
         "custody": {"status": "present", "custody_ref": str(tmp_path), "wbc_ref": "w"},
         "credentials": {"status": "available", "identity": "i", "transport": "local"},
         "runtime": {"status": "present", "interpreter": str(interpreter), "import_root": str(runtime_source), "source_revision": "a" * 40},

@@ -72,6 +72,10 @@ class FreshChildOwnerUnavailable(FreshChildAdmissionError):
     """A canonical owner adapter was not supplied."""
 
 
+DEFAULT_FRESH_CHILD_CAPABILITIES = ("execute",)
+CURRENT_AUTHORITY_BINDING_SCHEMA = "arnold.megaplan.current_authority_binding.v1"
+
+
 @runtime_checkable
 class FreshChildJournal(Protocol):
     """The canonical Run Authority journal used for fresh-run admission.
@@ -149,6 +153,7 @@ class FreshChildRequest:
     approval_actor: str
     parent_occurrence_digest: str
     fence_token: int = 1
+    capabilities: tuple[str, ...] = DEFAULT_FRESH_CHILD_CAPABILITIES
 
     def __post_init__(self) -> None:
         for name in (
@@ -177,6 +182,12 @@ class FreshChildRequest:
             raise ValueError("fence_token must be a positive integer")
         if not isinstance(self.child_selector, Mapping):
             raise ValueError("child_selector must be a mapping")
+        if not isinstance(self.capabilities, (tuple, list)) or not self.capabilities:
+            raise ValueError("capabilities must be a non-empty sequence")
+        capabilities = tuple(_required_text(value, "capability") for value in self.capabilities)
+        if len(set(capabilities)) != len(capabilities):
+            raise ValueError("capabilities must not contain duplicates")
+        object.__setattr__(self, "capabilities", capabilities)
         frozen_selector = json.loads(canonical_json(_canonical(self.child_selector)))
         object.__setattr__(self, "child_selector", frozen_selector)
 
@@ -212,6 +223,7 @@ class FreshChildRequest:
             "approval_actor": self.approval_actor,
             "parent_occurrence_digest": self.parent_occurrence_digest,
             "fence_token": self.fence_token,
+            "capabilities": list(self.capabilities),
         }
         if include_digest:
             result["request_digest"] = self.request_digest
@@ -261,6 +273,174 @@ class FreshChildAdmissionReceipt:
             raise FreshChildConflict("Custody lease is not bound to RA grant")
         if self.custody.occurrence_key.occurrence_digest != self.occurrence.occurrence_digest:
             raise FreshChildConflict("Custody lease is not bound to admitted occurrence")
+
+
+def _contract_digest(record: Any) -> str:
+    digest = getattr(record, "digest", None)
+    if not callable(digest):
+        raise FreshChildOwnerUnavailable("authority owner returned an undigestible record")
+    value = digest()
+    if not isinstance(value, str) or len(value) != 64:
+        raise FreshChildOwnerUnavailable("authority owner returned an invalid record digest")
+    return value
+
+
+class FreshChildAuthorityContext:
+    """Read current authority from the existing RA, WBC, and Custody owners.
+
+    The context is a verifier and reference builder only.  It never appends,
+    reserves, or acquires.  Callers bind the returned immutable references to
+    the launch envelope and call :meth:`read` again at each effect boundary.
+    """
+
+    def __init__(
+        self,
+        *,
+        receipt: FreshChildAdmissionReceipt,
+        journal: FreshChildJournal,
+        wbc: WbcOwner,
+        custody: CustodyOwner,
+    ) -> None:
+        self.receipt = receipt
+        self.journal = journal
+        self.wbc = wbc
+        self.custody = custody
+        self._expected: dict[str, Any] | None = None
+
+    def bind(self, authority: Mapping[str, Any]) -> None:
+        """Freeze the first owner observation for later effect re-reads."""
+        if not isinstance(authority, Mapping) or authority.get("schema") != CURRENT_AUTHORITY_BINDING_SCHEMA:
+            raise FreshChildOwnerUnavailable("cannot bind a malformed current authority observation")
+        self._expected = dict(authority)
+
+    def authorize(self, *, boundary: str, target_key: str, capability: str) -> Any:
+        """Return the canonical gate verdict for one exact transport target."""
+        from arnold_pipelines.megaplan.custody.action_validator import GateResult
+
+        if not capability:
+            return GateResult.BLOCKED_MISSING_GRANT
+        try:
+            expected = self._expected
+            if expected is not None and not expected.get("target_binding"):
+                expected = dict(expected)
+                expected.pop("target_binding", None)
+            observed = self.read(
+                capability=capability,
+                target_binding={"boundary": str(boundary), "target_key": target_key},
+                expected=expected,
+            )
+            if self._expected is None or not self._expected.get("target_binding"):
+                self.bind(observed)
+            return GateResult.AUTHORIZED
+        except FreshChildAdmissionError:
+            return GateResult.BLOCKED_STALE_GRANT
+        except Exception:
+            return GateResult.ERROR
+
+    def read(
+        self,
+        *,
+        capability: str,
+        target_binding: Mapping[str, Any] | None = None,
+        expected: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Return a coherent current-owner observation or fail closed."""
+        from arnold_pipelines.run_authority.current_source import CurrentSourceRequest
+        from arnold_pipelines.run_authority.reducer import reduce_run_authority
+        from arnold_pipelines.megaplan.maintenance.sources import RunAuthorityAdapter
+
+        request = self.receipt.request
+        raw = self.journal.read_view(request.run_id, request.run_revision)
+        records = getattr(raw, "records", None)
+        cursor = getattr(raw, "cursor", getattr(raw, "journal_cursor", None))
+        if not isinstance(records, tuple) or not isinstance(cursor, int) or cursor < 0:
+            raise FreshChildOwnerUnavailable("Run Authority owner returned an invalid current view")
+        view = reduce_run_authority(
+            records,
+            run_id=request.run_id,
+            run_revision=request.run_revision,
+            journal_cursor=cursor,
+        )
+        source_request = CurrentSourceRequest(
+            run_id=request.run_id,
+            run_revision=request.run_revision,
+            coordinator_attempt_id=request.coordinator_attempt_id,
+            grant_id=self.receipt.identity.grant_id,
+            fence_token=str(self.receipt.authority.fence.token),
+            subject_attempt_id=request.subject_attempt_id,
+            decision_id=self.receipt.identity.decision_id,
+            subject_id=request.subject_id,
+            capability=capability,
+        )
+        ra = RunAuthorityAdapter(lambda: view).read(source_request)
+        current = ra.current_source
+        if ra.torn or current is None or not current.satisfied:
+            reason = current.reason if current is not None else "current source observation missing"
+            raise FreshChildOwnerUnavailable(f"G5A_REMOTE_BLOCKED: {reason}")
+
+        reservation = self.wbc.read_reservation(
+            self.receipt.identity.wbc_attempt_id, self.receipt.identity.glek
+        )
+        if reservation is None or reservation.attempt_id != self.receipt.identity.wbc_attempt_id:
+            raise FreshChildOwnerUnavailable("G5A_REMOTE_BLOCKED: WBC reservation is missing or stale")
+        lease = self.custody.read_lease(self.receipt.custody.lease_id)
+        if lease is None or lease.is_expired:
+            raise FreshChildOwnerUnavailable("G5A_REMOTE_BLOCKED: Custody lease is missing or expired")
+        if (
+            lease.run_authority_grant_id != self.receipt.identity.grant_id
+            or lease.coordinator_fence_token != self.receipt.authority.fence.token
+            or lease.wbc_attempt_reference != reservation.attempt_id
+            or lease.occurrence_key.occurrence_digest != self.receipt.occurrence.occurrence_digest
+        ):
+            raise FreshChildOwnerUnavailable("G5A_REMOTE_BLOCKED: Custody owner identity drift")
+
+        refs = {ref.locator: ref.digest for ref in current.references}
+        authority = {
+            "schema": CURRENT_AUTHORITY_BINDING_SCHEMA,
+            "run_id": request.run_id,
+            "run_revision": request.run_revision,
+            "coordinator_attempt_id": request.coordinator_attempt_id,
+            "subject_id": request.subject_id,
+            "subject_attempt_id": request.subject_attempt_id,
+            "capability": capability,
+            "grant_id": self.receipt.identity.grant_id,
+            "fence_token": self.receipt.authority.fence.token,
+            "claim_id": self.receipt.identity.claim_id,
+            "decision_id": self.receipt.identity.decision_id,
+            "journal_cursor": ra.journal_cursor,
+            "view_hash": ra.view_hash,
+            "grant_ref": refs.get(f"grant://{self.receipt.identity.grant_id}"),
+            "fence_ref": refs.get(
+                f"fence://{request.coordinator_attempt_id}/{self.receipt.authority.fence.token}"
+            ),
+            "attempt_ref": refs.get(f"attempt://{request.subject_attempt_id}"),
+            "decision_ref": refs.get(f"decision://{self.receipt.identity.decision_id}"),
+            "wbc_attempt_id": reservation.attempt_id,
+            "glek": reservation.glek,
+            "custody_lease_id": lease.lease_id,
+            "custody_epoch": lease.custody_epoch,
+            "custody_ref": _contract_digest(lease),
+            "target_binding": dict(target_binding or {}),
+            "owner_paths": {
+                "authority_journal": str(getattr(self.journal, "database", "")),
+                "wbc_ledger": str(getattr(getattr(self.wbc, "store", None), "_db_path", "")),
+                "custody_lease_dir": str(getattr(getattr(self.custody, "store", None), "base_dir", "")),
+            },
+        }
+        owner_paths = authority["owner_paths"]
+        if not all(isinstance(value, str) and value for value in owner_paths.values()):
+            raise FreshChildOwnerUnavailable("G5A_REMOTE_BLOCKED: canonical owner locations are unavailable")
+        if any(not isinstance(authority[key], str) or not authority[key] for key in (
+            "grant_ref", "fence_ref", "attempt_ref", "decision_ref", "custody_ref"
+        )):
+            raise FreshChildOwnerUnavailable("G5A_REMOTE_BLOCKED: owner record references are incomplete")
+        if expected is not None:
+            for key, value in expected.items():
+                if authority.get(key) != value:
+                    raise FreshChildOwnerUnavailable(
+                        f"G5A_REMOTE_BLOCKED: authority reference drift at {key}"
+                    )
+        return authority
 
 
 def _identity(request: FreshChildRequest) -> tuple[FreshChildIdentity, GlobalEffectIdentity]:
@@ -328,7 +508,7 @@ def _records(request: FreshChildRequest, identity: FreshChildIdentity) -> tuple[
         coordinator_attempt_id=identity.coordinator_attempt_id,
         fence_token=fence.token,
         subject_ids=(request.subject_id,),
-        capabilities=("execute",),
+        capabilities=request.capabilities,
         evidence_ids=(evidence.evidence_id,),
     )
     attempt = SubjectAttempt(
@@ -552,10 +732,13 @@ __all__ = [
     "FreshChildAdmission",
     "FreshChildAdmissionError",
     "FreshChildAdmissionReceipt",
+    "FreshChildAuthorityContext",
     "FreshChildConflict",
     "FreshChildIdentity",
     "FreshChildIndeterminate",
     "FreshChildJournal",
     "FreshChildOwnerUnavailable",
     "FreshChildRequest",
+    "DEFAULT_FRESH_CHILD_CAPABILITIES",
+    "CURRENT_AUTHORITY_BINDING_SCHEMA",
 ]

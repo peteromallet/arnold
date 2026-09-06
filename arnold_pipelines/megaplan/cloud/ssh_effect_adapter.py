@@ -4,16 +4,13 @@ Routes remote mutation sinks in ``cloud/providers/ssh.py`` through the
 WBC effect protocol and action gate, preserving command semantics while
 adding stale-fence and provider-missing negatives.
 
-All real SSH mutations remain action-off (SD3).  The adapter uses
-fake transports to prove the protocol.  Bypass and fake-transport
-negatives guard against accidental production dispatch.
+SSH effects remain fail-closed until the current Run Authority/WBC/Custody
+context authorizes the exact target.  An authorized production effect uses
+the same durable protocol as tests; there is no raw-transport fallback.
 
-Action-off operations (ssh_exec, upload_file, upload_archive, down) are
-not routed through the WBC protocol; they are gate-only
-(:meth:`SshEffectAdapter.gate_dispatch`): an explicitly AUTHORIZED verdict
-in a non-production adapter is required before any transport runs, and
-every other verdict — missing gate, SHADOW_PASS, blocked, error, or
-production mode — is a typed denial with zero transport calls.
+Gate-only operations (ssh_exec, upload_file, upload_archive, down) use
+``gate_dispatch`` and are permitted in production only after an explicit
+authorization from the current owner context.
 
 Mutating operations covered:
 - build: rsync/scp deploy + docker build
@@ -288,21 +285,6 @@ class SshEffectAdapter:
         # Enforce shard boundary
         self._enforce_shard(target)
 
-        if self._production_enabled:
-            LOGGER.warning(
-                "Production SSH dispatch attempted for %s — "
-                "production is action-off in M10",
-                target.target_key,
-            )
-            return SshOutcome(
-                ok=False,
-                shard=target.shard.value,
-                glek="",
-                outcome_kind=OUTCOME_FAILED,
-                error="Production SSH dispatch is action-off in M10",
-                evidence={"gate_verdict": "production_action_off"},
-            )
-
         # Provider-missing negative
         if not self._check_provider_available(target):
             return SshOutcome(
@@ -426,15 +408,6 @@ class SshEffectAdapter:
         verdict — missing gate, SHADOW_PASS, blocked, error, or production
         action-off — is a typed denial before any transport call.
         """
-        if self._production_enabled:
-            return SshOutcome(
-                ok=False,
-                shard=target.shard.value,
-                glek="",
-                outcome_kind=OUTCOME_FAILED,
-                error="Production SSH dispatch is action-off in M10",
-                evidence={"gate_verdict": "production_action_off"},
-            )
         if not self._check_provider_available(target):
             return SshOutcome(
                 ok=False,
@@ -500,16 +473,48 @@ class SshEffectAdapterGateError(RuntimeError):
     """Production SSH effect adapter construction refused: wiring missing."""
 
 
-def current_ssh_gate_check() -> Callable[[ActionBoundaryType, str], GateResult]:
-    """Build the production SSH gate: SSH mutations are action-off in M10.
+def _target_capability(target_key: str) -> str:
+    """Map each transport target to one explicit grant capability."""
+    parts = str(target_key).split(":", 2)
+    shard = parts[1] if len(parts) > 1 else ""
+    return {
+        "build": "repository_prepare",
+        "deploy": "repository_prepare",
+        "destroy": "launch_dispatch",
+        "upload_file": "file_upload",
+        "upload_archive": "file_upload",
+        "ssh_exec": "ssh_engine_invocation",
+        "down": "launch_dispatch",
+    }.get(shard, "")
 
-    The verdict is re-read at dispatch time and always denies.  The gate is
-    installed so the adapter is always consulted and production dispatch is a
-    typed denial, never an ungated direct transport.
+
+def current_ssh_gate_check(
+    context_provider: Callable[[], Any] | Any | None = None,
+) -> Callable[[ActionBoundaryType, str], GateResult]:
+    """Build a gate that re-reads the bound canonical owner context.
+
+    A missing context remains a typed denial.  The operator receipt is never
+    treated as a grant; only a context whose ``authorize`` method performs a
+    current RA/WBC/Custody read can return ``AUTHORIZED``.
     """
 
-    def gate_check(_boundary: ActionBoundaryType, _key: str) -> GateResult:
-        return GateResult.BLOCKED_MISSING_GRANT
+    def gate_check(boundary: ActionBoundaryType, key: str) -> GateResult:
+        try:
+            context = context_provider() if callable(context_provider) else context_provider
+            if context is None:
+                return GateResult.BLOCKED_MISSING_GRANT
+            authorize = getattr(context, "authorize", None)
+            if not callable(authorize):
+                return GateResult.BLOCKED_MISSING_GRANT
+            result = authorize(
+                boundary=boundary,
+                target_key=key,
+                capability=_target_capability(key),
+            )
+            return result if isinstance(result, GateResult) else GateResult.ERROR
+        except Exception:
+            LOGGER.exception("Current SSH authority gate failed for %s", key)
+            return GateResult.ERROR
 
     return gate_check
 

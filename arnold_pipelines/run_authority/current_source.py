@@ -66,6 +66,10 @@ class CurrentSourceRequest:
     fence_token: str
     subject_attempt_id: str
     decision_id: str
+    # Launch effects bind the current tuple to an exact subject and
+    # capability.  These remain optional for historical read-only callers.
+    subject_id: str | None = None
+    capability: str | None = None
 
 
 @dataclass(frozen=True)
@@ -120,7 +124,7 @@ def _active_fence(
             continue
         if fence.coordinator_attempt_id != request.coordinator_attempt_id:
             continue
-        if fence.token != request.fence_token:
+        if str(fence.token) != str(request.fence_token):
             continue
         return fence
     return None
@@ -193,6 +197,19 @@ def evaluate_current_source(
     if grant is None:
         return _denied("no active grant for the requested grant id at the current revision",
                        grant_id=request.grant_id)
+
+    if request.subject_id is not None and request.subject_id not in grant.subject_ids:
+        return _denied(
+            "active grant does not cover the requested subject",
+            subject_id=request.subject_id,
+            grant_subject_ids=grant.subject_ids,
+        )
+    if request.capability is not None and request.capability not in grant.capabilities:
+        return _denied(
+            "active grant does not cover the requested capability",
+            capability=request.capability,
+            grant_capabilities=grant.capabilities,
+        )
 
     fence = _active_fence(view, request)
     if fence is None:

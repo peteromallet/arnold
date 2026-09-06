@@ -6418,6 +6418,86 @@ def _reject_noncanonical_launch_input(
     )
 
 
+def _read_current_launch_authority(
+    provider: Any,
+    *,
+    capability: str,
+    target_binding: Mapping[str, Any],
+    expected: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Read the canonical fresh-child owner before one launch effect."""
+    context = getattr(provider, "fresh_child_authority_context", None)
+    reader = getattr(provider, "read_current_authority", None)
+    if context is not None and callable(getattr(context, "read", None)):
+        read = context.read
+    elif callable(reader):
+        read = reader
+    else:
+        raise CliError(
+            "G5A_REMOTE_BLOCKED",
+            "provider has no canonical fresh-child authority reader",
+        )
+    try:
+        kwargs: dict[str, Any] = {
+            "capability": capability,
+            "target_binding": dict(target_binding),
+        }
+        if expected is not None:
+            kwargs["expected"] = dict(expected)
+        authority = read(**kwargs)
+    except CliError:
+        raise
+    except Exception as exc:
+        raise CliError(
+            "G5A_REMOTE_BLOCKED",
+            f"current owner read failed before {capability}: {type(exc).__name__}: {exc}",
+        ) from exc
+    if (
+        not isinstance(authority, Mapping)
+        or authority.get("schema") != "arnold.megaplan.current_authority_binding.v1"
+    ):
+        raise CliError(
+            "G5A_REMOTE_BLOCKED",
+            "current owner read did not return the canonical authority binding",
+        )
+    if context is not None and callable(getattr(context, "bind", None)) and expected is None:
+        context.bind(authority)
+        binder = getattr(provider, "bind_authority_context", None)
+        if callable(binder):
+            binder(context)
+    return dict(authority)
+
+
+def _authority_observation(authority: Mapping[str, Any]) -> dict[str, Any]:
+    """Project one coherent owner read into the existing preflight shape."""
+    return {
+        "status": "current",
+        "schema": authority.get("schema"),
+        "grant": authority.get("grant_id"),
+        "fence": authority.get("fence_token"),
+        "attempt": authority.get("subject_attempt_id"),
+        "claim": authority.get("claim_id"),
+        "decision": authority.get("decision_id"),
+        "subject": authority.get("subject_id"),
+        "capability": authority.get("capability"),
+        "evidence": {
+            "verified": True,
+            "source": "run-authority",
+            "journal_cursor": authority.get("journal_cursor"),
+            "view_hash": authority.get("view_hash"),
+            "grant_ref": authority.get("grant_ref"),
+            "fence_ref": authority.get("fence_ref"),
+            "attempt_ref": authority.get("attempt_ref"),
+            "decision_ref": authority.get("decision_ref"),
+            "custody_ref": authority.get("custody_ref"),
+            "wbc_attempt_id": authority.get("wbc_attempt_id"),
+            "glek": authority.get("glek"),
+            "custody_lease_id": authority.get("custody_lease_id"),
+            "custody_epoch": authority.get("custody_epoch"),
+        },
+    }
+
+
 def _run_authoritative_chain_wrapper(root: Path, args: argparse.Namespace, spec: CloudSpec, provider) -> int:
     """Prepare remote inputs, then invoke the co-located launch engine once.
 
@@ -6460,6 +6540,24 @@ def _run_authoritative_chain_wrapper(root: Path, args: argparse.Namespace, spec:
         # Preparation remains a controller transport operation.  It does not
         # admit or dispatch anything and returns no live launch projection.
         return _prepare_chain_inputs(root, args, spec, provider, local_spec_path, project_root, chain_spec, launch_ctx)
+
+    authority_target = {
+        "provider": str(spec.provider),
+        "workspace": launch_ctx.workspace,
+        "session": launch_ctx.session_name,
+        "source_revision": str(spec.megaplan.ref),
+        "chain_spec": str(local_spec_path),
+    }
+    authority_binding = _read_current_launch_authority(
+        provider,
+        capability="repository_prepare",
+        target_binding=authority_target,
+    )
+    authority_identity = {
+        key: value
+        for key, value in authority_binding.items()
+        if key not in {"capability", "target_binding"}
+    }
 
     uploads: list[tuple[Path, str]] = []
     idea_dir = Path(args.idea_dir).expanduser().resolve() if args.idea_dir else local_spec_path.parent.resolve()
@@ -6566,11 +6664,12 @@ def _run_authoritative_chain_wrapper(root: Path, args: argparse.Namespace, spec:
         "metadata": {
             "runtime_binding": _envelope_runtime_binding(runtime_binding),
             "launch_attestation": launch_attestation,
+            "authority_binding": authority_binding,
         },
     }
     observations = {
         "source": {"status": "current", "revision": runtime_binding["runtime_revision"], "ref": str(spec.megaplan.ref), "tree": str(project_root)},
-        "authority": {"status": "current", "grant": operation_id, "fence": request_id, "decision": operation_id, "evidence": {"verified": True, "source": "operation-envelope"}},
+        "authority": _authority_observation(authority_binding),
         "custody": {"status": "present", "custody_ref": launch_ctx.workspace, "wbc_ref": launch_ctx.workspace},
         "credentials": _cloud_launch_credentials_observation(spec, provider),
         "runtime": {"status": "present", "interpreter": launch_attestation["dependency_interpreter_identity"] or spec.megaplan.runtime_python or "python", "import_root": runtime_binding["runtime_source"], "source_revision": runtime_binding["runtime_revision"], "manifest_identity": runtime_binding["manifest_identity"], "evidence": launch_attestation["provenance"]},
@@ -6592,8 +6691,26 @@ def _run_authoritative_chain_wrapper(root: Path, args: argparse.Namespace, spec:
     if not preflight.accepted:
         raise CliError("launch_preflight_rejected", "; ".join(preflight.failures))
     for source, destination in uploads:
+        _read_current_launch_authority(
+            provider,
+            capability="file_upload",
+            target_binding={**authority_target, "destination": destination},
+            expected=authority_identity,
+        )
         provider.upload_file(source, destination)
+    _read_current_launch_authority(
+        provider,
+        capability="file_upload",
+        target_binding={**authority_target, "destination": launch_ctx.remote_spec_path},
+        expected=authority_identity,
+    )
     provider.upload_file(local_spec_path, launch_ctx.remote_spec_path)
+    _read_current_launch_authority(
+        provider,
+        capability="ssh_engine_invocation",
+        target_binding={**authority_target, "operation": operation_id},
+        expected=authority_identity,
+    )
     request = build_launch_request(
         envelope=envelope,
         command=command,
@@ -6876,6 +6993,23 @@ def _run_epic_chain_wrapper(root: Path, args: argparse.Namespace, spec: CloudSpe
         local_spec_path=local_spec_path,
         epic_chain_spec=epic_chain_spec,
     )
+    authority_target = {
+        "provider": str(spec.provider),
+        "workspace": launch_ctx.workspace,
+        "session": launch_ctx.session_name,
+        "source_revision": str(spec.megaplan.ref),
+        "chain_spec": str(local_spec_path),
+    }
+    authority_binding = _read_current_launch_authority(
+        provider,
+        capability="repository_prepare",
+        target_binding=authority_target,
+    )
+    authority_identity = {
+        key: value
+        for key, value in authority_binding.items()
+        if key not in {"capability", "target_binding"}
+    }
     uploads = _durable_megaplan_uploads(project_root, launch_ctx.workspace)
     command = _epic_chain_start_command(
         launch_ctx.remote_spec_path,
@@ -6933,11 +7067,12 @@ def _run_epic_chain_wrapper(root: Path, args: argparse.Namespace, spec: CloudSpe
         "metadata": {
             "runtime_binding": _envelope_runtime_binding(runtime_binding),
             "launch_attestation": launch_attestation,
+            "authority_binding": authority_binding,
         },
     }
     observations = {
         "source": {"status": "current", "revision": runtime_binding["runtime_revision"], "ref": str(spec.megaplan.ref), "tree": str(project_root)},
-        "authority": {"status": "current", "grant": operation_id, "fence": request_id, "decision": operation_id, "evidence": {"verified": True, "source": "operation-envelope"}},
+        "authority": _authority_observation(authority_binding),
         "custody": {"status": "present", "custody_ref": launch_ctx.workspace, "wbc_ref": launch_ctx.workspace},
         "credentials": _cloud_launch_credentials_observation(spec, provider),
         "runtime": {"status": "present", "interpreter": launch_attestation["dependency_interpreter_identity"] or spec.megaplan.runtime_python or "python", "import_root": runtime_binding["runtime_source"], "source_revision": runtime_binding["runtime_revision"], "manifest_identity": runtime_binding["manifest_identity"], "evidence": launch_attestation["provenance"]},
@@ -6960,12 +7095,30 @@ def _run_epic_chain_wrapper(root: Path, args: argparse.Namespace, spec: CloudSpe
         raise CliError("launch_preflight_rejected", "; ".join(preflight.failures))
     archive_path: Path | None = None
     try:
+        _read_current_launch_authority(
+            provider,
+            capability="file_upload",
+            target_binding={**authority_target, "destination": launch_ctx.workspace},
+            expected=authority_identity,
+        )
         archive_path = _write_durable_megaplan_archive(project_root, uploads)
         provider.upload_archive(archive_path, launch_ctx.workspace)
     finally:
         if archive_path is not None:
             archive_path.unlink(missing_ok=True)
+    _read_current_launch_authority(
+        provider,
+        capability="file_upload",
+        target_binding={**authority_target, "destination": launch_ctx.remote_spec_path},
+        expected=authority_identity,
+    )
     provider.upload_file(local_spec_path, launch_ctx.remote_spec_path)
+    _read_current_launch_authority(
+        provider,
+        capability="ssh_engine_invocation",
+        target_binding={**authority_target, "operation": operation_id},
+        expected=authority_identity,
+    )
     request = build_launch_request(
         envelope=envelope,
         command=command,

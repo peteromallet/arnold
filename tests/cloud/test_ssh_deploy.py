@@ -356,7 +356,7 @@ class TestSshProviderGatedDirectTransport:
                 message_part="Action gate blocked",
             )
 
-    def test_direct_transport_denied_on_production_adapter_even_when_authorized(
+    def test_direct_transport_runs_on_production_adapter_when_authorized(
         self,
     ) -> None:
         production = SshEffectAdapter(
@@ -364,12 +364,12 @@ class TestSshProviderGatedDirectTransport:
             action_gate_check=lambda _boundary, _target_key: GateResult.AUTHORIZED,
             production_enabled=True,
         )
-        self._assert_denied(
-            production,
-            lambda p: p.ssh_exec("echo hi"),
-            code="provider_failed",
-            message_part="action-off",
+        provider, captured = self._capture_provider(
+            _minimal_cloud_spec(), adapter=production
         )
+        result = provider.ssh_exec("echo hi")
+        assert result.returncode == 0
+        assert captured == ["docker exec megaplan-cloud-agent bash -lc 'echo hi'"]
 
     # ── authorized gate: transport runs ──
 
@@ -424,7 +424,7 @@ class TestSshProviderGatedDirectTransport:
                 lambda: pytest.fail("raw SSH dispatch bypassed gate"),
             )
         assert caught.value.code == "provider_failed"
-        assert "action-off" in caught.value.message
+        assert "Action gate blocked" in caught.value.message
 
     def test_continuation_cloud_yaml_preflight_uses_gated_factory(self) -> None:
         """The real SSH cloud.yaml follows the preflight provider path."""
