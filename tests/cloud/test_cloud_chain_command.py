@@ -1101,6 +1101,58 @@ def test_atomic_marker_writer_can_be_followed_by_shell_operator(tmp_path: Path) 
     assert payload["content_digest"]
 
 
+def test_atomic_marker_writer_rejects_manifest_byte_drift_before_replacement(
+    tmp_path: Path,
+) -> None:
+    marker = tmp_path / "markers" / "demo.json"
+    marker.parent.mkdir(parents=True)
+    manifest = tmp_path / "runtime-manifest.json"
+    manifest.write_bytes(b"manifest-before-drift\n")
+    pinned_digest = hashlib.sha256(manifest.read_bytes()).hexdigest()
+    original_marker = (
+        json.dumps(
+            {
+                "session": "old",
+                "run_kind": "chain",
+                "bootstrap_manifest_path": str(manifest),
+                "manifest_sha256": pinned_digest,
+                "manifest_identity": pinned_digest,
+            },
+            sort_keys=True,
+        ).encode("utf-8")
+        + b"\n"
+    )
+    marker.write_bytes(original_marker)
+    command = _atomic_marker_write_command(
+        str(marker),
+        {
+            "session": "old",
+            "run_kind": "chain",
+            "bootstrap_manifest_path": str(manifest),
+            "manifest_sha256": pinned_digest,
+            "manifest_identity": pinned_digest,
+        },
+    )
+    manifest.write_bytes(b"manifest-after-drift\n")
+
+    result = subprocess.run(
+        ["bash", "-lc", command],
+        cwd=tmp_path,
+        env={
+            "HOME": str(tmp_path / "home"),
+            "PATH": os.environ["PATH"],
+            "PYTHONPATH": str(tmp_path / "package-unavailable"),
+        },
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert "runtime manifest bytes changed after launch binding" in result.stderr
+    assert marker.read_bytes() == original_marker
+
+
 def test_atomic_marker_writer_rejects_foreign_identity(tmp_path: Path) -> None:
     marker = tmp_path / "markers" / "demo.json"
     marker.parent.mkdir(parents=True)
