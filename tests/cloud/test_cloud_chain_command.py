@@ -598,7 +598,8 @@ def test_successor_closed_profile_route_requires_canonical_role_closure() -> Non
     }
     alias = copy.deepcopy(summary)
     alias["milestones"][0]["profile"] = "successor-muse-alias"
-    assert _validate_continuation_muse_routes(alias)["profile"] == "successor-muse-alias"
+    with pytest.raises(CliError, match="supported Muse profile"):
+        _validate_continuation_muse_routes(alias)
 
 
 @pytest.mark.parametrize(
@@ -755,9 +756,9 @@ def test_successor_cloud_preflight_runs_exact_muse_probe(
         SimpleNamespace(),
     )
     payload = json.loads(capsys.readouterr().out)
-    assert rc == 0, payload
-    assert payload["closed_route"]["profile"] == "successor-muse-alias"
-    assert probes == [(None, True)]
+    assert rc == 78, payload
+    assert payload["error"]["code"] == "closed_profile_route_mismatch"
+    assert probes == []
 
 
 def test_tmux_chain_projects_closed_profile_into_watchdog_environment() -> None:

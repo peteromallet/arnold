@@ -235,6 +235,14 @@ def _validate_continuation_muse_routes(
     if not canonical_signal and not legacy_route:
         return None
 
+    unsupported_profiles = profiles - CONTINUATION_MUSE_PROFILES
+    if unsupported_profiles:
+        raise CliError(
+            "closed_profile_route_mismatch",
+            "closed Muse profile must use a supported Muse profile",
+            extra={"profiles": sorted(profiles), "session": session},
+        )
+
     if legacy_route and not canonical_signal:
         # Backward compatibility for the still-authoritative legacy chain.
         # This branch is deliberately exact and has no profile-prefix or
