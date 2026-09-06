@@ -384,15 +384,22 @@ def launch_transaction(
         reason = LaunchReason.REPLAY if admission.reason is LaunchReason.REPLAY else admission.reason
         return LaunchTransactionResult(LaunchOutcome(admission.result, reason), admission)
     if admission.reason is LaunchReason.REPLAY:
-        # An admitted-but-not-accepted request has an unknown physical result;
-        # replay observes custody and never redispatches it.
+        # Admission replay is not acceptance evidence.  Only the durable
+        # launch.accepted event plus its matching process resource/identity
+        # may establish an accepted replay; never redispatch this request.
+        custody = inspect_launch(candidate, store=store)
+        if custody.result is LaunchResult.ACCEPTED:
+            return LaunchTransactionResult(
+                LaunchOutcome(LaunchResult.ACCEPTED, LaunchReason.REPLAY),
+                admission,
+            )
         replay_state = getattr(getattr(admission, "operation", None), "state", None)
         if getattr(replay_state, "value", replay_state) == "pending":
             return LaunchTransactionResult(
                 LaunchOutcome(LaunchResult.UNKNOWN, LaunchReason.DISPATCH_UNCERTAIN),
                 admission,
             )
-        return LaunchTransactionResult(LaunchOutcome(LaunchResult.ACCEPTED, LaunchReason.REPLAY), admission)
+        return LaunchTransactionResult(custody.outcome, admission)
 
     try:
         dispatched = dispatch(candidate)

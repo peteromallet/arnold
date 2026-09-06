@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import hashlib
 import json
 from pathlib import Path
 import shlex
@@ -21,6 +22,7 @@ from arnold.runtime.durable_ops import (
     LaunchResult,
     ResourceType,
     TypedResource,
+    inspect_launch,
     launch_transaction,
     run_launch_preflight,
 )
@@ -28,10 +30,164 @@ from arnold.runtime.durable_ops import (
 from agentbox.config import load_agentbox_config
 from agentbox.operations import open_operation_store
 from agentbox.tmux import inspect_session, new_session_argv, run_tmux
+from arnold_pipelines.megaplan.cloud.runtime_manifest import (
+    EPIC_REQUIRED,
+    ManifestError,
+    MANIFEST_SCHEMA_VERSION,
+    RuntimeManifest,
+    TOP_LEVEL_REQUIRED,
+)
 
 
 class ChainDriveError(RuntimeError):
     """A malformed or unplaceable authoritative launch request."""
+
+
+def _runtime_binding_from_envelope(envelope: LaunchEnvelope) -> Mapping[str, Any]:
+    metadata = envelope.launch_spec.get("metadata")
+    binding = metadata.get("runtime_binding") if isinstance(metadata, Mapping) else None
+    if not isinstance(binding, Mapping):
+        raise ValueError("missing runtime manifest binding")
+    return binding
+
+
+def _envelope_has_runtime_binding(envelope: LaunchEnvelope) -> bool:
+    metadata = envelope.launch_spec.get("metadata")
+    return isinstance(metadata, Mapping) and "runtime_binding" in metadata
+
+
+def _canonical_runtime_identity(runtime_source: str, runtime_revision: str) -> dict[str, Any]:
+    identity: dict[str, Any] = {
+        "import_root": runtime_source,
+        "source_revision": runtime_revision,
+        "editable_root": "",
+        "editable_revision": "",
+        "direct_url": {},
+        "pth": [],
+        "imports": {
+            "arnold": runtime_source + "/arnold/__init__.py",
+            "arnold_pipelines": runtime_source + "/arnold_pipelines/__init__.py",
+            "megaplan": runtime_source + "/arnold_pipelines/megaplan/__init__.py",
+        },
+    }
+    core = dict(identity)
+    for key in ("editable_root", "editable_revision", "direct_url", "pth", "imports"):
+        core[key] = None
+    identity["content_sha256"] = hashlib.sha256(
+        json.dumps(core, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    return identity
+
+
+def _plain_json(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return {str(key): _plain_json(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_plain_json(item) for item in value]
+    return value
+
+
+def _validate_runtime_manifest_binding(envelope: LaunchEnvelope) -> dict[str, Any]:
+    """Validate the envelope's immutable runtime binding before admission."""
+    binding = _runtime_binding_from_envelope(envelope)
+    required = {
+        "manifest_path",
+        "manifest_sha256",
+        "manifest_identity",
+        "runtime_id",
+        "runtime_source",
+        "runtime_revision",
+        "runtime_identity",
+        "runtime_identity_raw",
+    }
+    missing = sorted(required - set(binding))
+    if missing:
+        raise ValueError("runtime manifest binding missing fields: " + ", ".join(missing))
+
+    manifest_text = binding.get("manifest_path")
+    if not isinstance(manifest_text, str) or not manifest_text or not Path(manifest_text).is_absolute():
+        raise ValueError("runtime manifest binding path must be absolute")
+    manifest_path = Path(manifest_text).expanduser().resolve(strict=False)
+
+    digest = binding.get("manifest_sha256")
+    identity_digest = binding.get("manifest_identity")
+    if (
+        not isinstance(digest, str)
+        or not isinstance(identity_digest, str)
+        or digest != identity_digest
+        or len(digest) != 64
+        or any(char not in "0123456789abcdef" for char in digest)
+    ):
+        raise ValueError("runtime manifest binding has an invalid byte hash")
+    try:
+        raw = manifest_path.read_bytes()
+    except OSError as exc:
+        raise ValueError(f"runtime manifest binding unreadable: {manifest_path}") from exc
+    if hashlib.sha256(raw).hexdigest() != digest:
+        raise ValueError("runtime manifest binding byte hash mismatch")
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("runtime manifest binding is not valid UTF-8 JSON") from exc
+    if not (
+        isinstance(payload, dict)
+        and payload.get("schema") == MANIFEST_SCHEMA_VERSION
+        and all(field in payload for field in TOP_LEVEL_REQUIRED)
+    ):
+        raise ValueError("runtime manifest binding schema mismatch")
+    try:
+        manifest = RuntimeManifest.from_dict(payload)
+    except (ManifestError, TypeError, ValueError) as exc:
+        raise ValueError(f"runtime manifest binding schema invalid: {exc}") from exc
+    if manifest.compatibility_only:
+        raise ValueError("runtime manifest binding points to compatibility-only content")
+    epic = manifest.epic
+    if not all(field in epic for field in EPIC_REQUIRED):
+        raise ValueError("runtime manifest binding missing epic schema")
+    for field in ("runtime_root", "expected_head"):
+        if not isinstance(epic.get(field), str) or not epic[field]:
+            raise ValueError(f"runtime manifest binding missing epic.{field}")
+
+    runtime_id = binding.get("runtime_id")
+    runtime_source = binding.get("runtime_source")
+    runtime_revision = binding.get("runtime_revision")
+    if (
+        not isinstance(runtime_id, str)
+        or not runtime_id
+        or manifest.runtime_id != runtime_id
+        or not isinstance(runtime_source, str)
+        or not Path(runtime_source).is_absolute()
+        or runtime_source != str(Path(epic["runtime_root"]).expanduser().resolve(strict=False))
+        or not isinstance(runtime_revision, str)
+        or runtime_revision != epic["expected_head"]
+    ):
+        raise ValueError("runtime manifest binding runtime identity mismatch")
+
+    raw_identity = binding.get("runtime_identity_raw")
+    if not isinstance(raw_identity, Mapping):
+        raise ValueError("runtime manifest binding missing raw runtime identity")
+    expected_raw = {
+        "runtime_id": runtime_id,
+        "epic_id": manifest.epic_id,
+        "runtime_source": runtime_source,
+        "runtime_revision": runtime_revision,
+    }
+    if dict(raw_identity) != expected_raw:
+        raise ValueError("runtime manifest binding raw runtime identity mismatch")
+    canonical = binding.get("runtime_identity")
+    if not isinstance(canonical, Mapping) or _plain_json(canonical) != _canonical_runtime_identity(runtime_source, runtime_revision):
+        raise ValueError("runtime manifest binding canonical runtime identity mismatch")
+
+    return {
+        "manifest_path": str(manifest_path),
+        "manifest_sha256": digest,
+        "manifest_identity": digest,
+        "runtime_id": runtime_id,
+        "runtime_source": runtime_source,
+        "runtime_revision": runtime_revision,
+        "runtime_identity": dict(canonical),
+        "runtime_identity_raw": expected_raw,
+    }
 
 
 def _json_response(
@@ -90,6 +246,31 @@ def execute_authoritative_launch(request: Mapping[str, Any]) -> dict[str, Any]:
             envelope_digest=envelope.digest,
             detail="engine store does not match the configured authoritative store",
         )
+    try:
+        runtime_binding = _validate_runtime_manifest_binding(envelope)
+    except ValueError as exc:
+        # Pre-binding envelopes from an older engine may be replayed only when
+        # durable custody already proves acceptance.  This is read-only and
+        # deliberately happens before preflight/admission, so an unaccepted
+        # legacy request remains a zero-mutation rejection.
+        if not _envelope_has_runtime_binding(envelope):
+            legacy = inspect_launch(envelope, store=open_operation_store(config))
+            if legacy.result is LaunchResult.ACCEPTED:
+                return _json_response(
+                    result=LaunchResult.ACCEPTED,
+                    reason="replay",
+                    operation_id=envelope.operation_id,
+                    request_id=envelope.request_id,
+                    envelope_digest=envelope.digest,
+                )
+        return _json_response(
+            result=LaunchResult.REJECTED,
+            reason="runtime_manifest_binding_invalid",
+            operation_id=envelope.operation_id,
+            request_id=envelope.request_id,
+            envelope_digest=envelope.digest,
+            detail=str(exc),
+        )
     observations = request["preflight_observations"]
     if not isinstance(observations, Mapping):
         raise ChainDriveError("preflight_observations must be an object")
@@ -103,11 +284,14 @@ def execute_authoritative_launch(request: Mapping[str, Any]) -> dict[str, Any]:
             envelope_digest=envelope.digest,
         )
 
-    command = request["command"]
+    # Request-side command/cwd/session fields are transport projections.  The
+    # immutable envelope is authoritative, so a contradictory projection can
+    # never redirect dispatch.
+    command = envelope.launch_spec.get("command")
     if not isinstance(command, (str, list, tuple)):
         raise ChainDriveError("command must be a string or argv sequence")
-    cwd = request["cwd"]
-    session = request["session"]
+    cwd = envelope.launch_spec.get("cwd")
+    session = envelope.launch_spec.get("expected_session_name")
     if not isinstance(cwd, str) or not cwd or not isinstance(session, str) or not session:
         raise ChainDriveError("cwd and session must be non-empty strings")
     store = open_operation_store(config)
@@ -116,6 +300,9 @@ def execute_authoritative_launch(request: Mapping[str, Any]) -> dict[str, Any]:
         "ARNOLD_LAUNCH_REQUEST_ID": envelope.request_id,
         "ARNOLD_LAUNCH_ENVELOPE_DIGEST": envelope.digest,
         "ARNOLD_LAUNCH_PROCESS_IDENTITY": str(envelope.launch_spec.get("process_session_identity") or session),
+        # The envelope binding is the only authority.  This is a single
+        # process-session projection used by the runtime gate and command.
+        "ARNOLD_RUNTIME_MANIFEST": runtime_binding["manifest_path"],
     }
 
     def dispatch(candidate: LaunchEnvelope) -> str:

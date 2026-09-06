@@ -3824,6 +3824,14 @@ manifest_path = pathlib.Path(current.get("bootstrap_manifest_path", ""))
 if manifest_path.is_file():
     from arnold_pipelines.megaplan.cloud.runtime_manifest import manifest_bytes_sha256
     manifest_identity = manifest_bytes_sha256(manifest_path)
+    expected_manifest_identity = str(
+        current.get("manifest_sha256") or current.get("manifest_identity") or ""
+    )
+    if expected_manifest_identity and expected_manifest_identity != manifest_identity:
+        raise RuntimeError(
+            "runtime manifest bytes changed after launch binding: "
+            f"expected {{expected_manifest_identity}}, observed {{manifest_identity}}"
+        )
     current["manifest_sha256"] = manifest_identity
     current["manifest_identity"] = manifest_identity
     try:
@@ -4502,7 +4510,8 @@ def _chain_runtime_worktree_path(slug: str) -> str:
 
 # Reader used by the box-side probe: prints one JSON binding record from the
 # per-epic manifest — {"present": true, "created": 0|1, "epic_id",
-# "runtime_id", "runtime_src", "runtime_revision"}. The read is schema-gated
+# "runtime_id", "manifest_path", "manifest_sha256", "runtime_source",
+# "runtime_revision", "runtime_identity", "runtime_identity_raw"}. The read is schema-gated
 # on the CANONICAL runtime-manifest schema (G6 round-9 finding 2): the
 # manifest must carry ``schema == MANIFEST_SCHEMA_VERSION`` plus the
 # canonical top-level and ``epic`` required key sets — generated from
@@ -4516,9 +4525,10 @@ _RUNTIME_MANIFEST_BINDING_READER = f"""import hashlib, json, pathlib, sys
 TOP_LEVEL_REQUIRED = {json.dumps(list(TOP_LEVEL_REQUIRED))}
 EPIC_REQUIRED = {json.dumps(list(EPIC_REQUIRED))}
 MANIFEST_SCHEMA_VERSION = {json.dumps(MANIFEST_SCHEMA_VERSION)}
-path = pathlib.Path(sys.argv[1])
+path = pathlib.Path(sys.argv[1]).expanduser().resolve(strict=False)
 created = int(sys.argv[2]) if len(sys.argv) > 2 else 0
-payload = json.loads(path.read_text(encoding="utf-8"))
+raw = path.read_bytes()
+payload = json.loads(raw.decode("utf-8"))
 epic = payload.get("epic") if isinstance(payload, dict) else None
 if not (
     isinstance(payload, dict)
@@ -4532,7 +4542,7 @@ if not (
         "refusing to read raw fields\\n"
     )
     sys.exit(24)
-runtime_root = str(epic.get("runtime_root") or "")
+runtime_root = str(pathlib.Path(str(epic.get("runtime_root") or "")).expanduser().resolve(strict=False))
 runtime_revision = str(epic.get("expected_head") or "")
 runtime_identity = {{
         "import_root": runtime_root,
@@ -4553,14 +4563,25 @@ for key in ("editable_root", "editable_revision", "direct_url", "pth", "imports"
 runtime_identity["content_sha256"] = hashlib.sha256(
     json.dumps(identity_core, sort_keys=True, separators=(",", ":")).encode("utf-8")
 ).hexdigest()
+runtime_identity_raw = {{
+    "runtime_id": payload.get("runtime_id", ""),
+    "epic_id": payload.get("epic_id", ""),
+    "runtime_source": runtime_root,
+    "runtime_revision": runtime_revision,
+}}
 print(json.dumps({{
     "present": True,
     "created": created,
     "epic_id": payload.get("epic_id", ""),
     "runtime_id": payload.get("runtime_id", ""),
     "runtime_src": runtime_root,
+    "runtime_source": runtime_root,
     "runtime_revision": runtime_revision,
+    "manifest_path": str(path),
+    "manifest_sha256": hashlib.sha256(raw).hexdigest(),
+    "manifest_identity": hashlib.sha256(raw).hexdigest(),
     "runtime_identity": runtime_identity,
+    "runtime_identity_raw": runtime_identity_raw,
 }}, sort_keys=True))
 """
 
@@ -4769,11 +4790,41 @@ def _parse_chain_runtime_binding(
             "chain_runtime_manifest_incomplete",
             "cloud chain runtime manifest declares no epic.expected_head",
         )
+    runtime_source = str(payload.get("runtime_source") or runtime_src)
+    if runtime_source != runtime_src:
+        raise CliError(
+            "chain_runtime_manifest_binding_mismatch",
+            "cloud chain runtime manifest declares conflicting runtime sources",
+        )
+    runtime_id = str(payload.get("runtime_id") or "")
+    if not runtime_id:
+        raise CliError(
+            "chain_runtime_manifest_incomplete",
+            "cloud chain runtime manifest declares no runtime id",
+        )
+    manifest_path = str(payload.get("manifest_path") or "").strip()
+    manifest_sha256 = str(payload.get("manifest_sha256") or "").strip()
+    if not manifest_path or not Path(manifest_path).is_absolute() or len(manifest_sha256) != 64:
+        raise CliError(
+            "chain_runtime_manifest_incomplete",
+            "cloud chain runtime manifest binding lacks an absolute path or byte hash",
+        )
+    runtime_identity_raw = payload.get("runtime_identity_raw")
+    if not isinstance(runtime_identity_raw, Mapping):
+        raise CliError(
+            "chain_runtime_manifest_incomplete",
+            "cloud chain runtime manifest binding declares no raw runtime identity",
+        )
     return {
         "runtime_src": runtime_src,
+        "runtime_source": runtime_source,
         "runtime_revision": runtime_revision,
-        "runtime_id": str(payload.get("runtime_id") or ""),
+        "runtime_id": runtime_id,
         "runtime_identity": dict(payload.get("runtime_identity") or {}),
+        "runtime_identity_raw": dict(runtime_identity_raw),
+        "manifest_path": manifest_path,
+        "manifest_sha256": manifest_sha256,
+        "manifest_identity": str(payload.get("manifest_identity") or manifest_sha256),
         "created": bool(payload.get("created")),
     }
 
@@ -4845,7 +4896,14 @@ def _ensure_chain_runtime_binding(
         result,
         slug=slug,
     )
-    binding["manifest_path"] = manifest_path
+    expected_manifest_path = str(Path(manifest_path).expanduser().resolve(strict=False))
+    # The probe is the sole producer. Preserve its exact path/hash and reject
+    # a producer that tried to substitute a different path or byte identity.
+    if str(binding.get("manifest_path")) != expected_manifest_path:
+        raise CliError("chain_runtime_manifest_binding_mismatch", "runtime probe returned a different manifest path")
+    if str(binding.get("manifest_sha256") or "") != str(binding.get("manifest_identity") or ""):
+        raise CliError("chain_runtime_manifest_binding_mismatch", "runtime probe returned mismatched manifest identities")
+    binding["manifest_path"] = expected_manifest_path
     binding["slug"] = slug
     binding["policy_path"] = policy_path
     return binding
@@ -4860,7 +4918,11 @@ def _chain_runtime_provenance_payload(
     (recorded in the session marker; G1 per-session binding)."""
     return {
         "path": str(binding["manifest_path"]),
+        "manifest_path": str(binding["manifest_path"]),
+        "manifest_sha256": str(binding.get("manifest_sha256") or ""),
+        "manifest_identity": str(binding.get("manifest_identity") or binding.get("manifest_sha256") or ""),
         "runtime_src": str(binding["runtime_src"]),
+        "runtime_source": str(binding.get("runtime_source") or binding["runtime_src"]),
         "runtime_id": str(binding.get("runtime_id") or ""),
         "expected_head": str(binding["runtime_revision"]),
         "binding": "manifest_bound",
@@ -4885,8 +4947,61 @@ def _chain_runtime_marker_binding(binding: Mapping[str, Any]) -> dict[str, Any]:
         )
     return {
         "schema": "arnold.megaplan.marker_runtime_binding.v1",
+        "manifest_path": str(binding["manifest_path"]),
+        "manifest_sha256": str(binding.get("manifest_sha256") or ""),
+        "manifest_identity": str(binding.get("manifest_identity") or binding.get("manifest_sha256") or ""),
+        "runtime_id": str(binding.get("runtime_id") or ""),
+        "runtime_source": str(binding.get("runtime_source") or binding.get("runtime_src") or ""),
+        "runtime_revision": str(binding.get("runtime_revision") or ""),
         "current_identity": dict(identity),
+        "raw_identity": dict(binding.get("runtime_identity_raw") or {}),
     }
+
+
+def _envelope_runtime_binding(binding: Mapping[str, Any]) -> dict[str, Any]:
+    """Return the one canonical immutable binding carried by the envelope."""
+    return {
+        "manifest_path": str(binding["manifest_path"]),
+        "manifest_sha256": str(binding.get("manifest_sha256") or ""),
+        "manifest_identity": str(binding.get("manifest_identity") or binding.get("manifest_sha256") or ""),
+        "runtime_id": str(binding.get("runtime_id") or ""),
+        "runtime_source": str(binding.get("runtime_source") or binding.get("runtime_src") or ""),
+        "runtime_revision": str(binding.get("runtime_revision") or ""),
+        "runtime_identity": dict(binding.get("runtime_identity") or {}),
+        "runtime_identity_raw": dict(binding.get("runtime_identity_raw") or {}),
+    }
+
+
+def _chain_command_with_runtime_binding(
+    command: str,
+    *,
+    launch_ctx: ChainLaunchContext,
+    binding: Mapping[str, Any],
+) -> str:
+    """Project one validated runtime binding into the managed marker.
+
+    The envelope remains the authority.  This command-side projection is only
+    written after durable admission, and the marker writer rechecks the exact
+    manifest byte hash before publishing the projection.
+    """
+    marker_payload = {
+        "session": launch_ctx.session_name,
+        "workspace": launch_ctx.workspace,
+        "remote_spec": launch_ctx.remote_spec_path,
+        "identity_digest": launch_ctx.digest,
+        "run_kind": "chain",
+        "run_id": str(uuid.uuid4()),
+        "started_at": datetime.now(timezone.utc).isoformat(),
+        "bootstrap_manifest_path": str(binding["manifest_path"]),
+        "manifest_sha256": str(binding["manifest_sha256"]),
+        "manifest_identity": str(binding["manifest_identity"]),
+        "runtime_id": str(binding.get("runtime_id") or ""),
+        "runtime_binding": _chain_runtime_marker_binding(binding),
+    }
+    return (
+        f"{_write_session_marker_command(launch_ctx.marker_path, marker_payload)} && "
+        + command
+    )
 
 
 def _manifest_runtime_activate_command(binding: Mapping[str, Any]) -> str:
@@ -6187,6 +6302,21 @@ def _run_authoritative_chain_wrapper(root: Path, args: argparse.Namespace, spec:
         )))
     for source, destination in _chain_anchor_uploads(local_spec_path, launch_ctx.remote_spec_path, chain_spec):
         _append_unique_upload(uploads, source, destination)
+    # Runtime creation/probing is the sole binding producer and must complete
+    # before the immutable launch envelope is assembled.  The exact binding is
+    # then copied once into envelope metadata and projected into command/env.
+    # Keep the existing source-ref gate ahead of runtime preparation so local
+    # and test providers still report their intended advertised-ref failure,
+    # rather than an unrelated missing runtime interpreter.
+    if spec.provider == "ssh" and (spec.megaplan.repo or "").strip():
+        _verify_configured_megaplan_ref_advertised(spec)
+    _ensure_repo_checkout(spec, provider, relay=False)
+    runtime_binding = _ensure_chain_runtime_binding(
+        provider=provider,
+        launch_ctx=launch_ctx,
+        launch_spec=spec,
+        local_spec_path=local_spec_path,
+    )
     command = _chain_start_command(
         launch_ctx.remote_spec_path,
         project_dir=launch_ctx.workspace,
@@ -6197,6 +6327,11 @@ def _run_authoritative_chain_wrapper(root: Path, args: argparse.Namespace, spec:
         repair_session=launch_ctx.session_name,
         repair_run_kind="chain",
         repair_marker_dir=str(PurePosixPath(launch_ctx.marker_path).parent),
+    )
+    command = _chain_command_with_runtime_binding(
+        command,
+        launch_ctx=launch_ctx,
+        binding=runtime_binding,
     )
     operation_id = f"cloud-chain:{launch_ctx.identity}"
     request_id = f"cloud-chain-request:{launch_ctx.digest}"
@@ -6211,6 +6346,7 @@ def _run_authoritative_chain_wrapper(root: Path, args: argparse.Namespace, spec:
         "plan_id": launch_ctx.identity,
         "source_revision": str(spec.megaplan.ref),
         "configured_spec": str(local_spec_path),
+        "metadata": {"runtime_binding": _envelope_runtime_binding(runtime_binding)},
     }
     observations = {
         "source": {"status": "current", "revision": str(spec.megaplan.ref), "ref": str(spec.megaplan.ref), "tree": str(project_root)},
@@ -6235,7 +6371,6 @@ def _run_authoritative_chain_wrapper(root: Path, args: argparse.Namespace, spec:
     )
     if not preflight.accepted:
         raise CliError("launch_preflight_rejected", "; ".join(preflight.failures))
-    _ensure_repo_checkout(spec, provider, relay=False)
     for source, destination in uploads:
         provider.upload_file(source, destination)
     provider.upload_file(local_spec_path, launch_ctx.remote_spec_path)
@@ -6530,6 +6665,20 @@ def _run_epic_chain_wrapper(root: Path, args: argparse.Namespace, spec: CloudSpe
         repair_session=launch_ctx.session_name,
         repair_marker_dir=str(PurePosixPath(launch_ctx.marker_path).parent),
     )
+    if spec.provider == "ssh" and (spec.megaplan.repo or "").strip():
+        _verify_configured_megaplan_ref_advertised(spec)
+    _ensure_repo_checkout(spec, provider, relay=False)
+    runtime_binding = _ensure_chain_runtime_binding(
+        provider=provider,
+        launch_ctx=launch_ctx,
+        launch_spec=spec,
+        local_spec_path=local_spec_path,
+    )
+    command = _chain_command_with_runtime_binding(
+        command,
+        launch_ctx=launch_ctx,
+        binding=runtime_binding,
+    )
     operation_id = f"cloud-epic-chain:{launch_ctx.identity}"
     request_id = f"cloud-epic-chain-request:{launch_ctx.digest}"
     launch_spec = {
@@ -6543,6 +6692,7 @@ def _run_epic_chain_wrapper(root: Path, args: argparse.Namespace, spec: CloudSpe
         "plan_id": launch_ctx.identity,
         "source_revision": str(spec.megaplan.ref),
         "configured_spec": str(local_spec_path),
+        "metadata": {"runtime_binding": _envelope_runtime_binding(runtime_binding)},
     }
     observations = {
         "source": {"status": "current", "revision": str(spec.megaplan.ref), "ref": str(spec.megaplan.ref), "tree": str(project_root)},
@@ -6567,7 +6717,6 @@ def _run_epic_chain_wrapper(root: Path, args: argparse.Namespace, spec: CloudSpe
     )
     if not preflight.accepted:
         raise CliError("launch_preflight_rejected", "; ".join(preflight.failures))
-    _ensure_repo_checkout(spec, provider, relay=False)
     archive_path: Path | None = None
     try:
         archive_path = _write_durable_megaplan_archive(project_root, uploads)

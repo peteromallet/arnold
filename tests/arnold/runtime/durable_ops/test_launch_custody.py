@@ -6,10 +6,12 @@ from pathlib import Path
 from arnold.runtime.durable_ops import (
     FileBackedDurableOpsStore,
     LaunchEnvelope,
+    LaunchReason,
     LaunchResult,
     ResourceType,
     TypedResource,
     inspect_launch,
+    launch_transaction,
     launch_transaction,
     reconcile_launch,
 )
@@ -172,3 +174,26 @@ def test_reconcile_requires_exact_identity_and_never_accepts_dead_or_wrong_proce
     result = reconcile_launch(envelope, store=store, observe=lambda *_: dead)
     assert result.result is LaunchResult.UNKNOWN
     assert store.list_typed_resources(envelope.operation_id) == ()
+
+
+def test_terminal_unaccepted_admission_replay_is_not_accepted_or_redispatched(tmp_path: Path) -> None:
+    store = FileBackedDurableOpsStore(tmp_path / "ops")
+    envelope = _envelope("terminal-replay-op", "terminal-replay-request")
+    store.admit_launch(envelope)
+    data = store._read_data()
+    data["operation_runs"][envelope.operation_id]["state"] = "failed"
+    store._write_data(data)
+    dispatches: list[object] = []
+
+    replay = launch_transaction(
+        envelope,
+        store=store,
+        preflight=_Preflight(),
+        dispatch=lambda value: dispatches.append(value),
+        observe=lambda value, candidate: _observation(candidate),
+        resource_factory=lambda value, observation, candidate: _resource(candidate, dict(observation)),
+    )
+
+    assert replay.result is LaunchResult.CONFLICT
+    assert replay.reason is LaunchReason.NOT_PENDING
+    assert dispatches == []

@@ -18,6 +18,8 @@ from types import SimpleNamespace
 import pytest
 import yaml
 
+from agentbox.config import AgentBoxConfig
+from agentbox.tmux import SessionStatus
 from arnold_pipelines.megaplan import chain as chain_module
 from arnold_pipelines.megaplan.cloud.cli import (
     _atomic_marker_write_command,
@@ -2076,7 +2078,10 @@ def test_chain_spec_enables_post_hot_env_runtime_gate_regardless_of_isolated_run
 def _runtime_binding(**overrides: Any) -> dict[str, Any]:
     binding = {
         "manifest_path": "/workspace/.megaplan/demo-abc123.json",
+        "manifest_sha256": "c" * 64,
+        "manifest_identity": "c" * 64,
         "runtime_src": "/workspace/runtime-candidates/demo-abc123",
+        "runtime_source": "/workspace/runtime-candidates/demo-abc123",
         "runtime_revision": "a" * 40,
         "runtime_id": "demo-abc123-20260810",
         "slug": "demo-abc123",
@@ -2091,6 +2096,12 @@ def _runtime_binding(**overrides: Any) -> dict[str, Any]:
             "pth": [],
             "imports": {},
             "content_sha256": "b" * 64,
+        },
+        "runtime_identity_raw": {
+            "runtime_id": "demo-abc123-20260810",
+            "epic_id": "demo-abc123",
+            "runtime_source": "/workspace/runtime-candidates/demo-abc123",
+            "runtime_revision": "a" * 40,
         },
     }
     binding.update(overrides)
@@ -2412,7 +2423,11 @@ def test_parse_chain_runtime_binding_accepts_binding_record() -> None:
         "epic_id": "demo-abc123",
         "runtime_id": "demo-abc123-20260810",
         "runtime_src": "/workspace/runtime-candidates/demo-abc123",
+        "runtime_source": "/workspace/runtime-candidates/demo-abc123",
         "runtime_revision": "a" * 40,
+        "manifest_path": "/workspace/.megaplan/demo-abc123.json",
+        "manifest_sha256": "c" * 64,
+        "manifest_identity": "c" * 64,
         "runtime_identity": {
             "import_root": "/workspace/runtime-candidates/demo-abc123",
             "source_revision": "a" * 40,
@@ -2422,6 +2437,12 @@ def test_parse_chain_runtime_binding_accepts_binding_record() -> None:
             "pth": [],
             "imports": {},
             "content_sha256": "b" * 64,
+        },
+        "runtime_identity_raw": {
+            "runtime_id": "demo-abc123-20260810",
+            "epic_id": "demo-abc123",
+            "runtime_source": "/workspace/runtime-candidates/demo-abc123",
+            "runtime_revision": "a" * 40,
         },
     }
     result = subprocess.CompletedProcess([], 0, json.dumps(payload) + "\n", "")
@@ -3021,6 +3042,7 @@ class _LaunchEpicProvider:
         self.uploads: list[tuple[Path, str]] = []
         self.remote_files: set[str] = set()
         self.markers: dict[str, dict] = {}
+        self.runtime_probe_calls = 0
 
     def upload_file(self, src: Path, dest: str) -> None:
         self.uploads.append((src, dest))
@@ -3074,6 +3096,7 @@ class _LaunchEpicProvider:
             # must return one JSON binding record (see
             # _RUNTIME_MANIFEST_BINDING_READER). The test fakes a manifest
             # already present on the box.
+            self.runtime_probe_calls += 1
             slug_match = re.search(r"SLUG='([^']+)'", command)
             slug = slug_match.group(1) if slug_match else "demo"
             binding = {
@@ -3082,7 +3105,31 @@ class _LaunchEpicProvider:
                 "epic_id": slug,
                 "runtime_id": f"runtime-{slug}",
                 "runtime_src": f"/workspace/runtime-candidates/{slug}",
+                "runtime_source": f"/workspace/runtime-candidates/{slug}",
                 "runtime_revision": "a" * 40,
+                "manifest_path": f"/workspace/.megaplan/{slug}.json",
+                "manifest_sha256": "c" * 64,
+                "manifest_identity": "c" * 64,
+                "runtime_identity": {
+                    "import_root": f"/workspace/runtime-candidates/{slug}",
+                    "source_revision": "a" * 40,
+                    "editable_root": "",
+                    "editable_revision": "",
+                    "direct_url": {},
+                    "pth": [],
+                    "imports": {
+                        "arnold": f"/workspace/runtime-candidates/{slug}/arnold/__init__.py",
+                        "arnold_pipelines": f"/workspace/runtime-candidates/{slug}/arnold_pipelines/__init__.py",
+                        "megaplan": f"/workspace/runtime-candidates/{slug}/arnold_pipelines/megaplan/__init__.py",
+                    },
+                    "content_sha256": "b" * 64,
+                },
+                "runtime_identity_raw": {
+                    "runtime_id": f"runtime-{slug}",
+                    "epic_id": slug,
+                    "runtime_source": f"/workspace/runtime-candidates/{slug}",
+                    "runtime_revision": "a" * 40,
+                },
             }
             return subprocess.CompletedProcess([], 0, json.dumps(binding, sort_keys=True) + "\n", "")
         if "tmux new-session" in command or "session already running for this chain" in command:
@@ -3162,7 +3209,167 @@ def test_launch_epic_end_to_end_uploads_canonical_spec_and_tracks_watchdog(
     assert provider.launch_request["session"]
     assert provider.launch_request["envelope"]["launch_spec"]["operation_type"] == "megaplan_chain"
     assert provider.launch_request["envelope"]["launch_spec"]["expected_session_name"] == provider.launch_request["session"]
+    binding = provider.launch_request["envelope"]["launch_spec"]["metadata"]["runtime_binding"]
+    assert provider.runtime_probe_calls == 1
+    assert binding["manifest_path"].startswith("/workspace/.megaplan/")
+    assert len(binding["manifest_sha256"]) == 64
+    assert binding["manifest_identity"] == binding["manifest_sha256"]
+    assert binding["runtime_source"] == f"/workspace/runtime-candidates/demo"
     assert remote_spec in provider.remote_files
+
+
+def test_composed_cli_on_box_chain_drive_dispatches_once_with_seed_binding(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Exercise the real CLI request through OnBox into chain_drive.
+
+    Muse role/policy closure is already exhaustively pinned by
+    ``test_continuation_runtime_binding.py``; this composition test focuses
+    on carrying that launch's runtime seed through the direct dispatch path.
+    """
+    from arnold_pipelines.megaplan.cloud import chain_drive
+    from arnold_pipelines.megaplan.cloud.providers.on_box import OnBoxProvider
+
+    app = tmp_path / "app"
+    brief_dir = app / ".megaplan" / "initiatives" / "demo"
+    brief_dir.mkdir(parents=True)
+    subprocess.run(["git", "init"], cwd=app, check=True, capture_output=True, text=True)
+    (brief_dir / "NORTHSTAR.md").write_text("North star\n", encoding="utf-8")
+    (brief_dir / "m1.md").write_text("M1\n", encoding="utf-8")
+    materialized = _materialize_canonical_epic_input(
+        root=tmp_path, spec=_cloud_spec(), spec_or_dir=str(brief_dir)
+    )
+
+    runtime_root = (tmp_path / "runtime-candidate").resolve()
+    runtime_root.mkdir()
+    manifest_path = (tmp_path / "runtime-manifest.json").resolve()
+    runtime_revision = "a" * 40
+    manifest_payload = {
+        "schema": "1",
+        "runtime_id": "runtime-demo",
+        "generation": 1,
+        "epic_id": "demo",
+        "state": "active",
+        "owner": "test",
+        "base": {"ref": "main", "commit": runtime_revision, "editable_install_path": "", "venv_path": ""},
+        "epic": {
+            "branch": "epic/demo",
+            "worktree_path": str(runtime_root),
+            "venv_path": "",
+            "runtime_root": str(runtime_root),
+            "expected_head": runtime_revision,
+            "repair_bin": "",
+            "deps_lockfile": "",
+        },
+        "indirection": {
+            "host_path": "", "container_path": "", "mount_table": [],
+            "execution_namespace": "", "verified_head": "", "last_verified_at": "",
+            "attestation": {"module_file": "", "module_digest": "", "mount_id": ""},
+        },
+        "policy": {"policy_sha": "", "model_policy_sha": "", "sync_policy": ""},
+        "promotions": [],
+        "timestamps": {"created": "", "updated": "", "closed": ""},
+        "gc_policy": "",
+        "commands": [],
+    }
+    manifest_path.write_text(json.dumps(manifest_payload), encoding="utf-8")
+    manifest_sha = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
+    runtime_identity = chain_drive._canonical_runtime_identity(str(runtime_root), runtime_revision)
+    raw_identity = {
+        "runtime_id": "runtime-demo",
+        "epic_id": "demo",
+        "runtime_source": str(runtime_root),
+        "runtime_revision": runtime_revision,
+    }
+
+    class ComposedProvider(_LaunchEpicProvider):
+        def ssh_exec(self, command: str) -> subprocess.CompletedProcess[str]:
+            result = super().ssh_exec(command)
+            if "ARNOLD_RUNTIME_MANIFEST_DIR" not in command:
+                return result
+            payload = json.loads(result.stdout)
+            payload.update(
+                {
+                    "runtime_id": "runtime-demo",
+                    "runtime_src": str(runtime_root),
+                    "runtime_source": str(runtime_root),
+                    "runtime_revision": runtime_revision,
+                    "manifest_path": str(manifest_path),
+                    "manifest_sha256": manifest_sha,
+                    "manifest_identity": manifest_sha,
+                    "runtime_identity": runtime_identity,
+                    "runtime_identity_raw": raw_identity,
+                }
+            )
+            return subprocess.CompletedProcess([], 0, json.dumps(payload) + "\n", "")
+
+        def invoke_launch_engine(self, request: dict) -> dict:
+            self.launch_request = request
+            return OnBoxProvider.invoke_launch_engine(object.__new__(OnBoxProvider), request)
+
+    provider = ComposedProvider()
+    config = AgentBoxConfig(
+        workspace_root=tmp_path,
+        ops_store_root=tmp_path / "ops",
+        runs_root=tmp_path / "runs",
+        locks_root=tmp_path / "locks",
+    )
+    dispatches: list[list[str]] = []
+    monkeypatch.setattr("arnold_pipelines.megaplan.cloud.cli._ensure_repo_checkout", lambda *_a, **_k: None)
+    monkeypatch.setattr("arnold_pipelines.megaplan.cloud.cli._chain_runtime_manifest_dir", lambda: str(tmp_path))
+    monkeypatch.setattr("arnold_pipelines.megaplan.cloud.cli._chain_runtime_manifest_path", lambda _slug: str(manifest_path))
+    monkeypatch.setattr("arnold_pipelines.megaplan.cloud.cli._chain_runtime_worktree_path", lambda _slug: str(runtime_root))
+    monkeypatch.setattr(chain_drive, "load_agentbox_config", lambda: config)
+    monkeypatch.setenv("ARNOLD_RUNTIME_MANIFEST", "/ambient/contradictory.json")
+    monkeypatch.setattr(chain_drive, "run_tmux", lambda argv: dispatches.append(list(argv)))
+
+    def observe(session: str, expected_identity=None) -> SessionStatus:
+        assert expected_identity is not None
+        return SessionStatus(
+            session,
+            "running",
+            True,
+            operation_id=expected_identity["ARNOLD_LAUNCH_OPERATION_ID"],
+            request_id=expected_identity["ARNOLD_LAUNCH_REQUEST_ID"],
+            envelope_digest=expected_identity["ARNOLD_LAUNCH_ENVELOPE_DIGEST"],
+            process_session_identity=expected_identity["ARNOLD_LAUNCH_PROCESS_IDENTITY"],
+            identity_available=True,
+        )
+
+    monkeypatch.setattr(chain_drive, "inspect_session", observe)
+    assert _run_chain_wrapper(
+        tmp_path,
+        argparse.Namespace(
+            spec=str(materialized.spec_path),
+            idea_dir=str(materialized.project_root),
+            prepare_only=False,
+            allow_loose_chain_spec=False,
+            _canonicalized_epic=True,
+            _generated_canonical_files=[],
+            one=False,
+            no_git_refresh=True,
+        ),
+        _cloud_spec(),
+        provider,
+    ) == 0
+
+    assert len(dispatches) == 1
+    argv = dispatches[0]
+    assert argv.count(f"ARNOLD_RUNTIME_MANIFEST={manifest_path}") == 1
+    marker_path, marker = _parse_marker_write(argv[-1])
+    assert marker_path
+    marker_binding = marker["runtime_binding"]
+    assert marker["bootstrap_manifest_path"] == str(manifest_path)
+    assert marker["manifest_sha256"] == manifest_sha
+    assert marker["manifest_identity"] == manifest_sha
+    assert marker_binding["manifest_identity"] == manifest_sha
+    assert marker_binding["manifest_sha256"] == manifest_sha
+    assert marker_binding["current_identity"] == runtime_identity
+    assert marker_binding["raw_identity"] == raw_identity
+    envelope_binding = provider.launch_request["envelope"]["launch_spec"]["metadata"]["runtime_binding"]
+    assert envelope_binding["manifest_path"] == str(manifest_path)
+    assert envelope_binding["manifest_identity"] == manifest_sha
 
 
 def test_remote_chain_upload_path_anchors_relative_initiatives_to_workspace() -> None:
@@ -3928,7 +4135,7 @@ def test_cloud_chain_persists_failed_launch_outcome_when_engine_ref_is_not_adver
             provider,
         )
 
-    assert excinfo.value.code == "launch_unknown"
+    assert excinfo.value.code == "engine_ref_not_advertised"
     assert not provider.markers
 
 
@@ -4015,7 +4222,7 @@ def test_cloud_epic_chain_persists_failed_launch_outcome_when_engine_ref_is_not_
             provider,
         )
 
-    assert excinfo.value.code == "launch_unknown"
+    assert excinfo.value.code == "engine_ref_not_advertised"
     assert not provider.markers
 
 
