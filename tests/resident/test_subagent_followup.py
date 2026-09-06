@@ -10,6 +10,7 @@ import threading
 import pytest
 
 from arnold_pipelines.megaplan.resident import subagent
+from arnold_pipelines.megaplan import managed_agent
 from arnold_pipelines.megaplan.resident.agent_loop import (
     AgentRequest,
     FakeAgentRunner,
@@ -791,10 +792,18 @@ def test_live_followup_queues_exact_parent_interrupt_and_retry_is_idempotent(
     tmp_path: Path, monkeypatch, caller_provenance: dict
 ) -> None:
     target_path = _write_run(tmp_path, status="running", pid=111)
+    parent = json.loads(target_path.read_text())
+    parent["supervisor_start_ticks"] = "start-111"
+    target_path.write_text(json.dumps(parent))
     monkeypatch.setattr(
         subagent,
         "_pid_matches_manifest",
         lambda pid, path: pid == 111 and path == target_path,
+    )
+    monkeypatch.setattr(
+        subagent,
+        "_pid_start_ticks",
+        lambda pid: "start-111" if pid == 111 else "start-supervisor",
     )
     calls = 0
 
@@ -855,6 +864,9 @@ def test_continuation_interrupts_only_exact_active_supervisor_before_resume(
     tmp_path: Path, monkeypatch, caller_provenance: dict
 ) -> None:
     target_path = _write_run(tmp_path, status="running", pid=111)
+    parent = json.loads(target_path.read_text())
+    parent["worker_start_ticks"] = "start-111"
+    target_path.write_text(json.dumps(parent))
     monkeypatch.setattr(
         subagent,
         "_pid_matches_manifest",
@@ -867,27 +879,71 @@ def test_continuation_interrupts_only_exact_active_supervisor_before_resume(
         project_dir=tmp_path,
         workspace_root=None,
     )
-    signals: list[tuple[int, int]] = []
+    door_calls: list[dict[str, object]] = []
 
-    def fake_kill(pid: int, signum: int) -> None:
-        signals.append((pid, signum))
+    monkeypatch.setattr(managed_agent, "_pid_start_ticks", lambda _pid: "start-111")
+    monkeypatch.setattr(managed_agent.os, "getpgid", lambda _pid: 111)
+    def lowest_signal_boundary(pid: int, signum: int) -> None:
+        door_calls.append({"pid": pid, "signum": signum})
         parent = json.loads(target_path.read_text())
         parent["status"] = "interrupted"
         target_path.write_text(json.dumps(parent))
 
-    monkeypatch.setattr(subagent.os, "kill", fake_kill)
+    monkeypatch.setattr(managed_agent.os, "kill", lowest_signal_boundary)
     monkeypatch.setattr(subagent.time, "sleep", lambda _seconds: None)
     child_path = Path(result.continuation_manifest_path)
     child = json.loads(child_path.read_text())
 
     resolved, session_id = subagent._await_continuation_parent(child_path, child)
 
-    assert signals == [(111, subagent.signal.SIGINT)]
+    assert len(door_calls) == 1
+    assert door_calls[0]["pid"] == 111
+    assert door_calls[0]["signum"] == subagent.signal.SIGINT
     assert session_id == SESSION_ID
     assert resolved["continuation_wait"]["status"] == "parent_terminal"
     parent = json.loads(target_path.read_text())
     assert parent["followup_interrupt"]["evidence"] == (
         "exact_manifest_supervisor_identity_verified"
+    )
+
+
+def test_continuation_refuses_to_wait_when_supervisor_signal_is_refused(
+    tmp_path: Path, monkeypatch, caller_provenance: dict
+) -> None:
+    target_path = _write_run(tmp_path, status="running", pid=111)
+    parent = json.loads(target_path.read_text())
+    parent["worker_start_ticks"] = "start-111"
+    target_path.write_text(json.dumps(parent))
+    monkeypatch.setattr(
+        subagent,
+        "_pid_matches_manifest",
+        lambda pid, path: pid == 111 and path == target_path,
+    )
+    monkeypatch.setattr(subagent.subprocess, "Popen", lambda *a, **k: _Supervisor())
+    result = subagent.follow_up_managed_subagent(
+        run_id=TARGET_RUN_ID,
+        message="Use this message now.",
+        project_dir=tmp_path,
+        workspace_root=None,
+    )
+    calls: list[dict[str, object]] = []
+
+    def refuse_signal(path, manifest, pid, signum, **kwargs):
+        calls.append({"path": path, "manifest": manifest, "pid": pid, "signum": signum, **kwargs})
+        return False
+
+    monkeypatch.setattr(subagent, "signal_managed_process", refuse_signal)
+    monkeypatch.setattr(subagent.time, "sleep", lambda _seconds: pytest.fail("refused signal must not wait"))
+    child_path = Path(result.continuation_manifest_path)
+    child = json.loads(child_path.read_text())
+
+    with pytest.raises(subagent.SubagentFollowupError, match="signal was refused"):
+        subagent._await_continuation_parent(child_path, child)
+
+    assert len(calls) == 1
+    assert calls[0]["worker"] is False
+    assert json.loads(child_path.read_text())["continuation_wait"]["status"] == (
+        "pending_parent_terminal"
     )
 
 

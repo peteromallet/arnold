@@ -255,9 +255,9 @@ def test_generate_evidence_bundle_emits_checker_records_and_scoped_boundary_proo
             "canonical_source_sha256": _sha256(
                 ROOT / "arnold_pipelines/megaplan/workflows/workflow.pypeline"
             ),
-            "compiled_manifest_hash": "sha256:09255e89b8ec7f90612ccae382bf01b4ff39228c47f777c73f2d253042dcf362",
+            "compiled_manifest_hash": "sha256:962e57e7f8bb15761cc2a6a2e2bb64924eb6681bc86ed5fbf0de295df1ab5504",
             "compiled_topology_hash": "sha256:295e0ad28430ff465334a36c6ff5add25fba1d21d7ba2449da6b081150098260",
-            "fixture_manifest_hash": "sha256:09255e89b8ec7f90612ccae382bf01b4ff39228c47f777c73f2d253042dcf362",
+            "fixture_manifest_hash": "sha256:962e57e7f8bb15761cc2a6a2e2bb64924eb6681bc86ed5fbf0de295df1ab5504",
             "fixture_topology_hash": "sha256:295e0ad28430ff465334a36c6ff5add25fba1d21d7ba2449da6b081150098260",
             "compiled_node_count": 14,
             "compiled_route_count": 23,

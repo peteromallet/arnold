@@ -90,7 +90,7 @@ def test_adopt_rebinds_plan_project_dir_and_clears_active_step(tmp_path: Path) -
         "execute=codex:high",
     ]
     assert target_state["config"]["tier_models"]["execute"]["4"] == "codex:low"
-    assert target_state["config"]["tier_models"]["execute"]["1"].startswith("hermes:")
+    assert target_state["config"]["tier_models"]["execute"]["1"].startswith("omp:")
     assert "active_step" not in target_state
     assert target_state["latest_failure"] is None
     assert target_state["last_failure"] is None

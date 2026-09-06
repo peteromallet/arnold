@@ -764,7 +764,7 @@ def _cmd_graph(args: argparse.Namespace) -> int:
     return 0
 
 
-def build_parser(prog: str = "megaplan workflow") -> argparse.ArgumentParser:
+def build_parser(prog: str = "arnold workflow") -> argparse.ArgumentParser:
     """Return the ``<program> workflow`` argument parser."""
 
     parser = argparse.ArgumentParser(
@@ -862,7 +862,7 @@ def build_parser(prog: str = "megaplan workflow") -> argparse.ArgumentParser:
     return parser
 
 
-def main(argv: Sequence[str] | None = None, prog: str = "megaplan workflow") -> int:
+def main(argv: Sequence[str] | None = None, prog: str = "arnold workflow") -> int:
     parser = build_parser(prog)
 
     dispatch = {

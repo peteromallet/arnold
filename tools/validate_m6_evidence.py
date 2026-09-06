@@ -388,11 +388,23 @@ def _reverify_wbc_ancestry() -> dict[str, Any]:
 # ── Main validation ─────────────────────────────────────────────────────────
 
 
-def validate_all_evidence(strict: bool = False) -> dict[str, Any]:
+def _artifact_path(path: Path, input_root: Path) -> Path:
+    """Resolve a declared repository artifact under an explicit input root."""
+    try:
+        relative = path.resolve().relative_to(REPO_ROOT.resolve())
+    except ValueError:
+        relative = Path(path.name)
+    return (input_root / relative).resolve()
+
+
+def validate_all_evidence(
+    strict: bool = False, *, input_root: Path | None = None
+) -> dict[str, Any]:
     """Validate the complete M6 evidence bundle.
 
     Returns the comprehensive proof index dict.
     """
+    input_root = (input_root or REPO_ROOT).resolve()
     now = datetime.now(timezone.utc).isoformat()
     errors: list[str] = []
     warnings: list[str] = []
@@ -405,7 +417,9 @@ def validate_all_evidence(strict: bool = False) -> dict[str, Any]:
     wbc_ancestry = _reverify_wbc_ancestry()
 
     # ── Load prerequisite verification ───────────────────────────────────
-    prereq_data = _load_json(M6_ARTIFACTS["prerequisite_verification"]["path"])
+    prereq_data = _load_json(_artifact_path(
+        M6_ARTIFACTS["prerequisite_verification"]["path"], input_root
+    ))
     prereq_status = "UNKNOWN"
     prereq_summary: dict[str, Any] = {}
     if prereq_data is None:
@@ -437,7 +451,7 @@ def validate_all_evidence(strict: bool = False) -> dict[str, Any]:
 
     for key in sorted(M6_ARTIFACTS):
         spec = M6_ARTIFACTS[key]
-        path: Path = spec["path"]
+        path = _artifact_path(spec["path"], input_root)
         expected_schema = spec["expected_schema"]
         generator = spec["generator"]
         generator_args = spec.get("generator_args", [])
@@ -453,6 +467,8 @@ def validate_all_evidence(strict: bool = False) -> dict[str, Any]:
         # Extract stored schema and composite hash from JSON artifacts
         actual_schema = "UNKNOWN"
         stored_composite_hash = "UNKNOWN"
+        stored_byte_hash = "UNKNOWN"
+        recomputed_composite = None
         row_count: Any = "UNKNOWN"
         artifact_rows: list[dict[str, Any]] = []
 
@@ -461,6 +477,7 @@ def validate_all_evidence(strict: bool = False) -> dict[str, Any]:
             if data is not None:
                 actual_schema = data.get("schema", "UNKNOWN")
                 stored_composite_hash = data.get("composite_hash", "UNKNOWN")
+                stored_byte_hash = data.get("content_hash", data.get("content_hash_fresh", "UNKNOWN"))
                 artifact_rows = data.get("rows") or data.get("entries") or data.get("stages") or []
                 if isinstance(artifact_rows, list):
                     row_count = len(artifact_rows)
@@ -490,6 +507,12 @@ def validate_all_evidence(strict: bool = False) -> dict[str, Any]:
                             f"stored={stored_composite_hash[:16]}..., "
                             f"recomputed={recomputed_composite[:16]}..."
                         )
+                if stored_byte_hash not in ("UNKNOWN", fresh_hash):
+                    stale_hashes.append(key)
+                    errors.append(
+                        f"{key}: byte content hash is stale — stored={stored_byte_hash[:16]}..., "
+                        f"recomputed={fresh_hash[:16]}..."
+                    )
 
             else:
                 warnings.append(f"{key}: present but unparseable JSON")
@@ -503,11 +526,13 @@ def validate_all_evidence(strict: bool = False) -> dict[str, Any]:
         # Build proof index entry
         entry: dict[str, Any] = {
             "artifact_key": key,
-            "path": str(path),
+            "path": str(path.relative_to(input_root)),
             "expected_schema": expected_schema,
             "actual_schema": actual_schema,
             "content_hash_fresh": fresh_hash,
-            "content_hash_stored": stored_composite_hash if stored_composite_hash != "UNKNOWN" else fresh_hash,
+            "content_hash_stored": stored_byte_hash if stored_byte_hash != "UNKNOWN" else fresh_hash,
+            "composite_hash_stored": stored_composite_hash,
+            "composite_hash_recomputed": recomputed_composite or "UNKNOWN",
             "row_count": row_count,
             "present": present,
             "generator": generator,
@@ -544,7 +569,7 @@ def validate_all_evidence(strict: bool = False) -> dict[str, Any]:
     }
 
     # Collect global unknowns from all artifacts
-    global_unknowns = _collect_global_unknowns()
+    global_unknowns = _collect_global_unknowns(input_root=input_root)
     global_unknowns["repository_head"] = head
     global_unknowns["repository_head_valid"] = head_valid
     global_unknowns["wbc_ancestry_parent_match"] = wbc_ancestry.get("expected_parents_match", "UNKNOWN")
@@ -579,6 +604,7 @@ def validate_all_evidence(strict: bool = False) -> dict[str, Any]:
         "unexplained_row_artifacts": unexplained_row_artifacts,
         "entries": entries,
         "repository_head": head,
+        "input_root": str(input_root),
         "wbc_ancestry_result": wbc_ancestry,
         "unresolved_summary": unresolved_summary,
         "global_unknowns": global_unknowns,
@@ -615,12 +641,14 @@ def _recompute_composite_hash(rows: list[dict[str, Any]], data: dict[str, Any]) 
     return None
 
 
-def _collect_global_unknowns() -> dict[str, Any]:
+def _collect_global_unknowns(*, input_root: Path = REPO_ROOT) -> dict[str, Any]:
     """Collect global unknown baselines from all evidence artifacts."""
     unknowns: dict[str, Any] = {}
 
     # Prerequisite verification unknowns
-    prereq = _load_json(M6_ARTIFACTS["prerequisite_verification"]["path"])
+    prereq = _load_json(_artifact_path(
+        M6_ARTIFACTS["prerequisite_verification"]["path"], input_root
+    ))
     if prereq:
         unknowns["prerequisite_overall_status"] = prereq.get("overall_status", "UNKNOWN")
         unknowns["prerequisite_m5_bound_head_coherent"] = "UNKNOWN"
@@ -632,7 +660,9 @@ def _collect_global_unknowns() -> dict[str, Any]:
                     )
 
     # PC scope decision blocker
-    pc_scope = _load_json(M6_ARTIFACTS["pc_scope_decision"]["path"])
+    pc_scope = _load_json(_artifact_path(
+        M6_ARTIFACTS["pc_scope_decision"]["path"], input_root
+    ))
     if pc_scope:
         blockers = pc_scope.get("blockers", [])
         unknowns["pc_scope_blocker_count"] = len(blockers)
@@ -641,13 +671,17 @@ def _collect_global_unknowns() -> dict[str, Any]:
         )
 
     # Ownership decision blockers
-    ownership = _load_json(M6_ARTIFACTS["ownership_decision_record"]["path"])
+    ownership = _load_json(_artifact_path(
+        M6_ARTIFACTS["ownership_decision_record"]["path"], input_root
+    ))
     if ownership:
         blockers = ownership.get("global_blockers", [])
         unknowns["ownership_blocker_count"] = len(blockers)
 
     # Migration matrix classification gaps
-    matrix = _load_json(M6_ARTIFACTS["migration_matrix_reconciled"]["path"])
+    matrix = _load_json(_artifact_path(
+        M6_ARTIFACTS["migration_matrix_reconciled"]["path"], input_root
+    ))
     if matrix:
         rows = matrix.get("rows", [])
         unknowns["migration_matrix_total_rows"] = len(rows)
@@ -656,7 +690,9 @@ def _collect_global_unknowns() -> dict[str, Any]:
         )
 
     # Finding register coverage
-    findings = _load_json(M6_ARTIFACTS["finding_prevention_register"]["path"])
+    findings = _load_json(_artifact_path(
+        M6_ARTIFACTS["finding_prevention_register"]["path"], input_root
+    ))
     if findings:
         f_rows = findings.get("rows", [])
         unknowns["finding_register_total"] = len(f_rows)
@@ -722,6 +758,12 @@ def main() -> None:
         help=f"Output path for proof index (default: evidence/m6-proof-index.json)",
     )
     parser.add_argument(
+        "--input-root",
+        type=Path,
+        default=REPO_ROOT,
+        help="Repository/evidence root to read; output is independent and may be elsewhere.",
+    )
+    parser.add_argument(
         "--strict",
         action="store_true",
         help="Exit non-zero if validation fails (stale hashes, unexplained rows, etc.)",
@@ -741,7 +783,7 @@ def main() -> None:
     output_path: Path = args.output
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    proof_index = validate_all_evidence(strict=args.strict)
+    proof_index = validate_all_evidence(strict=args.strict, input_root=args.input_root)
 
     # Emit proof index
     with open(output_path, "w", encoding="utf-8") as fh:

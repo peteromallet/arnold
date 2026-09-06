@@ -128,12 +128,12 @@ def _scope_for(declaration: SubjectDeclaration, index: int, scopes: Any, context
     return _scope(value, declaration)
 
 
-def _binding(spec: CompletionSpec, declaration: SubjectDeclaration, scope: EvidenceScope, context: Mapping[str, Any]) -> CompletionBinding:
+def _binding(spec: CompletionSpec, declaration: SubjectDeclaration, scope: EvidenceScope, context: Mapping[str, Any], *, admission_source: str) -> CompletionBinding:
     fields = {key: context[key] for key in _BINDING_KEYS if key in context}
     fields.setdefault("semantic_path", f"{declaration.source.source_id}:{declaration.subject_instance_id}")
     return bind(
         spec, SubjectInstanceId(declaration.subject_instance_id, declaration.subject_kind),
-        admission_source=str(context.get("admission_source", "megaplan-shadow")),
+        admission_source=str(context.get("admission_source", admission_source)),
         bound_artifacts=context.get("bound_artifacts", ()), evidence_scope=scope, **fields,
     )
 
@@ -437,7 +437,7 @@ def _qualify_verdict(verdict: CompletionVerdict) -> CompletionVerdict:
     )
 
 
-def evaluate_shadow(inventory: tuple[SubjectDeclaration, ...], *, candidate_outcome: Any = "success", candidate_outcomes: Any = None, outcome: Any = None, primary_evidence: Any = (), scoped_primary_evidence: Any = None, evidence: Any = None, evidence_scope: Any = None, capture_receipts: Any = (), capture_receipt: Any = None, capture_evidence: Any = None, evidence_scopes: Any = None, scopes: Any = None, admission_inputs: Any = None, admission_context: Any = None, binding_inputs: Any = None, verifier_provenance: Any = None, verifier_provenances: Any = None, discovery_report: S2FGapReport | None = None, **kwargs: Any) -> ShadowEvaluation:
+def evaluate_shadow(inventory: tuple[SubjectDeclaration, ...], *, candidate_outcome: Any = "success", candidate_outcomes: Any = None, outcome: Any = None, primary_evidence: Any = (), scoped_primary_evidence: Any = None, evidence: Any = None, evidence_scope: Any = None, capture_receipts: Any = (), capture_receipt: Any = None, capture_evidence: Any = None, evidence_scopes: Any = None, scopes: Any = None, admission_inputs: Any = None, admission_context: Any = None, binding_inputs: Any = None, admission_source: str = "shadow", verifier_provenance: Any = None, verifier_provenances: Any = None, discovery_report: S2FGapReport | None = None, **kwargs: Any) -> ShadowEvaluation:
     """Evaluate each candidate over an exact C2 binding and preserve gaps."""
     if not inventory:
         gap = _discovery_gap(discovery_report)
@@ -460,7 +460,7 @@ def evaluate_shadow(inventory: tuple[SubjectDeclaration, ...], *, candidate_outc
     for index, (declaration, spec) in enumerate(zip(declarations, specs)):
         context = _context(input_context, declaration, index)
         scope = _scope_for(declaration, index, scope_input, context)
-        binding = _binding(spec, declaration, scope, context)
+        binding = _binding(spec, declaration, scope, context, admission_source=admission_source)
         primary = _records(primary_input, declaration, index, binding, scope, capture=False)
         captures = _records(capture_input, declaration, index, binding, scope, capture=True)
         selected = _outcome(outcome if outcome is not None else _select(candidate_input, declaration, index))

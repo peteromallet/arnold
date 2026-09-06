@@ -18,6 +18,10 @@ def _write_execute_authority(plan_dir: Path, *, task_id: str = "legacy-task") ->
         json.dumps({"tasks": [{"id": task_id, "status": "waived"}]}),
         encoding="utf-8",
     )
+    (plan_dir / "phase_result.json").write_text(
+        json.dumps({"phase": "execute", "exit_kind": "success"}),
+        encoding="utf-8",
+    )
 
 
 def test_pre_m6_planning_name_alias_resolves_registry_pipeline() -> None:

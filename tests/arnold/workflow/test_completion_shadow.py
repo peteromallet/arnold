@@ -399,7 +399,8 @@ class TestGenerateShadowSpecsFromS2F:
             DEFAULT_S2F_SCAN_DIRS,
             S2F_SCHEMA_MARKERS,
         )
-        assert ".megaplan/plans" in DEFAULT_S2F_SCAN_DIRS
+        assert "plans" in DEFAULT_S2F_SCAN_DIRS
+        assert "plans/*" in DEFAULT_S2F_SCAN_DIRS
         assert "GO-FORMAT" in S2F_SCHEMA_MARKERS
         assert ".pype" in S2F_SCHEMA_MARKERS
         assert "boundary-registry" in S2F_SCHEMA_MARKERS

@@ -1,0 +1,169 @@
+base_branch: integration/goal-maintenance-runtime-20260820
+
+anchors:
+  north_star: NORTHSTAR.md
+
+milestones:
+  - label: p0-mrc-intake-crosswalk
+    idea: .megaplan/initiatives/native-build-forward/briefs/p0-mrc-intake-crosswalk.md
+    profile: partnered-5
+    merge_policy: auto
+
+  - label: p1-custody-m11-admission
+    idea: .megaplan/initiatives/native-build-forward/briefs/p1-custody-m11-admission.md
+    profile: partnered-5
+    merge_policy: auto
+    depends_on:
+      - p0-mrc-intake-crosswalk
+
+  - label: p2-milestone-gate-bootstrap
+    idea: .megaplan/initiatives/native-build-forward/briefs/p2-milestone-gate-bootstrap.md
+    profile: partnered-5
+    merge_policy: auto
+    depends_on:
+      - p1-custody-m11-admission
+
+  - label: native-s1-baseline
+    idea: .megaplan/initiatives/native-build-forward/briefs/native-s1-baseline.md
+    profile: partnered-5
+    merge_policy: auto
+    depends_on:
+      - p2-milestone-gate-bootstrap
+
+  - label: native-s2f-pype-format
+    idea: .megaplan/initiatives/native-build-forward/briefs/native-s2f-pype-format.md
+    profile: partnered-5
+    merge_policy: auto
+    depends_on:
+      - native-s1-baseline
+
+  - label: native-c1-completion-contract
+    idea: .megaplan/initiatives/native-build-forward/briefs/native-c1-completion-contract.md
+    profile: partnered-5
+    merge_policy: auto
+    depends_on:
+      - native-s2f-pype-format
+
+  - label: native-c2-completion-evaluation
+    idea: .megaplan/initiatives/native-build-forward/briefs/native-c2-completion-evaluation.md
+    profile: partnered-5
+    merge_policy: auto
+    depends_on:
+      - native-c1-completion-contract
+
+  - label: native-s2r-durable-primitives
+    idea: .megaplan/initiatives/native-build-forward/briefs/native-s2r-durable-primitives.md
+    profile: partnered-5
+    merge_policy: auto
+    depends_on:
+      - native-c2-completion-evaluation
+
+  - label: native-s3a-plan-quality-cutover
+    idea: .megaplan/initiatives/native-build-forward/briefs/native-s3a-plan-quality-cutover.md
+    profile: partnered-5
+    merge_policy: auto
+    depends_on:
+      - native-s2r-durable-primitives
+
+  - label: native-s3b-gate-revise-cutover
+    idea: .megaplan/initiatives/native-build-forward/briefs/native-s3b-gate-revise-cutover.md
+    profile: partnered-5
+    merge_policy: auto
+    depends_on:
+      - native-s3a-plan-quality-cutover
+
+  - label: native-s4-tiebreaker-finalize-reentry
+    idea: .megaplan/initiatives/native-build-forward/briefs/native-s4-tiebreaker-finalize-reentry.md
+    profile: partnered-5
+    merge_policy: auto
+    depends_on:
+      - native-s3b-gate-revise-cutover
+
+  - label: native-s5a-delivery-shadow
+    idea: .megaplan/initiatives/native-build-forward/briefs/native-s5a-delivery-shadow.md
+    profile: partnered-5
+    merge_policy: auto
+    depends_on:
+      - native-s4-tiebreaker-finalize-reentry
+
+  - label: native-s5b-live-delivery
+    idea: .megaplan/initiatives/native-build-forward/briefs/native-s5b-live-delivery.md
+    profile: partnered-5
+    merge_policy: auto
+    depends_on:
+      - native-s5a-delivery-shadow
+
+  - label: native-s6-control-plane
+    idea: .megaplan/initiatives/native-build-forward/briefs/native-s6-control-plane.md
+    profile: partnered-5
+    merge_policy: auto
+    depends_on:
+      - native-s5b-live-delivery
+
+  - label: native-s7-conformance
+    idea: .megaplan/initiatives/native-build-forward/briefs/native-s7-conformance.md
+    profile: partnered-5
+    merge_policy: auto
+    depends_on:
+      - native-s6-control-plane
+
+  - label: platform-s1-inventory
+    idea: .megaplan/initiatives/native-build-forward/briefs/platform-s1-inventory.md
+    profile: partnered-5
+    merge_policy: auto
+    depends_on:
+      - native-s7-conformance
+
+  - label: platform-s2a-runtime-authority
+    idea: .megaplan/initiatives/native-build-forward/briefs/platform-s2a-runtime-authority.md
+    profile: partnered-5
+    merge_policy: auto
+    depends_on:
+      - platform-s1-inventory
+
+  - label: platform-s2b-authoring-core
+    idea: .megaplan/initiatives/native-build-forward/briefs/platform-s2b-authoring-core.md
+    profile: partnered-5
+    merge_policy: auto
+    depends_on:
+      - platform-s2a-runtime-authority
+
+  - label: platform-s3-developer-tooling
+    idea: .megaplan/initiatives/native-build-forward/briefs/platform-s3-developer-tooling.md
+    profile: partnered-5
+    merge_policy: auto
+    depends_on:
+      - platform-s2b-authoring-core
+
+  - label: platform-s4-recomposition
+    idea: .megaplan/initiatives/native-build-forward/briefs/platform-s4-recomposition.md
+    profile: partnered-5
+    merge_policy: auto
+    depends_on:
+      - platform-s3-developer-tooling
+
+  - label: platform-s5-second-consumer
+    idea: .megaplan/initiatives/native-build-forward/briefs/platform-s5-second-consumer.md
+    profile: partnered-5
+    merge_policy: auto
+    depends_on:
+      - platform-s4-recomposition
+
+  - label: platform-s6-certification
+    idea: .megaplan/initiatives/native-build-forward/briefs/platform-s6-certification.md
+    profile: partnered-5
+    merge_policy: auto
+    depends_on:
+      - platform-s5-second-consumer
+
+on_failure:
+  abort: stop_chain
+on_escalate:
+  abort: stop_chain
+
+merge_policy: auto
+
+driver:
+  auto_approve: true
+  max_iterations: 90
+  poll_sleep: 8.0

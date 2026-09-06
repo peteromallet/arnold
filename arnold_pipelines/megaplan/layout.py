@@ -14,6 +14,9 @@ from arnold_pipelines.megaplan.artifacts import slugify as artifact_slugify
 
 LAYOUT_POLICY_VERSION = "megaplan-initiatives-v1"
 INITIATIVES_DIR = Path(".megaplan") / "initiatives"
+COLLECTION_DIR = Path(".megaplan") / "collection"
+COLLECTION_AUTHORITY_PATH = COLLECTION_DIR / "authority.json"
+COLLECTION_CHAIN_PATH = COLLECTION_DIR / "chain.yaml"
 LEGACY_BRIEFS_DIR = Path(".megaplan") / "briefs"
 RUNTIME_PLANS_DIR = Path(".megaplan") / "plans"
 RUNTIME_EPICS_DIR = Path(".megaplan") / "epics"
@@ -166,6 +169,12 @@ def initiatives_dir(repo_root: str | Path) -> Path:
     return path
 
 
+def collection_dir(repo_root: str | Path) -> Path:
+    """Return the ownerless, placement-only collection namespace."""
+
+    return Path(repo_root) / COLLECTION_DIR
+
+
 def initiative_root(repo_root: str | Path, slug: str) -> Path:
     return initiatives_dir(repo_root) / slugify_initiative(slug)
 
@@ -238,6 +247,16 @@ def is_canonical_chain_spec(path: str | Path, repo_root: str | Path) -> bool:
         and parts[3] == "chain.yaml"
         and bool(parts[2])
     )
+
+
+def is_collection_chain_spec(path: str | Path, repo_root: str | Path) -> bool:
+    """Recognize the preserved collection chain without granting launch authority."""
+
+    try:
+        rel = Path(path).expanduser().resolve().relative_to(Path(repo_root).expanduser().resolve())
+    except ValueError:
+        return False
+    return rel == COLLECTION_CHAIN_PATH
 
 
 def is_legacy_briefs_chain_spec(path: str | Path, repo_root: str | Path) -> bool:

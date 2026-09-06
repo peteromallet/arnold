@@ -10,10 +10,12 @@ import sys
 from pathlib import Path
 
 import pytest
+from packaging.markers import Marker
 
 from arnold_pipelines.megaplan.cloud.install_sync import (
     EditableInstallRetiredError,
     GenerationError,
+    _marker_aware_frozen_requirements,
     apply_install_sync,
     compute_venv_digest,
     ensure_dependency_generation,
@@ -131,6 +133,100 @@ def test_frozen_requirements_only_registry_sources() -> None:
     )
     assert frozen_requirements(lock) == ["requests==2.31.0", "widget==3.0.0"]
     assert frozen_path_sources(lock) == ["vendor/local-a", "vendor/local-b"]
+
+
+def test_marker_aware_frozen_requirements_preserves_transitive_lock_marker() -> None:
+    lock = (
+        'version = 1\n'
+        '[[package]]\nname = "demo"\nversion = "0.1.0"\n'
+        'source = { editable = "." }\n'
+        'dependencies = [{ name = "parent" }]\n\n'
+        '[[package]]\nname = "parent"\nversion = "1.0.0"\n'
+        'source = { registry = "https://pypi.org/simple" }\n'
+        'dependencies = [{ name = "conditional", marker = "python_full_version >= \'3.13\'" }]\n\n'
+        '[[package]]\nname = "conditional"\nversion = "2.0.0"\n'
+        'source = { registry = "https://pypi.org/simple" }\n'
+        '\n[[package]]\nname = "orphan"\nversion = "9.9.9"\n'
+        'source = { registry = "https://pypi.org/simple" }\n'
+    )
+    requirements = _marker_aware_frozen_requirements(lock)
+    assert "parent==1.0.0" in requirements
+    assert "conditional==2.0.0; python_full_version >= '3.13'" in requirements
+    assert not any(requirement.startswith("orphan==") for requirement in requirements)
+
+
+def test_marker_graph_follows_only_selected_dependency_extras() -> None:
+    lock = (
+        'version = 1\n'
+        '[[package]]\nname = "demo"\nversion = "0.1.0"\n'
+        'source = { editable = "." }\n'
+        'dependencies = [{ name = "feature", extra = ["ops"] }]\n\n'
+        'optional-dependencies = { unused = [{ name = "unselected-child" }] }\n\n'
+        '[[package]]\nname = "feature"\nversion = "1.0.0"\n'
+        'source = { registry = "https://pypi.org/simple" }\n'
+        'optional-dependencies = { ops = [{ name = "feature-child" }] }\n\n'
+        '[[package]]\nname = "feature-child"\nversion = "2.0.0"\n'
+        'source = { registry = "https://pypi.org/simple" }\n\n'
+        '[[package]]\nname = "unselected-child"\nversion = "3.0.0"\n'
+        'source = { registry = "https://pypi.org/simple" }\n'
+    )
+    requirements = _marker_aware_frozen_requirements(lock)
+    assert "feature==1.0.0" in requirements
+    assert "feature-child==2.0.0" in requirements
+    assert not any(
+        requirement.startswith("unselected-child==") for requirement in requirements
+    )
+
+
+@pytest.mark.parametrize(
+    ("lock_fragment", "message"),
+    [
+        (
+            'dependencies = [{ name = "missing" }]\n',
+            "requires missing package",
+        ),
+        (
+            'dependencies = [{ name = "duplicate" }]\n\n'
+            '[[package]]\nname = "duplicate"\nversion = "1.0.0"\n'
+            'source = { registry = "https://pypi.org/simple" }\n\n'
+            '[[package]]\nname = "duplicate"\nversion = "2.0.0"\n'
+            'source = { registry = "https://pypi.org/simple" }\n',
+            "is ambiguous",
+        ),
+    ],
+)
+def test_marker_graph_rejects_missing_or_ambiguous_required_edges(
+    lock_fragment: str, message: str
+) -> None:
+    lock = (
+        'version = 1\n'
+        '[[package]]\nname = "demo"\nversion = "0.1.0"\n'
+        'source = { editable = "." }\n'
+        + lock_fragment
+    )
+    with pytest.raises(GenerationError, match=message):
+        _marker_aware_frozen_requirements(lock)
+
+
+def test_marker_graph_composes_markers_and_audioop_is_python_version_aware() -> None:
+    lock = (
+        'version = 1\n'
+        '[[package]]\nname = "demo"\nversion = "0.1.0"\n'
+        'source = { editable = "." }\n'
+        'dependencies = [{ name = "discord-py", marker = "sys_platform == \'darwin\'" }]\n\n'
+        '[[package]]\nname = "discord-py"\nversion = "2.7.1"\n'
+        'source = { registry = "https://pypi.org/simple" }\n'
+        'dependencies = [{ name = "audioop-lts", marker = "python_full_version >= \'3.13\'" }]\n\n'
+        '[[package]]\nname = "audioop-lts"\nversion = "0.2.2"\n'
+        'source = { registry = "https://pypi.org/simple" }\n'
+    )
+    requirements = _marker_aware_frozen_requirements(lock)
+    audioop = next(requirement for requirement in requirements if requirement.startswith("audioop-lts=="))
+    expression = audioop.split("; ", 1)[1]
+    marker = Marker(expression)
+    assert marker.evaluate({"python_full_version": "3.11.11", "sys_platform": "darwin"}) is False
+    assert marker.evaluate({"python_full_version": "3.13.3", "sys_platform": "darwin"}) is True
+    assert expression == "(sys_platform == 'darwin') and (python_full_version >= '3.13')"
 
 
 def test_path_only_generation_keeps_pip_and_passes_directory_to_install(

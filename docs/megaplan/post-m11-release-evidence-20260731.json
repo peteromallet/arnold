@@ -456,20 +456,482 @@
   ],
   "canonical_artifact_moves": [
     {
+      "kind": "promote_preserving_source",
       "from": ".megaplan/initiatives/megaplan-native-parity-corrective/GOLDEN_TRACE_CONTRACT.md",
-      "to": ".megaplan/initiatives/megaplan-native-parity-corrective/validation/GOLDEN_TRACE_CONTRACT.md"
+      "to": ".megaplan/initiatives/megaplan-native-parity-corrective/validation/GOLDEN_TRACE_CONTRACT.md",
+      "source_revision": "2fa0982dcc408b1ec8836aad9c2d840a6d05558e",
+      "destination_revision": "2fa0982dcc408b1ec8836aad9c2d840a6d05558e",
+      "source_sha256": "3744ad93c28e86328e435533d120ce0c14d9ddc53b9e9a55a1979d7d824ee840",
+      "destination_sha256": "3744ad93c28e86328e435533d120ce0c14d9ddc53b9e9a55a1979d7d824ee840"
     },
     {
+      "kind": "promote_preserving_source",
       "from": ".megaplan/initiatives/megaplan-north-star-sense-checks-revise-design/docs/research.md",
-      "to": ".megaplan/initiatives/megaplan-north-star-sense-checks-revise-design/research/research.md"
+      "to": ".megaplan/initiatives/megaplan-north-star-sense-checks-revise-design/research/research.md",
+      "source_revision": "2fa0982dcc408b1ec8836aad9c2d840a6d05558e",
+      "destination_revision": "2fa0982dcc408b1ec8836aad9c2d840a6d05558e",
+      "source_sha256": "3f9fb440adb783dd072c39dba98f8fe8c9c003b4d63e6e8b15f3449279bf418d",
+      "destination_sha256": "3f9fb440adb783dd072c39dba98f8fe8c9c003b4d63e6e8b15f3449279bf418d"
     },
     {
+      "kind": "promote_preserving_source",
       "from": ".megaplan/initiatives/native-workflow-platformization/PLATFORM_CONTRACT.md",
-      "to": ".megaplan/initiatives/native-workflow-platformization/decisions/PLATFORM_CONTRACT.md"
+      "to": ".megaplan/initiatives/native-workflow-platformization/decisions/PLATFORM_CONTRACT.md",
+      "source_revision": "2fa0982dcc408b1ec8836aad9c2d840a6d05558e",
+      "destination_revision": "2460e24335f30c6856464f9a677782cd15ddedda",
+      "source_sha256": "b0989eea80f9942025e9ddc6b368847f1a8e14727f8b91f12bcf63a654cc360e",
+      "destination_sha256": "e86fa4bd0dbbc3cbdd23de4d5cec965e326d908161a811ffce73c435dc4a7494",
+      "supersession": {
+        "relation": "canonical_destination_supersedes_historical_source",
+        "evidence": {
+          "commit": "2460e24335f30c6856464f9a677782cd15ddedda",
+          "source": ".megaplan/initiatives/native-workflow-platformization/PLATFORM_CONTRACT.md",
+          "destination": ".megaplan/initiatives/native-workflow-platformization/decisions/PLATFORM_CONTRACT.md"
+        }
+      }
     },
     {
+      "kind": "promote_preserving_source",
       "from": ".megaplan/initiatives/standardized-completion-specifications/SUPERSESSION_CROSSWALK.yaml",
-      "to": ".megaplan/initiatives/standardized-completion-specifications/evidence/SUPERSESSION_CROSSWALK.yaml"
+      "to": ".megaplan/initiatives/standardized-completion-specifications/evidence/SUPERSESSION_CROSSWALK.yaml",
+      "source_revision": "2fa0982dcc408b1ec8836aad9c2d840a6d05558e",
+      "destination_revision": "2fa0982dcc408b1ec8836aad9c2d840a6d05558e",
+      "source_sha256": "4402af2915b53ba8d07495919d75d3df7f5240286a0df4ff3aed525fadb39902",
+      "destination_sha256": "4402af2915b53ba8d07495919d75d3df7f5240286a0df4ff3aed525fadb39902"
+    },
+  {
+    "kind": "promote_preserving_source",
+    "from": ".megaplan/initiatives/native-build-forward-continuation-20260902-r2/HANDOFF.md",
+    "to": ".megaplan/initiatives/native-build-forward-continuation-20260902-r2/handoff/HANDOFF.md",
+    "source_revision": "4023fdd9b2027561e221dac98e234b59289e0ca6",
+    "source_sha256": "42d63815f418e176413332bd01405255675221dba40d856058df7a22b3a359b5",
+    "destination_sha256": "42d63815f418e176413332bd01405255675221dba40d856058df7a22b3a359b5",
+    "authority": {
+      "path": ".megaplan/initiatives/native-build-forward-continuation-20260902-r2/chain.yaml",
+      "sha256": "6e5ae55ca39e10ee115192ee2d4ed93915baf0502e3a9bb60b26105e91b98bf6"
+    }
+  },
+  {
+    "kind": "promote_preserving_source",
+    "from": ".megaplan/initiatives/native-build-forward-continuation-20260902-r2/provenance.json",
+    "to": ".megaplan/initiatives/native-build-forward-continuation-20260902-r2/evidence/provenance.json",
+    "source_revision": "4023fdd9b2027561e221dac98e234b59289e0ca6",
+    "source_sha256": "b3037a1eeb06531b76f1765d8e90d4db61ba8bec15a841cec3430915f9c53f94",
+    "destination_sha256": "b3037a1eeb06531b76f1765d8e90d4db61ba8bec15a841cec3430915f9c53f94",
+    "authority": {
+      "path": ".megaplan/initiatives/native-build-forward-continuation-20260902-r2/chain.yaml",
+      "sha256": "6e5ae55ca39e10ee115192ee2d4ed93915baf0502e3a9bb60b26105e91b98bf6"
+    }
+  },
+  {
+    "kind": "promote_preserving_source",
+    "from": ".megaplan/initiatives/native-build-forward-continuation-20260902-r3/HANDOFF.md",
+    "to": ".megaplan/initiatives/native-build-forward-continuation-20260902-r3/handoff/HANDOFF.md",
+    "source_revision": "4023fdd9b2027561e221dac98e234b59289e0ca6",
+    "source_sha256": "02ba4babbd22d171d2863a81b124334f7475cb3005950de8eb4b01a4e1672b19",
+    "destination_sha256": "02ba4babbd22d171d2863a81b124334f7475cb3005950de8eb4b01a4e1672b19",
+    "authority": {
+      "path": ".megaplan/initiatives/native-build-forward-continuation-20260902-r3/chain.yaml",
+      "sha256": "cc3f1dc477114fc0fcdf32bd76974a4230ba18fef1bc1bf02274b6af068bec8c"
+    }
+  },
+  {
+    "kind": "promote_preserving_source",
+    "from": ".megaplan/initiatives/native-build-forward-continuation-20260902-r3/provenance.json",
+    "to": ".megaplan/initiatives/native-build-forward-continuation-20260902-r3/evidence/provenance.json",
+    "source_revision": "4023fdd9b2027561e221dac98e234b59289e0ca6",
+    "source_sha256": "59e3510441aab6b5bf8dcd802a8607ba131aed6527ec544f106d82eb84d1e9c0",
+    "destination_sha256": "59e3510441aab6b5bf8dcd802a8607ba131aed6527ec544f106d82eb84d1e9c0",
+    "authority": {
+      "path": ".megaplan/initiatives/native-build-forward-continuation-20260902-r3/chain.yaml",
+      "sha256": "cc3f1dc477114fc0fcdf32bd76974a4230ba18fef1bc1bf02274b6af068bec8c"
+    }
+  },
+  {
+    "kind": "promote_preserving_source",
+    "from": ".megaplan/initiatives/native-build-forward-continuation-20260902-r4/HANDOFF.md",
+    "to": ".megaplan/initiatives/native-build-forward-continuation-20260902-r4/handoff/HANDOFF.md",
+    "source_revision": "4023fdd9b2027561e221dac98e234b59289e0ca6",
+    "source_sha256": "860d69c11d4009038d8702fac6f48e26d2be00f24cd872e5c55c34b60eb23ade",
+    "destination_sha256": "860d69c11d4009038d8702fac6f48e26d2be00f24cd872e5c55c34b60eb23ade",
+    "authority": {
+      "path": ".megaplan/initiatives/native-build-forward-continuation-20260902-r4/chain.yaml",
+      "sha256": "1f5cbea7049581212c1e4d9043f99f24ea83f35a69e73a61a609cfa7c5c309b6"
+    }
+  },
+  {
+    "kind": "promote_preserving_source",
+    "from": ".megaplan/initiatives/native-build-forward-continuation-20260902-r4/provenance.json",
+    "to": ".megaplan/initiatives/native-build-forward-continuation-20260902-r4/evidence/provenance.json",
+    "source_revision": "4023fdd9b2027561e221dac98e234b59289e0ca6",
+    "source_sha256": "1a633c189080dae5acf11d2e5f676fb1a0fa1d59d9192ad23e4ad3a6e6d1ce2b",
+    "destination_sha256": "1a633c189080dae5acf11d2e5f676fb1a0fa1d59d9192ad23e4ad3a6e6d1ce2b",
+    "authority": {
+      "path": ".megaplan/initiatives/native-build-forward-continuation-20260902-r4/chain.yaml",
+      "sha256": "1f5cbea7049581212c1e4d9043f99f24ea83f35a69e73a61a609cfa7c5c309b6"
+    }
+  },
+  {
+    "kind": "promote_preserving_source",
+    "from": ".megaplan/initiatives/native-build-forward-continuation-20260903-r5/HANDOFF.md",
+    "to": ".megaplan/initiatives/native-build-forward-continuation-20260903-r5/handoff/HANDOFF.md",
+    "source_revision": "4023fdd9b2027561e221dac98e234b59289e0ca6",
+    "source_sha256": "88fb5d7de9c8f42ba6eeac78a52fcc53c34d01208694e3d6669d49dccb55023f",
+    "destination_sha256": "88fb5d7de9c8f42ba6eeac78a52fcc53c34d01208694e3d6669d49dccb55023f",
+    "authority": {
+      "path": ".megaplan/initiatives/native-build-forward-continuation-20260903-r5/chain.yaml",
+      "sha256": "aee169ee93785d59f8befdc59129bbec0d2886fdb979ec7c14682ea42248f2e9"
+    }
+  },
+  {
+    "kind": "promote_preserving_source",
+    "from": ".megaplan/initiatives/native-build-forward-continuation-20260903-r5/provenance.json",
+    "to": ".megaplan/initiatives/native-build-forward-continuation-20260903-r5/evidence/provenance.json",
+    "source_revision": "4023fdd9b2027561e221dac98e234b59289e0ca6",
+    "source_sha256": "b671ca89edf65324d2e8fa9833580ad4eae7aa5a1465a130b0c4ee31abb0977d",
+    "destination_sha256": "b671ca89edf65324d2e8fa9833580ad4eae7aa5a1465a130b0c4ee31abb0977d",
+    "authority": {
+      "path": ".megaplan/initiatives/native-build-forward-continuation-20260903-r5/chain.yaml",
+      "sha256": "aee169ee93785d59f8befdc59129bbec0d2886fdb979ec7c14682ea42248f2e9"
+    }
+  },
+  {
+    "kind": "promote_preserving_source",
+    "from": ".megaplan/initiatives/native-build-forward-continuation-20260903-r6/HANDOFF.md",
+    "to": ".megaplan/initiatives/native-build-forward-continuation-20260903-r6/handoff/HANDOFF.md",
+    "source_revision": "4023fdd9b2027561e221dac98e234b59289e0ca6",
+    "source_sha256": "8408d1b34640e4e148627c5e34ea1c2228749b880a298a3e7331e9db4d729f36",
+    "destination_sha256": "8408d1b34640e4e148627c5e34ea1c2228749b880a298a3e7331e9db4d729f36",
+    "authority": {
+      "path": ".megaplan/initiatives/native-build-forward-continuation-20260903-r6/chain.yaml",
+      "sha256": "c8b4127aed7488e3e6ccb1bdccc9f5525bd8ab16d68ef07c90ac1c0a138f6755"
+    }
+  },
+  {
+    "kind": "promote_preserving_source",
+    "from": ".megaplan/initiatives/native-build-forward-continuation-20260903-r6/provenance.json",
+    "to": ".megaplan/initiatives/native-build-forward-continuation-20260903-r6/evidence/provenance.json",
+    "source_revision": "4023fdd9b2027561e221dac98e234b59289e0ca6",
+    "source_sha256": "00ea73abf99c69f5bfb33fb9da3f84c68c443a102b1695f1e538e5b8c7fab7f0",
+    "destination_sha256": "00ea73abf99c69f5bfb33fb9da3f84c68c443a102b1695f1e538e5b8c7fab7f0",
+    "authority": {
+      "path": ".megaplan/initiatives/native-build-forward-continuation-20260903-r6/chain.yaml",
+      "sha256": "c8b4127aed7488e3e6ccb1bdccc9f5525bd8ab16d68ef07c90ac1c0a138f6755"
+    }
+  },
+  {
+    "kind": "promote_preserving_source",
+    "from": ".megaplan/initiatives/native-build-forward-continuation-20260903-r7/HANDOFF.md",
+    "to": ".megaplan/initiatives/native-build-forward-continuation-20260903-r7/handoff/HANDOFF.md",
+    "source_revision": "4023fdd9b2027561e221dac98e234b59289e0ca6",
+    "source_sha256": "80fcf0f43e8e0c0e55ce307e974cb3102d87fe07bf0cd3f7c5d228ab49a78d54",
+    "destination_sha256": "80fcf0f43e8e0c0e55ce307e974cb3102d87fe07bf0cd3f7c5d228ab49a78d54",
+    "authority": {
+      "path": ".megaplan/initiatives/native-build-forward-continuation-20260903-r7/chain.yaml",
+      "sha256": "d06ddd5dd6ce2fd315dafbd43431341d4836658d7b5b3cb200b63dc0c7d9cd1b"
+    }
+  },
+  {
+    "kind": "promote_preserving_source",
+    "from": ".megaplan/initiatives/native-build-forward-continuation-20260903-r7/provenance.json",
+    "to": ".megaplan/initiatives/native-build-forward-continuation-20260903-r7/evidence/provenance.json",
+    "source_revision": "4023fdd9b2027561e221dac98e234b59289e0ca6",
+    "source_sha256": "8c1d1b58f9f09dc99074120f65165fbeab873eaccf690e5f35d2bc83c5f96804",
+    "destination_sha256": "8c1d1b58f9f09dc99074120f65165fbeab873eaccf690e5f35d2bc83c5f96804",
+    "authority": {
+      "path": ".megaplan/initiatives/native-build-forward-continuation-20260903-r7/chain.yaml",
+      "sha256": "d06ddd5dd6ce2fd315dafbd43431341d4836658d7b5b3cb200b63dc0c7d9cd1b"
+    }
+  },
+  {
+    "kind": "promote_preserving_source",
+    "from": ".megaplan/initiatives/native-build-forward-continuation-20260903-r8/HANDOFF.md",
+    "to": ".megaplan/initiatives/native-build-forward-continuation-20260903-r8/handoff/HANDOFF.md",
+    "source_revision": "4023fdd9b2027561e221dac98e234b59289e0ca6",
+    "source_sha256": "04fcbe94a602914f41e15e0538e59f74ddb7ac4a1f8964893216a0ee998d6d16",
+    "destination_sha256": "04fcbe94a602914f41e15e0538e59f74ddb7ac4a1f8964893216a0ee998d6d16",
+    "authority": {
+      "path": ".megaplan/initiatives/native-build-forward-continuation-20260903-r8/chain.yaml",
+      "sha256": "d804e73d3015643de32e4b5ed309f541186ab71903b0bd0cf28509e538317c68"
+    }
+  },
+  {
+    "kind": "promote_preserving_source",
+    "from": ".megaplan/initiatives/native-build-forward-continuation-20260903-r8/provenance.json",
+    "to": ".megaplan/initiatives/native-build-forward-continuation-20260903-r8/evidence/provenance.json",
+    "source_revision": "4023fdd9b2027561e221dac98e234b59289e0ca6",
+    "source_sha256": "1a189faf2605cdee52a909a35b2c90dd5c5d095c834af9beaadf8382f7c74f39",
+    "destination_sha256": "1a189faf2605cdee52a909a35b2c90dd5c5d095c834af9beaadf8382f7c74f39",
+    "authority": {
+      "path": ".megaplan/initiatives/native-build-forward-continuation-20260903-r8/chain.yaml",
+      "sha256": "d804e73d3015643de32e4b5ed309f541186ab71903b0bd0cf28509e538317c68"
+    }
+  },
+  {
+    "kind": "promote_preserving_source",
+    "from": ".megaplan/initiatives/native-build-forward-continuation-20260903-r9/HANDOFF.md",
+    "to": ".megaplan/initiatives/native-build-forward-continuation-20260903-r9/handoff/HANDOFF.md",
+    "source_revision": "4023fdd9b2027561e221dac98e234b59289e0ca6",
+    "source_sha256": "1b7818445fbb26120cea541b46d9e3db5ff1693ea18caac9f7532c8841d40c36",
+    "destination_sha256": "1b7818445fbb26120cea541b46d9e3db5ff1693ea18caac9f7532c8841d40c36",
+    "authority": {
+      "path": ".megaplan/initiatives/native-build-forward-continuation-20260903-r9/chain.yaml",
+      "sha256": "25584b139379cd166570498465919891ba64887c8e961761ea12c957e227483d"
+    }
+  },
+  {
+    "kind": "promote_preserving_source",
+    "from": ".megaplan/initiatives/native-build-forward-continuation-20260903-r9/provenance.json",
+    "to": ".megaplan/initiatives/native-build-forward-continuation-20260903-r9/evidence/provenance.json",
+    "source_revision": "4023fdd9b2027561e221dac98e234b59289e0ca6",
+    "source_sha256": "0309d28d1ea14a856fd5ebc952d3aef2f3b37a706a9d86c544c7ac112dc91189",
+    "destination_sha256": "0309d28d1ea14a856fd5ebc952d3aef2f3b37a706a9d86c544c7ac112dc91189",
+    "authority": {
+      "path": ".megaplan/initiatives/native-build-forward-continuation-20260903-r9/chain.yaml",
+      "sha256": "25584b139379cd166570498465919891ba64887c8e961761ea12c957e227483d"
+    }
+  },
+  {
+    "kind": "promote_preserving_source",
+    "from": ".megaplan/initiatives/native-build-forward-continuation-20260904/HANDOFF.md",
+    "to": ".megaplan/initiatives/native-build-forward-continuation-20260904/handoff/HANDOFF.md",
+    "source_revision": "4023fdd9b2027561e221dac98e234b59289e0ca6",
+    "source_sha256": "1ff7c6e537f38699bb168a54d6d27e09e220ddcf4e80a3285976bdf350be7661",
+    "destination_sha256": "1ff7c6e537f38699bb168a54d6d27e09e220ddcf4e80a3285976bdf350be7661",
+    "authority": {
+      "path": ".megaplan/initiatives/native-build-forward-continuation-20260904/chain.yaml",
+      "sha256": "d38cb3d899f1dc16b8a6d8fc62b7dbfd5d33d06ae2836b00146e76e29a89bb27"
+    }
+  },
+  {
+    "kind": "promote_preserving_source",
+    "from": ".megaplan/initiatives/native-build-forward-main-continuation-20260904/HANDOFF.md",
+    "to": ".megaplan/initiatives/native-build-forward-main-continuation-20260904/handoff/HANDOFF.md",
+    "source_revision": "4023fdd9b2027561e221dac98e234b59289e0ca6",
+    "source_sha256": "deff70a66d40639a14d5d5620375d29d80c74aab0976d9aec1dedd6427ff08cb",
+    "destination_sha256": "deff70a66d40639a14d5d5620375d29d80c74aab0976d9aec1dedd6427ff08cb",
+    "authority": {
+      "path": ".megaplan/initiatives/native-build-forward-main-continuation-20260904/chain.yaml",
+      "sha256": "c32d2db8113304ce6e3804bafab2f0a7ae81838b85bca2c14055c5edbdf8022b"
+    }
+  },
+  {
+    "kind": "promote_preserving_source",
+    "from": ".megaplan/initiatives/native-build-forward/profiles/native-ox-alpha.toml",
+    "to": ".megaplan/initiatives/native-build-forward/assets/profiles/native-ox-alpha.toml",
+    "source_revision": "4023fdd9b2027561e221dac98e234b59289e0ca6",
+    "source_sha256": "d9d3e14db22e127ac3d6d51812ea9c4dddb0ba55e22ce57fbbbb105a8450fb88",
+    "destination_sha256": "d9d3e14db22e127ac3d6d51812ea9c4dddb0ba55e22ce57fbbbb105a8450fb88",
+    "authority": {
+      "path": ".megaplan/initiatives/native-build-forward/chain.yaml",
+      "sha256": "f83c778be28652e6eb88906760ab9d64cb1a01a31a5e28f5dd1ae5ce2972cac4"
+    }
+  },
+  {
+    "kind": "promote_preserving_source",
+    "from": ".megaplan/initiatives/superfixer-repair-custody/load-bearing-questions.md",
+    "to": ".megaplan/initiatives/superfixer-repair-custody/research/load-bearing-questions.md",
+    "source_revision": "4023fdd9b2027561e221dac98e234b59289e0ca6",
+    "source_sha256": "97a1c992d202bc4ba02d8eb25f71cce1272acfd0f2527a954dce58d8e280dcc0",
+    "destination_sha256": "97a1c992d202bc4ba02d8eb25f71cce1272acfd0f2527a954dce58d8e280dcc0",
+    "authority": {
+      "path": ".megaplan/initiatives/superfixer-repair-custody/chain.yaml",
+      "sha256": "2ac092bc11aae05a6da7cf247c755d4b44f321eb088a62770917e7aca8032235"
+    }
+  },
+  {
+    "kind": "promote_preserving_source",
+    "from": ".megaplan/initiatives/superfixer-repair-custody/megaplan-prep.md",
+    "to": ".megaplan/initiatives/superfixer-repair-custody/research/megaplan-prep.md",
+    "source_revision": "4023fdd9b2027561e221dac98e234b59289e0ca6",
+    "source_sha256": "18b41c8b9be9e5301454915a78e97e62ce9c24f6607935fed9ff7058f6bfe0cb",
+    "destination_sha256": "18b41c8b9be9e5301454915a78e97e62ce9c24f6607935fed9ff7058f6bfe0cb",
+    "authority": {
+      "path": ".megaplan/initiatives/superfixer-repair-custody/chain.yaml",
+      "sha256": "2ac092bc11aae05a6da7cf247c755d4b44f321eb088a62770917e7aca8032235"
+    }
+  },
+  {
+    "kind": "promote_preserving_source",
+    "from": ".megaplan/initiatives/superfixer-repair-custody/repair-custody-sprint-plan.md",
+    "to": ".megaplan/initiatives/superfixer-repair-custody/research/repair-custody-sprint-plan.md",
+    "source_revision": "4023fdd9b2027561e221dac98e234b59289e0ca6",
+    "source_sha256": "8f21ebf9b37c3a82bad2965bf817d5494d2778c6dea2881bfefe6720440ca3ef",
+    "destination_sha256": "8f21ebf9b37c3a82bad2965bf817d5494d2778c6dea2881bfefe6720440ca3ef",
+    "authority": {
+      "path": ".megaplan/initiatives/superfixer-repair-custody/chain.yaml",
+      "sha256": "2ac092bc11aae05a6da7cf247c755d4b44f321eb088a62770917e7aca8032235"
+    }
+  },
+  {
+    "kind": "promote_preserving_source",
+    "from": ".megaplan/initiatives/CLOUD.md",
+    "to": ".megaplan/collection/CLOUD.md",
+    "source_revision": "4023fdd9b2027561e221dac98e234b59289e0ca6",
+    "source_sha256": "be7c87b8a109084cf7cab08941561adffc61485ec31e980737d66ee015359b58",
+    "destination_sha256": "be7c87b8a109084cf7cab08941561adffc61485ec31e980737d66ee015359b58",
+    "collection_scope": "initiative_collection",
+    "artifact_type": "cloud_guidance",
+    "authority": {
+      "path": ".megaplan/collection/authority.json",
+      "sha256": "3bc23104c71b27d26583e9ab5c0d800fea0c799d7a7be97f6551840771f3c5ce"
+    }
+  },
+  {
+    "kind": "promote_preserving_source",
+    "from": ".megaplan/initiatives/chain.yaml",
+    "to": ".megaplan/collection/chain.yaml",
+    "source_revision": "4023fdd9b2027561e221dac98e234b59289e0ca6",
+    "source_sha256": "60a6cfc151e935de8308f4bee2316b5948827d5e9610e3a11adc93a1e5ef99b1",
+    "destination_sha256": "60a6cfc151e935de8308f4bee2316b5948827d5e9610e3a11adc93a1e5ef99b1",
+    "collection_scope": "initiative_collection",
+    "artifact_type": "aggregate_chain_snapshot",
+    "authority": {
+      "path": ".megaplan/collection/authority.json",
+      "sha256": "3bc23104c71b27d26583e9ab5c0d800fea0c799d7a7be97f6551840771f3c5ce"
+    }
+  }
+],
+  "canonical_root_artifacts": [
+    {
+      "path": ".megaplan/initiatives/critique-ledger-accountability-v3-r6-20260805/prelaunch-disposition.json",
+      "generator": "chain.prelaunch_disposition.v1",
+      "authority": ".megaplan/initiatives/critique-ledger-accountability-v3-r6-20260805/chain.yaml",
+      "sha256": "b99f162b05a2e5f6f98147df233b8956d001f1009d6b93a2b46a7c2a6c57292e",
+      "authority_sha256": "75e5ed38908ba1390f84b80b19f6b7e9bd4e1d68656786d76149c1c4ba98fc8f"
+    },
+    {
+      "path": ".megaplan/initiatives/critique-ledger-accountability-v3-r7-20260805/prelaunch-disposition.json",
+      "generator": "chain.prelaunch_disposition.v1",
+      "authority": ".megaplan/initiatives/critique-ledger-accountability-v3-r7-20260805/chain.yaml",
+      "sha256": "65ea8b1d4bcbce039de81d534626f1d3682611c873b7c598d81ccefb273107bd",
+      "authority_sha256": "b8894ee3ff2db74a8b9db52540bf8b1fa264e9596031307c11bd4a172a85acfd"
+    },
+    {
+      "path": ".megaplan/initiatives/critique-ledger-accountability-v3-r7-20260805/follow-up-superfixer-v4-20260806-1329.json",
+      "generator": "chain.prelaunch_disposition.v1",
+      "authority": ".megaplan/initiatives/critique-ledger-accountability-v3-r7-20260805/chain.yaml",
+      "sha256": "57a6fe51bd945d5c1c4f71af8e670058fe8514aa426cf6f0a330d4309c46ccab",
+      "authority_sha256": "b8894ee3ff2db74a8b9db52540bf8b1fa264e9596031307c11bd4a172a85acfd"
+    },
+    {
+      "path": ".megaplan/initiatives/critique-ledger-post-relaunch-completion/UNFINISHED_WORK.md",
+      "generator": "critique_ledger_completion.validator.v1",
+      "authority": ".megaplan/initiatives/critique-ledger-post-relaunch-completion/validate_contract.py",
+      "sha256": "bf74a4090a6ea4a973faf19aba95d41c2a019e09521520ce8cf7ef69e5ab20a0",
+      "authority_sha256": "7dbee67406ef6fc84e519efffac606755fd2a43f9e3b285120ea35f4180c9407"
+    },
+    {
+      "path": ".megaplan/initiatives/critique-ledger-post-relaunch-completion/custody-manifest.json",
+      "generator": "critique_ledger_completion.validator.v1",
+      "authority": ".megaplan/initiatives/critique-ledger-post-relaunch-completion/validate_contract.py",
+      "sha256": "3dac6b6064bf4bdb2a33904f1dcba33e29caa0ebd05f76e1eb0accd1448ae5fe",
+      "authority_sha256": "7dbee67406ef6fc84e519efffac606755fd2a43f9e3b285120ea35f4180c9407"
+    },
+    {
+      "path": ".megaplan/initiatives/critique-ledger-post-relaunch-completion/finite-canary-operational-route.json",
+      "generator": "critique_ledger_completion.validator.v1",
+      "authority": ".megaplan/initiatives/critique-ledger-post-relaunch-completion/validate_contract.py",
+      "sha256": "b7bd81ddf77642f5dc220b2977e5ee07865484189f6c9f97758105f6e3396478",
+      "authority_sha256": "7dbee67406ef6fc84e519efffac606755fd2a43f9e3b285120ea35f4180c9407"
+    },
+    {
+      "path": ".megaplan/initiatives/critique-ledger-post-relaunch-completion/supersession-index.json",
+      "generator": "critique_ledger_completion.validator.v1",
+      "authority": ".megaplan/initiatives/critique-ledger-post-relaunch-completion/validate_contract.py",
+      "sha256": "dd927386e37f189508f0307c0a80fefcab91911d69a5b1e7e42c4ee0d5a67e7a",
+      "authority_sha256": "7dbee67406ef6fc84e519efffac606755fd2a43f9e3b285120ea35f4180c9407"
+    },
+    {
+      "path": ".megaplan/initiatives/critique-ledger-post-relaunch-completion/test_validate_contract.py",
+      "generator": "critique_ledger_completion.validator.v1",
+      "authority": ".megaplan/initiatives/critique-ledger-post-relaunch-completion/validate_contract.py",
+      "sha256": "3ab1a60297071f3918e9cf56ff3d0bdbce448e02894a3fc5b1f99683a433f0c3",
+      "authority_sha256": "7dbee67406ef6fc84e519efffac606755fd2a43f9e3b285120ea35f4180c9407"
+    },
+    {
+      "path": ".megaplan/initiatives/critique-ledger-post-relaunch-completion/validate_contract.py",
+      "generator": "critique_ledger_completion.validator.v1",
+      "authority": ".megaplan/initiatives/critique-ledger-post-relaunch-completion/validate_contract.py",
+      "sha256": "7dbee67406ef6fc84e519efffac606755fd2a43f9e3b285120ea35f4180c9407",
+      "authority_sha256": "7dbee67406ef6fc84e519efffac606755fd2a43f9e3b285120ea35f4180c9407"
+    },
+    {
+      "path": ".megaplan/initiatives/critique-ledger-safe-v3-canary/RUNBOOK.md",
+      "generator": "finite_canary.package.v1",
+      "authority": ".megaplan/initiatives/critique-ledger-safe-v3-canary/proof-map.json",
+      "sha256": "0884767c15a306df0229c141ccac0e967f464044853405e7600f75fe75ed3a3f",
+      "authority_sha256": "b1ddd3d5d74c0837044d9db12f9cbd6e088066f002f4f06fc2ef28d2c27fa263"
+    },
+    {
+      "path": ".megaplan/initiatives/critique-ledger-safe-v3-canary/canary.yaml",
+      "generator": "finite_canary.package.v1",
+      "authority": ".megaplan/initiatives/critique-ledger-safe-v3-canary/proof-map.json",
+      "sha256": "3b7d75c01b95565234bf2aa7eb00b40ab4a9b3e896e488cd079c68844ca2fc6c",
+      "authority_sha256": "b1ddd3d5d74c0837044d9db12f9cbd6e088066f002f4f06fc2ef28d2c27fa263"
+    },
+    {
+      "path": ".megaplan/initiatives/critique-ledger-safe-v3-canary/inputs/cl2-input.md",
+      "generator": "finite_canary.package.v1",
+      "authority": ".megaplan/initiatives/critique-ledger-safe-v3-canary/proof-map.json",
+      "sha256": "725dcc11441523689a4cbb3dee611a3b4a487be423ccfd71d5977e7402822ebf",
+      "authority_sha256": "b1ddd3d5d74c0837044d9db12f9cbd6e088066f002f4f06fc2ef28d2c27fa263"
+    },
+    {
+      "path": ".megaplan/initiatives/critique-ledger-safe-v3-canary/run_canary.py",
+      "generator": "finite_canary.package.v1",
+      "authority": ".megaplan/initiatives/critique-ledger-safe-v3-canary/proof-map.json",
+      "sha256": "6b2a7299d56103e4bc50f296c2f8d1ae36972668aecb90e260917c982e1e5adc",
+      "authority_sha256": "b1ddd3d5d74c0837044d9db12f9cbd6e088066f002f4f06fc2ef28d2c27fa263"
+    },
+    {
+      "path": ".megaplan/initiatives/critique-ledger-safe-v3-canary/structural-smoke/Dockerfile",
+      "generator": "finite_canary.package.v1",
+      "authority": ".megaplan/initiatives/critique-ledger-safe-v3-canary/proof-map.json",
+      "sha256": "4d310a4033d7d453b98bb6609b028d06792ace322dba754fcf05f28b0e7ddcfb",
+      "authority_sha256": "b1ddd3d5d74c0837044d9db12f9cbd6e088066f002f4f06fc2ef28d2c27fa263"
+    },
+    {
+      "path": ".megaplan/initiatives/critique-ledger-safe-v3-canary/structural-smoke/README.md",
+      "generator": "finite_canary.package.v1",
+      "authority": ".megaplan/initiatives/critique-ledger-safe-v3-canary/proof-map.json",
+      "sha256": "2e11a8041bebc3dce2da2e421871ad9cc4eaca4b48b6e0f2e2aab478ff913a85",
+      "authority_sha256": "b1ddd3d5d74c0837044d9db12f9cbd6e088066f002f4f06fc2ef28d2c27fa263"
+    },
+    {
+      "path": ".megaplan/initiatives/critique-ledger-safe-v3-canary/structural-smoke/fake_codex.py",
+      "generator": "finite_canary.package.v1",
+      "authority": ".megaplan/initiatives/critique-ledger-safe-v3-canary/proof-map.json",
+      "sha256": "6a73a17922deb7b7a6967960e84c00a660061b44416a251bf6193e5030156bef",
+      "authority_sha256": "b1ddd3d5d74c0837044d9db12f9cbd6e088066f002f4f06fc2ef28d2c27fa263"
+    },
+    {
+      "path": ".megaplan/initiatives/critique-ledger-safe-v3-canary/structural-smoke/run-offline-structural-smoke.sh",
+      "generator": "finite_canary.package.v1",
+      "authority": ".megaplan/initiatives/critique-ledger-safe-v3-canary/proof-map.json",
+      "sha256": "3d73e7cadb84fca6cb08c786050e6e27c8817f9a469f4795424462cbc4db1f4d",
+      "authority_sha256": "b1ddd3d5d74c0837044d9db12f9cbd6e088066f002f4f06fc2ef28d2c27fa263"
+    },
+    {
+      "path": ".megaplan/initiatives/critique-ledger-safe-v3-canary/structural-smoke/validate_container_inspect.py",
+      "generator": "finite_canary.package.v1",
+      "authority": ".megaplan/initiatives/critique-ledger-safe-v3-canary/proof-map.json",
+      "sha256": "24fae60c0d6bdc74aac474118c44d2677f59e28fdf1fc7bcd5d87aeb767d8698",
+      "authority_sha256": "b1ddd3d5d74c0837044d9db12f9cbd6e088066f002f4f06fc2ef28d2c27fa263"
+    },
+    {
+      "path": ".megaplan/initiatives/critique-ledger-safe-v3-canary/structural-smoke/verify_offline_smoke.py",
+      "generator": "finite_canary.package.v1",
+      "authority": ".megaplan/initiatives/critique-ledger-safe-v3-canary/proof-map.json",
+      "sha256": "30b9c12554dc83247415a97eb392832419c16c068980ab3c3ed7f3d41f98fa0d",
+      "authority_sha256": "b1ddd3d5d74c0837044d9db12f9cbd6e088066f002f4f06fc2ef28d2c27fa263"
+    },
+    {
+      "path": ".megaplan/initiatives/critique-ledger-safe-v3-canary/traceability.json",
+      "generator": "finite_canary.package.v1",
+      "authority": ".megaplan/initiatives/critique-ledger-safe-v3-canary/proof-map.json",
+      "sha256": "ab945c5efc40cdff62870c0c4e62d4378290e97563e8e9d4002b1c98c253fec5",
+      "authority_sha256": "b1ddd3d5d74c0837044d9db12f9cbd6e088066f002f4f06fc2ef28d2c27fa263"
     }
   ],
   "packaging_artifacts": [

@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import ast
+import importlib
+import itertools
 from pathlib import Path
 
 
@@ -59,3 +61,22 @@ def test_shadow_modules_obey_size_and_function_limits() -> None:
             assert function.end_lineno - function.lineno + 1 <= 80, function.name
         if path in production_paths:
             assert _conditional_depth(tree) <= 3
+    names = ("binding", "evaluation", "terminals", "wire")
+    modules = [importlib.import_module(f"arnold.workflow.completion.{name}") for name in names]
+    for module in modules:
+        exports = getattr(module, "__all__", None)
+        if exports is None:
+            continue
+        assert isinstance(exports, list)
+        for name in exports:
+            value = getattr(module, name)
+            owner = getattr(value, "__module__", None)
+            if owner is not None:
+                assert owner == module.__name__, (module.__name__, name, owner)
+    for order in itertools.permutations(names):
+        imported = [importlib.import_module(f"arnold.workflow.completion.{name}") for name in order]
+        assert imported[0].__name__.startswith("arnold.workflow.completion.")
+    assert modules[0].SubjectInstanceId.__module__ == modules[0].__name__
+    assert modules[1].EvidenceRecord.__module__ == modules[1].__name__
+    assert modules[2].M11AuthorityClosureResult.__module__ == modules[2].__name__
+    assert modules[3].WireDecodeResult.__module__ == modules[3].__name__

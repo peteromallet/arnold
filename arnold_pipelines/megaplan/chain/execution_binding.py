@@ -465,7 +465,22 @@ def _runtime_identity_sha256(identity: Mapping[str, Any]) -> str:
 
 
 def _normalized_runtime_identity(identity: Mapping[str, Any]) -> dict[str, Any]:
-    value = _runtime_identity_core(identity)
+    # Persist the complete provenance observation for audit/rebind callers.
+    # The digest still projects environment-derived fields away through
+    # ``_runtime_identity_sha256``; dropping them here made a valid canary
+    # lose its editable-install/import-origin proof at the state boundary.
+    value = {
+        key: identity.get(key)
+        for key in (
+            "import_root",
+            "source_revision",
+            "editable_root",
+            "editable_revision",
+            "direct_url",
+            "pth",
+            "imports",
+        )
+    }
     value["content_sha256"] = _runtime_identity_sha256(value)
     return value
 

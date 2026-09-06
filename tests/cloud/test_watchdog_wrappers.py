@@ -554,9 +554,18 @@ def _run_watchdog_shell(
     env["MEGAPLAN_SUPERVISOR_PYTHON"] = sys.executable
     env["MEGAPLAN_BABYSITTER_PYTHON"] = sys.executable
     # Extracted relaunch functions use the identity-scoped runtime manifest
-    # contract.  The fixture directory supplies only known-good sessions;
-    # tests for missing/invalid manifests override this explicitly.
-    env["ARNOLD_RUNTIME_MANIFEST_DIR"] = str(WATCHDOG_TEST_MANIFEST_DIR)
+    # contract. Keep committed fixture payloads historical and copy them into
+    # a per-run manifest directory rooted at this checked-out candidate. This
+    # avoids baking a machine-specific checkout path into the repository.
+    manifest_dir = tempfile.TemporaryDirectory(prefix="watchdog-runtime-manifests-")
+    manifest_root = Path(manifest_dir.name)
+    for fixture_path in WATCHDOG_TEST_MANIFEST_DIR.glob("*.json"):
+        payload = json.loads(fixture_path.read_text(encoding="utf-8"))
+        payload.setdefault("epic", {})["runtime_root"] = str(REPO_ROOT)
+        (manifest_root / fixture_path.name).write_text(
+            json.dumps(payload), encoding="utf-8"
+        )
+    env["ARNOLD_RUNTIME_MANIFEST_DIR"] = str(manifest_root)
     # The runtime library invokes the pinned interpreter with ``-P``.  Keep
     # the extracted-wrapper harness bound to this checkout explicitly rather
     # than relying on pytest's ambient import path.
@@ -585,13 +594,34 @@ relaunch_materializer_authority_gate() {
   printf '%s\n' '{"family":"direct_module.auto","is_non_authoritative_family":true,"is_repair_authority":false,"can_become_accepted_repair_on_success":false,"accepted_repair_requires_canonical_delegation":true,"canonical_delegation_path":"simple_fixer.singleton_claim.exact_f01_tuple","forbidden_sources_present":[]}'
 }
 '''
-    return subprocess.run(
-        ["bash", "-c", harness_stubs + "\n" + script],
-        capture_output=True,
-        text=True,
-        env=env,
-        check=False,
-    )
+    try:
+        return subprocess.run(
+            ["bash", "-c", harness_stubs + "\n" + script],
+            capture_output=True,
+            text=True,
+            env=env,
+            check=False,
+        )
+    finally:
+        manifest_dir.cleanup()
+
+
+def _assert_manifest_bound_chain_relaunch(command: str, runtime_root: Path) -> None:
+    """Assert chain relaunches delegate runtime binding to the launch boundary.
+
+    Chain commands intentionally do not synthesize a direct ``PYTHONPATH``
+    assignment. The boundary receives the preflight-accepted candidate root
+    and owns the runtime environment materialization.
+    """
+    assert "arnold_materialize_launch_boundary" in command
+    boundary_lines = [
+        line
+        for line in command.splitlines()
+        if "arnold_materialize_launch_boundary " in line
+    ]
+    assert boundary_lines, command
+    assert str(runtime_root) in boundary_lines[0], command
+    assert "PYTHONPATH=" not in command
 
 
 def test_watchdog_maps_suppressed_babysitter_to_typed_report_without_schedule(
@@ -2624,10 +2654,13 @@ def test_watchdog_relaunch_commands_bind_only_accepted_root_on_pythonpath(
     for label, path in outputs.items():
         generated = path.read_text(encoding="utf-8")
         assert ":${PYTHONPATH:-}" not in generated, label
-        assert f"PYTHONPATH={runtime_root}" in generated, label
-        # The accepted root is the ONLY PYTHONPATH entry: no colon-joined
-        # merge with any inherited value.
-        assert f"PYTHONPATH={runtime_root}:" not in generated, label
+        if label == "default_chain_relaunch":
+            _assert_manifest_bound_chain_relaunch(generated, runtime_root)
+        else:
+            assert f"PYTHONPATH={runtime_root}" in generated, label
+            # The accepted root is the ONLY PYTHONPATH entry: no colon-joined
+            # merge with any inherited value.
+            assert f"PYTHONPATH={runtime_root}:" not in generated, label
 
 
 @pytest.mark.parametrize("wrapper_kind", ["watchdog"])
@@ -3108,10 +3141,11 @@ def test_watchdog_stale_marker_relaunch_command_regenerates_clean_runtime_chain_
     # P4: the editable-install refresh machinery is deleted; a stale refresh-era
     # marker regenerates the manifest-runtime chain start (no source checkout
     # mutation, no env-selector re-resolution).  T-0022: the regenerated
-    # command puts ONLY the preflight-accepted engine root on PYTHONPATH.
+    # command passes ONLY the preflight-accepted engine root to the launch
+    # boundary, which owns runtime environment materialization.
     assert "python3 -P -m arnold_pipelines.megaplan chain start" in result.stdout
     assert "chain start --spec" in result.stdout
-    assert f"PYTHONPATH={runtime_root}" in result.stdout
+    _assert_manifest_bound_chain_relaunch(result.stdout, runtime_root)
     assert "MEGAPLAN_RUNTIME_SRC" not in result.stdout
     assert "editable-engine" not in result.stdout
     assert "refusing editable install refresh: tracked changes in source checkout" not in result.stdout
@@ -3248,10 +3282,11 @@ def test_persisted_push_capable_marker_command_is_always_regenerated(
     # P4: a push-capable (refresh-era) marker is regenerated as the
     # manifest-runtime chain start; the stale selector/refresh machinery is
     # gone from the emitted command.  T-0022: only the preflight-accepted
-    # engine root goes on PYTHONPATH.
+    # engine root is passed to the launch boundary, which owns runtime
+    # environment materialization.
     assert "python3 -P -m arnold_pipelines.megaplan chain start" in result.stdout
     assert "chain start --spec" in result.stdout
-    assert f"PYTHONPATH={runtime_root}" in result.stdout
+    _assert_manifest_bound_chain_relaunch(result.stdout, runtime_root)
     assert "MEGAPLAN_RUNTIME_SRC" not in result.stdout
     assert "source checkout dirty" not in result.stdout
     assert "attempting push" not in result.stdout
@@ -3309,7 +3344,7 @@ def test_persisted_install_capable_marker_command_is_always_regenerated(
     result = _run_watchdog_shell(script)
     assert result.returncode == 0, result.stderr
     assert "python3 -P -m arnold_pipelines.megaplan chain start" in result.stdout
-    assert f"PYTHONPATH={runtime_root}" in result.stdout
+    _assert_manifest_bound_chain_relaunch(result.stdout, runtime_root)
     assert "/tmp/unbound-runtime" not in result.stdout
 
 
@@ -3373,10 +3408,11 @@ def test_persisted_shared_root_invocation_marker_is_regenerated(
     result = _run_watchdog_shell(script)
     assert result.returncode == 0, result.stderr
     # The shared-root invocation is never returned verbatim; the accepted
-    # (manifest) root alone goes on PYTHONPATH in the regenerated command.
+    # The regenerated command delegates the accepted manifest root to the
+    # launch boundary; it never returns the shared-root invocation.
     assert "python3 -P -m arnold_pipelines.megaplan chain start" in result.stdout
     assert "chain start --spec" in result.stdout
-    assert f"PYTHONPATH={runtime_root}" in result.stdout
+    _assert_manifest_bound_chain_relaunch(result.stdout, runtime_root)
     assert "/workspace/arnold" not in result.stdout
 
 
@@ -3505,11 +3541,11 @@ def test_persisted_shared_root_param_expansion_marker_is_regenerated(
     result = _run_watchdog_shell(script)
     assert result.returncode == 0, result.stderr
     # The param-expansion shared root is never returned verbatim; the
-    # accepted (manifest) root alone goes on PYTHONPATH in the regenerated
-    # command.
+    # The regenerated command delegates the accepted manifest root to the
+    # launch boundary; it never returns the shared-root parameter expansion.
     assert "python3 -P -m arnold_pipelines.megaplan chain start" in result.stdout
     assert "chain start --spec" in result.stdout
-    assert f"PYTHONPATH={runtime_root}" in result.stdout
+    _assert_manifest_bound_chain_relaunch(result.stdout, runtime_root)
     assert "/workspace/arnold" not in result.stdout
 
 
@@ -3637,10 +3673,11 @@ def test_persisted_foreign_per_epic_marker_command_is_regenerated(
     result = _run_watchdog_shell(script)
     assert result.returncode == 0, result.stderr
     # The foreign per-epic runtime is never returned verbatim; the accepted
-    # (manifest) root alone goes on PYTHONPATH in the regenerated command.
+    # The regenerated command delegates the accepted manifest root to the
+    # launch boundary; it never returns the foreign runtime command.
     assert "python3 -P -m arnold_pipelines.megaplan chain start" in result.stdout
     assert "chain start --spec" in result.stdout
-    assert f"PYTHONPATH={runtime_root}" in result.stdout
+    _assert_manifest_bound_chain_relaunch(result.stdout, runtime_root)
     assert "/workspace/runtime-candidates/arnold-old" not in result.stdout
 
 
@@ -5830,6 +5867,17 @@ def test_watchdog_manual_review_chain_state_reports_needs_human_without_relaunch
     )
     report_path = tmp_path / "report.tsv"
     log_path = tmp_path / "watchdog.log"
+    # This branch intentionally exercises the status-trigger babysitter
+    # dispatch boundary.  Keep the child at the test boundary so the
+    # candidate checkout cannot run a real continuation probe or publish
+    # babysitter receipts into its working tree.
+    babysitter_bin = tmp_path / "babysitter-stub"
+    babysitter_bin.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+    babysitter_bin.chmod(0o755)
+    repair_data_dir = tmp_path / "repair-data"
+    repair_data_dir.mkdir()
+    operation_root = tmp_path / "operation"
+    operation_root.mkdir()
 
     script = "\n\n".join(
         [
@@ -5838,7 +5886,11 @@ def test_watchdog_manual_review_chain_state_reports_needs_human_without_relaunch
             _extract_wrapper_function("launch_chain_tick"),
             "chain_engine_root_preflight() { return 0; }",
             f"MARKER_DIR={str(marker_dir)!r}",
+            f"REPAIR_DATA_DIR={str(repair_data_dir)!r}",
             f"LOG={str(log_path)!r}",
+            f"export CLOUD_WATCHDOG_BABYSITTER_BIN={shlex.quote(str(babysitter_bin))}",
+            f"export ARNOLD_BASE_DIR={shlex.quote(str(operation_root))}",
+            "export ARNOLD_CHAIN_SESSION=demo-chain",
             """
 report_item() {
   printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$1" "$2" "$3" "$4" "$5" "$6" "$7" >> "$1"

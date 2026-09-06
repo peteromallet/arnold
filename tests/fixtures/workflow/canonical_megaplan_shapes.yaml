@@ -483,7 +483,7 @@ python_authoring_m3:
       fixture: tests/fixtures/workflow_authoring/m3/valid_m3_canonical_megaplan_topology.py
       canonical_shape: fanout_panel
       topology_hash: sha256:6680554eb181f686d0058cb1f5f837c709bee098fb00f41941ed8ffdc5fd0cf9
-      manifest_hash: sha256:e30c1ac57aa8573d2d990174cfc7993042f369c329d5b4d588ddc0bd2f78c82c
+      manifest_hash: sha256:72dbae9889e5081f82446fa9b9ccc7215a4746dccae87c019c6a22602cc83050
       nodes:
       - id: blocked_override
         kind: megaplan:override

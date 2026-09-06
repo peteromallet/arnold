@@ -699,9 +699,9 @@ class TestFallbackChainAncillaryRouting:
 
         resolved = resolve_prep_stage_model(state, "triage")
 
-        assert resolved.agent == "hermes"
-        assert resolved.model == "deepseek:deepseek-v4-pro"
-        assert resolved.resolved_model == "deepseek:deepseek-v4-pro"
+        assert resolved.agent == "omp"
+        assert resolved.model == "deepseek/deepseek-v4-pro"
+        assert resolved.resolved_model == "deepseek/deepseek-v4-pro"
 
     def test_auto_driver_tier_ladder_selects_first_chain_element(self, tmp_path: Path) -> None:
         from arnold_pipelines.megaplan.auto import _read_execute_tier_ladder

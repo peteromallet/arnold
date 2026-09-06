@@ -4,14 +4,14 @@ Covers the deterministic identity builder, the v2 envelope normalizer, the
 narrow owner-adoption enqueue wrapper (idempotency, crash convergence,
 byte-divergence refusal), the restricted-scope rejection of the adoption
 identity by generic repair machinery, and the real CLI happy/refusal paths on
-a mini copied tree (with the runtime-identity verifier seam patched exactly
-like the rehearsal does for the migration commands).
+a mini copied tree bound to a real candidate editable runtime and independently
+observed by a second interpreter.
 
-The mini tree points every runtime root at REPO_ROOT (the editable-installed
-control runtime), the independent import-root observation resolves there, and
-the ``verify_external_runtime_identity`` seam returns the same root, so the
-six-way root equality + independently verified identity guards run for real
-without an offline runtime fixture.
+The mini tree points every runtime root at the candidate worktree.  The
+candidate identity and provenance receipt come from one fresh editable
+interpreter; the independent import-root observation comes from another, so
+the six-way root equality and independently verified identity guards run
+without a fabricated verifier result or forced ``PYTHONPATH``.
 """
 
 from __future__ import annotations
@@ -95,17 +95,134 @@ def _git(root: Path, *args: str) -> str:
     ).stdout.strip()
 
 
-# ── mini copied-tree builder (all roots = REPO_ROOT) ───────────────────────
+# ── candidate-bound runtime + mini copied-tree builder ─────────────────────
 
 
-def _build_tree(root: Path) -> dict:
+def _build_candidate_runtime(tmp_path_factory: pytest.TempPathFactory) -> dict:
+    """Build a real candidate-bound editable runtime and receipt.
+
+    The pytest interpreter is installed outside this worktree on some hosts,
+    so the candidate is observed by two fresh interpreters: ``producer``
+    emits the identity/provenance receipt and ``observer`` supplies the
+    independent import-root observation used by occurrence-adopt.  Both are
+    installed editable from this worktree with ``PYTHONPATH`` removed.
+    """
+    root = tmp_path_factory.mktemp("adopt-runtime")
+    venv_a = root / "venv-a"
+    venv_b = root / "venv-b"
+    for venv_path in (venv_a, venv_b):
+        subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "venv",
+                "--copies",
+                "--system-site-packages",
+                str(venv_path),
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        subprocess.run(
+            [
+                str(venv_path / "bin" / "python"),
+                "-m",
+                "pip",
+                "install",
+                "--no-deps",
+                "-e",
+                str(REPO_ROOT),
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+            env={key: value for key, value in os.environ.items() if key != "PYTHONPATH"},
+        )
+
+    producer = venv_a / "bin" / "python"
+    observer = venv_b / "bin" / "python"
+    revision = _git(REPO_ROOT, "rev-parse", "HEAD")
+    identity_path = root / "runtime-identity.json"
+    receipt_path = root / "runtime-receipt.json"
+    provenance_program = (
+        REPO_ROOT
+        / "arnold_pipelines"
+        / "megaplan"
+        / "cloud"
+        / "runtime_provenance.py"
+    )
+    result = subprocess.run(
+        [
+            str(producer),
+            "-P",
+            str(provenance_program),
+            "--expected-root",
+            str(REPO_ROOT),
+            "--expected-revision",
+            revision,
+            "--receipt-out",
+            str(receipt_path),
+            "--identity-out",
+            str(identity_path),
+            "--emit-receipt",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        env={key: value for key, value in os.environ.items() if key != "PYTHONPATH"},
+    )
+    assert result.returncode == 0, result.stderr
+    identity = json.loads(identity_path.read_text(encoding="utf-8"))
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    assert identity["import_root"] == str(REPO_ROOT)
+    assert identity["editable_root"] == str(REPO_ROOT)
+    assert identity["source_revision"] == revision
+    assert receipt["provenance"]["ok"] is True
+    assert receipt["runtime_identity"] == identity
+    assert receipt["interpreter"]["executable"] == str(producer.resolve())
+    assert producer.resolve() != Path(sys.executable).resolve()
+
+    observation = subprocess.run(
+        [
+            str(observer),
+            "-P",
+            "-c",
+            (
+                "import pathlib, arnold_pipelines; "
+                "print(pathlib.Path(arnold_pipelines.__file__).resolve().parents[1])"
+            ),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        env={key: value for key, value in os.environ.items() if key != "PYTHONPATH"},
+    )
+    assert observation.returncode == 0, observation.stderr
+    assert Path(observation.stdout.strip()).resolve() == REPO_ROOT.resolve()
+    assert observer.resolve() != producer.resolve()
+    return {
+        "root": REPO_ROOT,
+        "venv": venv_a,
+        "producer": producer,
+        "observer": observer,
+        "identity": identity,
+        "receipt": receipt,
+    }
+
+
+def _build_tree(root: Path, runtime: dict) -> dict:
     """A mini chain + paused identity-less blocked plan + bound runtime.
 
     Every runtime root (chain binding, engine root, manifest runtime root,
-    marker runtime root, candidate root) points at REPO_ROOT, and the
-    independent import-root observation resolves there too, so all six
-    roots are equal by construction.
+    marker runtime root, candidate root) points at the real candidate
+    checkout.  The independent import-root observation and provenance
+    receipt are produced by separate candidate-bound interpreters.
     """
+    runtime_root = Path(runtime["root"])
+    runtime_identity = dict(runtime["identity"])
+    runtime_receipt = dict(runtime["receipt"])
+    runtime_venv = Path(runtime["venv"])
     _git(root, "init")
     _git(root, "config", "user.email", "tests@example.com")
     _git(root, "config", "user.name", "Tests")
@@ -154,12 +271,11 @@ def _build_tree(root: Path) -> dict:
     chain_state.metadata["execution_binding"] = {
         "runtime_binding": {
             "current_identity": {
-                "import_root": str(REPO_ROOT),
-                "content_sha256": "0" * 64,
+                **runtime_identity,
             }
         }
     }
-    chain_state.metadata["execution_environment"] = {"engine_root": str(REPO_ROOT)}
+    chain_state.metadata["execution_environment"] = {"engine_root": str(runtime_root)}
     chain_state.metadata["operator_pause"] = {
         "schema_version": "arnold.megaplan.operator-pause.v1",
         "active": True,
@@ -204,8 +320,7 @@ def _build_tree(root: Path) -> dict:
                 "session": SESSION,
                 "runtime_binding": {
                     "current_identity": {
-                        "import_root": str(REPO_ROOT),
-                        "content_sha256": "0" * 64,
+                        **runtime_identity,
                     }
                 },
                 "editable_source_head": "x",
@@ -229,33 +344,33 @@ def _build_tree(root: Path) -> dict:
                 "ref": "refs/heads/main",
                 "commit": "0" * 40,
                 "editable_install_path": "",
-                "venv_path": str(REPO_ROOT / ".venv"),
+                "venv_path": str(runtime_venv),
             },
             "epic": {
                 "branch": "adopt-work",
-                "worktree_path": str(REPO_ROOT),
-                "venv_path": str(REPO_ROOT / ".venv"),
-                "runtime_root": str(REPO_ROOT),
+                "worktree_path": str(runtime_root),
+                "venv_path": str(runtime_venv),
+                "runtime_root": str(runtime_root),
                 "expected_head": "0" * 40,
                 "repair_bin": str(
-                    REPO_ROOT
+                    runtime_root
                     / "arnold_pipelines"
                     / "megaplan"
                     / "cloud"
                     / "wrappers"
                     / "arnold-babysitter"
                 ),
-                "deps_lockfile": str(REPO_ROOT / "pyproject.toml"),
+                "deps_lockfile": str(runtime_root / "pyproject.toml"),
             },
             "indirection": {
-                "host_path": str(REPO_ROOT),
+                "host_path": str(runtime_root),
                 "container_path": "/workspace/demo",
                 "mount_table": [],
                 "execution_namespace": "demo-ns",
                 "verified_head": "0" * 40,
                 "last_verified_at": "2026-08-12T00:00:00+00:00",
                 "attestation": {
-                    "module_file": str(REPO_ROOT / "arnold_pipelines" / "__init__.py"),
+                    "module_file": str(runtime_root / "arnold_pipelines" / "__init__.py"),
                     "module_digest": "0" * 64,
                     "mount_id": "0:0",
                 },
@@ -280,16 +395,15 @@ def _build_tree(root: Path) -> dict:
     identity_path = root / "runtime-identity.json"
     identity_path.write_text(
         json.dumps(
-            {
-                "import_root": str(REPO_ROOT),
-                "content_sha256": "0" * 64,
-                "source_revision": "0" * 40,
-            }
+            runtime_identity
         ),
         encoding="utf-8",
     )
     receipt_path = root / "runtime-receipt.json"
-    receipt_path.write_text("{}\n", encoding="utf-8")
+    receipt_path.write_text(
+        json.dumps(runtime_receipt, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
 
     return {
         "root": root,
@@ -300,14 +414,25 @@ def _build_tree(root: Path) -> dict:
         "manifest_path": manifest_path,
         "identity_path": identity_path,
         "receipt_path": receipt_path,
+        "runtime_root": runtime_root,
         "plan_payload": plan_payload,
     }
 
 
 @pytest.fixture(scope="module")
-def adopt_tree(tmp_path_factory: pytest.TempPathFactory) -> dict:
+def candidate_runtime(tmp_path_factory: pytest.TempPathFactory) -> dict:
+    return _build_candidate_runtime(tmp_path_factory)
+
+
+@pytest.fixture(scope="module")
+def adopt_tree(
+    tmp_path_factory: pytest.TempPathFactory, candidate_runtime: dict
+) -> dict:
     """One module-scoped canonical tree; tests copy it per scenario."""
-    return _build_tree(tmp_path_factory.mktemp("adopt-tree"))
+    return _build_tree(
+        tmp_path_factory.mktemp("adopt-tree"),
+        candidate_runtime,
+    )
 
 
 def _fresh_tree(base: Path, canonical: dict) -> dict:
@@ -335,14 +460,15 @@ def _fresh_tree(base: Path, canonical: dict) -> dict:
     return tree
 
 
-def _roots() -> dict:
+def _roots(runtime_root: Path | str) -> dict:
+    runtime_root = str(runtime_root)
     return {
-        "chain_execution_root": str(REPO_ROOT),
-        "recorded_engine_root": str(REPO_ROOT),
-        "manifest_runtime_root": str(REPO_ROOT),
-        "marker_runtime_root": str(REPO_ROOT),
-        "independent_import_root": str(REPO_ROOT),
-        "candidate_root": str(REPO_ROOT),
+        "chain_execution_root": runtime_root,
+        "recorded_engine_root": runtime_root,
+        "manifest_runtime_root": runtime_root,
+        "marker_runtime_root": runtime_root,
+        "independent_import_root": runtime_root,
+        "candidate_root": runtime_root,
     }
 
 
@@ -386,8 +512,8 @@ def _adopt_argv(
         "--expected-marker-sha256", "sha256:" + _sha256_file(tree["marker_path"]),
         "--runtime-identity", str(tree["identity_path"]),
         "--runtime-provenance-receipt", str(tree["receipt_path"]),
-        "--candidate-root", str(REPO_ROOT),
-        "--expected-runtime-roots-sha256", "sha256:" + _canonical_sha256(_roots()),
+        "--candidate-root", str(tree["runtime_root"]),
+        "--expected-runtime-roots-sha256", "sha256:" + _canonical_sha256(_roots(tree["runtime_root"])),
         "--reason", "T-0101e' unit adoption",
         "--actor", actor,
         "--receipt", str(tree["plan_dir"] / "evidence" / receipt_name),
@@ -405,26 +531,75 @@ def _chain_cli(
 
 
 @pytest.fixture
-def patch_verifier(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Patch the runtime-identity verifier seam to the REPO_ROOT runtime.
+def candidate_runtime_observation(
+    monkeypatch: pytest.MonkeyPatch, candidate_runtime: dict
+) -> dict:
+    """Select the candidate observer through the production runtime seam.
 
-    Patched on the CONSUMER module (``occurrence_adopt``) exactly like the
-    rehearsal patches the migration modules' own imported seam.
+    The test runner may resolve the package from a different checkout.  Keep
+    the production verifier untouched, and use the launch runtime's explicit
+    ``ARNOLD_RUNTIME_PYTHON`` selector to make the real helper invoke the
+    candidate-bound observer.  Assert its bytes are genuinely imported from
+    the candidate root.
     """
     from arnold_pipelines.megaplan.chain import occurrence_adopt
 
-    def _verifier(_identity_path: Path, _receipt_path: Path) -> dict:
-        return {
-            "import_root": str(REPO_ROOT),
-            "content_sha256": "0" * 64,
-            "source_revision": "0" * 40,
-        }
-
-    monkeypatch.setattr(
-        occurrence_adopt,
-        "verify_external_runtime_identity",
-        _verifier,
+    monkeypatch.setenv("ARNOLD_RUNTIME_PYTHON", str(candidate_runtime["observer"]))
+    assert (
+        Path(occurrence_adopt._independent_import_root()).resolve()
+        == Path(candidate_runtime["root"]).resolve()
     )
+    return candidate_runtime
+
+
+def test_candidate_runtime_rejects_wrong_root_across_interpreters(
+    tmp_path: Path, candidate_runtime: dict
+) -> None:
+    """A candidate interpreter must fail closed when asked to prove another root."""
+    from arnold_pipelines.megaplan.chain.execution_binding import (
+        verify_external_runtime_identity,
+    )
+
+    identity_path = tmp_path / "wrong-root-identity.json"
+    receipt_path = tmp_path / "wrong-root-receipt.json"
+    wrong_root = tmp_path / "not-the-candidate"
+    revision = candidate_runtime["identity"]["source_revision"]
+    provenance_program = (
+        REPO_ROOT
+        / "arnold_pipelines"
+        / "megaplan"
+        / "cloud"
+        / "runtime_provenance.py"
+    )
+    result = subprocess.run(
+        [
+            str(candidate_runtime["producer"]),
+            "-P",
+            str(provenance_program),
+            "--expected-root",
+            str(wrong_root),
+            "--expected-revision",
+            revision,
+            "--receipt-out",
+            str(receipt_path),
+            "--identity-out",
+            str(identity_path),
+            "--emit-receipt",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        env={key: value for key, value in os.environ.items() if key != "PYTHONPATH"},
+    )
+    assert result.returncode != 0
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    assert receipt["interpreter"]["executable"] == str(
+        Path(candidate_runtime["producer"]).resolve()
+    )
+    assert "import_root_mismatch" in receipt["provenance"]["errors"]
+    with pytest.raises(CliError) as excinfo:
+        verify_external_runtime_identity(identity_path, receipt_path)
+    assert excinfo.value.code == "chain_runtime_binding_drift"
 
 
 def _snapshot(root: Path) -> dict[str, bytes]:
@@ -794,7 +969,7 @@ def test_cli_adopt_happy_path_and_idempotent_retry(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
     adopt_tree: dict,
-    patch_verifier: None,
+    candidate_runtime_observation: None,
 ) -> None:
     tree = _fresh_tree(tmp_path, adopt_tree)
     argv = _adopt_argv(tree)
@@ -864,7 +1039,7 @@ def test_cli_adopt_refuses_one_bit_cas_flip_zero_mutation(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
     adopt_tree: dict,
-    patch_verifier: None,
+    candidate_runtime_observation: None,
     flag: str,
 ) -> None:
     tree = _fresh_tree(tmp_path, adopt_tree)
@@ -885,7 +1060,7 @@ def test_cli_adopt_refuses_non_operator(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
     adopt_tree: dict,
-    patch_verifier: None,
+    candidate_runtime_observation: None,
 ) -> None:
     tree = _fresh_tree(tmp_path, adopt_tree)
     argv = _adopt_argv(tree, actor="not-operator")
@@ -897,7 +1072,7 @@ def test_cli_adopt_refuses_missing_pause(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
     adopt_tree: dict,
-    patch_verifier: None,
+    candidate_runtime_observation: None,
 ) -> None:
     tree = _fresh_tree(tmp_path, adopt_tree)
     state = load_chain_state(tree["spec_path"], verify_execution_binding=False)
@@ -917,7 +1092,7 @@ def test_cli_adopt_refuses_non_null_existing_identity(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
     adopt_tree: dict,
-    patch_verifier: None,
+    candidate_runtime_observation: None,
 ) -> None:
     tree = _fresh_tree(tmp_path, adopt_tree)
     plan_payload = json.loads(tree["plan_path"].read_text(encoding="utf-8"))
@@ -939,7 +1114,7 @@ def test_cli_adopt_refuses_ambiguous_failure(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
     adopt_tree: dict,
-    patch_verifier: None,
+    candidate_runtime_observation: None,
 ) -> None:
     tree = _fresh_tree(tmp_path, adopt_tree)
     plan_payload = json.loads(tree["plan_path"].read_text(encoding="utf-8"))
@@ -954,7 +1129,7 @@ def test_cli_adopt_refuses_unequal_roots(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
     adopt_tree: dict,
-    patch_verifier: None,
+    candidate_runtime_observation: None,
 ) -> None:
     tree = _fresh_tree(tmp_path, adopt_tree)
     argv = _adopt_argv(tree)
@@ -967,7 +1142,7 @@ def test_cli_adopt_crash_after_record_and_after_request_converge(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
     adopt_tree: dict,
-    patch_verifier: None,
+    candidate_runtime_observation: None,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Crash injection after the adoption authority / request writes converges.
@@ -1040,7 +1215,7 @@ def test_cli_adopt_crash_after_record_and_after_request_converge(
 def test_cli_adopt_two_concurrent_adopters_one_record(
     tmp_path: Path,
     adopt_tree: dict,
-    patch_verifier: None,
+    candidate_runtime_observation: None,
 ) -> None:
     import threading
 

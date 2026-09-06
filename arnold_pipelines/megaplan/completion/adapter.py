@@ -39,7 +39,6 @@ from arnold.workflow.completion.spec import (
     SubjectKind,
 )
 from arnold.workflow.completion.shadow import (
-    DEFAULT_S2F_SCAN_DIRS,
     S2F_SCHEMA_MARKERS,
     S2FGapReport,
     S2FTemplatesUnavailable,
@@ -50,6 +49,14 @@ from arnold.workflow.completion.shadow import (
 from arnold.workflow.completion.source_declaration import (
     SourceDeclaration,
     SubjectDeclaration,
+)
+
+MEGAPLAN_S2F_SCAN_DIRS: tuple[str, ...] = (
+    ".megaplan/plans",
+    ".megaplan/plans/*",
+    "s2f_templates",
+    ".megaplan/s2f_templates",
+    "gates/s2f_templates",
 )
 
 # ---------------------------------------------------------------------------
@@ -285,7 +292,7 @@ def megaplan_subject_inventory(
     """
     if artifacts is None:
         report = s2f_discovery_gap_report(
-            scan_dirs=scan_dirs,
+            scan_dirs=MEGAPLAN_S2F_SCAN_DIRS if scan_dirs is None else scan_dirs,
             schema_markers=schema_markers,
         )
         if not report.discovered_files:
@@ -337,7 +344,7 @@ class S2FShadowRunner:
     """
 
     scan_dirs: tuple[str, ...] = field(
-        default_factory=lambda: DEFAULT_S2F_SCAN_DIRS
+        default_factory=lambda: MEGAPLAN_S2F_SCAN_DIRS
     )
     schema_markers: tuple[str, ...] = field(
         default_factory=lambda: S2F_SCHEMA_MARKERS
@@ -393,7 +400,9 @@ class S2FShadowRunner:
         if not report.discovered_files and not allow_incomplete:
             raise S2FTemplatesUnavailable(report)
         if not report.discovered_files:
-            return evaluate_shadow((), discovery_report=report)
+            return evaluate_shadow(
+                (), discovery_report=report, admission_source="megaplan-shadow"
+            )
         return evaluate_shadow(
             report.parsed_declarations,
             candidate_outcome="success" if candidate_outcome is None else candidate_outcome,
@@ -403,6 +412,7 @@ class S2FShadowRunner:
             capture_receipts=capture_receipts,
             capture_evidence=capture_evidence,
             verifier_provenance=verifier_provenance,
+            admission_source="megaplan-shadow",
             discovery_report=report,
             **kwargs,
         )
@@ -451,6 +461,7 @@ class S2FShadowRunner:
             capture_receipts=capture_receipts,
             capture_evidence=capture_evidence,
             verifier_provenance=verifier_provenance,
+            admission_source="megaplan-shadow",
             **kwargs,
         )
 

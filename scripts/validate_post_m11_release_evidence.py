@@ -11,6 +11,12 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
+from arnold.conformance.checks import (
+    validate_collection_artifact_placements,
+    validate_canonical_artifact_placements,
+    validate_canonical_root_artifacts,
+)
+
 
 SHA1 = re.compile(r"^[0-9a-f]{40}$")
 SHA256 = re.compile(r"^[0-9a-f]{64}$")
@@ -520,17 +526,9 @@ def validate(path: Path) -> None:
                     )
                 )
 
-    for index, item in enumerate(data.get("canonical_artifact_moves", [])):
-        source = repo / item["from"]
-        destination = repo / item["to"]
-        if source.exists():
-            raise ValueError(
-                f"canonical_artifact_moves[{index}].from still exists: {item['from']}"
-            )
-        if not destination.is_file():
-            raise ValueError(
-                f"canonical_artifact_moves[{index}].to is missing: {item['to']}"
-            )
+    validate_collection_artifact_placements(data, repo_root=repo)
+    validate_canonical_artifact_placements(data, repo_root=repo)
+    validate_canonical_root_artifacts(data, repo_root=repo)
 
     for sha in sorted(git_objects):
         _git("cat-file", "-e", f"{sha}^{{object}}", cwd=repo)

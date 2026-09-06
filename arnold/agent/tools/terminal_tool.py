@@ -12,6 +12,7 @@ import json
 import logging
 import os
 import re
+import shlex
 import threading
 import time
 from typing import Any, Optional
@@ -138,27 +139,45 @@ def _create_environment(env_type: str, image: str = "", cwd: str = "", timeout: 
 
 
 def _environment_for(task_id: str, *, timeout: int | None = None) -> LocalEnvironment:
-    config = _get_env_config()
     task_id = task_id or "default"
-    overrides = _task_env_overrides.get(task_id, {})
-    cwd = str(overrides.get("cwd") or config["cwd"])
-    with _env_lock:
-        existing = _active_environments.get(task_id)
-        if existing is not None:
-            _last_activity[task_id] = time.time()
-            return existing
     with _creation_locks_lock:
         lock = _creation_locks.setdefault(task_id, threading.Lock())
     with lock:
+        # Serialize identity validation, stale replacement, cleanup, and
+        # creation for one task.  A fast path outside this lock can return an
+        # environment just as another caller is replacing and cleaning it.
+        config = _get_env_config()
+        overrides = _task_env_overrides.get(task_id, {})
+        cwd = str(overrides.get("cwd") or config["cwd"])
+
+        def is_current(environment: LocalEnvironment) -> bool:
+            # ``environment.cwd`` is mutable for persistent shells (a command
+            # may deliberately ``cd``).  Compare the task binding captured at
+            # creation time instead, so a cached shell is not replaced merely
+            # because its current directory changed during normal use.
+            return (
+                getattr(environment, "_terminal_task_cwd", None) == cwd
+                and getattr(environment, "_terminal_persistent", None)
+                == config["local_persistent"]
+            )
+
+        stale: LocalEnvironment | None = None
         with _env_lock:
             existing = _active_environments.get(task_id)
-            if existing is not None:
+            if existing is not None and is_current(existing):
                 _last_activity[task_id] = time.time()
                 return existing
+            if existing is not None:
+                stale = _active_environments.pop(task_id, None)
+                _last_activity.pop(task_id, None)
+        if stale is not None:
+            _cleanup_environment(task_id, stale)
         environment = _create_environment(
             "local", cwd=cwd, timeout=timeout or config["timeout"],
             local_config={"persistent": config["local_persistent"]}, task_id=task_id,
         )
+        environment._terminal_task_cwd = cwd
+        environment._terminal_persistent = config["local_persistent"]
         with _env_lock:
             _active_environments[task_id] = environment
             _last_activity[task_id] = time.time()
@@ -172,24 +191,73 @@ def _check_disk_usage_warning():
 
 def _cleanup_inactive_envs(lifetime_seconds: int = 300):
     now = time.time()
-    stale: list[tuple[str, LocalEnvironment]] = []
     with _env_lock:
-        for task_id, last_used in list(_last_activity.items()):
-            if now - last_used > lifetime_seconds:
-                environment = _active_environments.pop(task_id, None)
-                _last_activity.pop(task_id, None)
+        task_ids = [
+            task_id for task_id, last_used in _last_activity.items()
+            if now - last_used > lifetime_seconds
+        ]
+    for task_id in task_ids:
+        with _creation_locks_lock:
+            lock = _creation_locks.setdefault(task_id, threading.Lock())
+        with lock:
+            try:
+                with _env_lock:
+                    last_used = _last_activity.get(task_id)
+                    if last_used is None or now - last_used <= lifetime_seconds:
+                        continue
+                    environment = _active_environments.pop(task_id, None)
+                    _last_activity.pop(task_id, None)
                 if environment is not None:
-                    stale.append((task_id, environment))
-    for task_id, environment in stale:
+                    _cleanup_environment(task_id, environment)
+            finally:
+                with _creation_locks_lock:
+                    if _creation_locks.get(task_id) is lock:
+                        _creation_locks.pop(task_id, None)
+
+
+def _cleanup_environment(task_id: str, environment: LocalEnvironment) -> None:
+    """Clear the paired file-ops cache and clean one environment."""
+    try:
+        from arnold.agent.tools.file_tools import clear_file_ops_cache
+        clear_file_ops_cache(task_id)
+    except Exception:
+        pass
+    try:
+        environment.cleanup()
+    except Exception:
+        logger.warning("Error cleaning local environment for %s", task_id, exc_info=True)
+
+
+def _cleanup_task_environment(task_id: str, lock: threading.Lock) -> None:
+    with _env_lock:
+        environment = _active_environments.pop(task_id, None)
+        _last_activity.pop(task_id, None)
+    if environment is not None:
+        _cleanup_environment(task_id, environment)
+    with _creation_locks_lock:
+        if _creation_locks.get(task_id) is lock:
+            _creation_locks.pop(task_id, None)
+
+
+def cleanup_vm(task_id: str):
+    task_id = task_id or "default"
+    with _creation_locks_lock:
+        lock = _creation_locks.setdefault(task_id, threading.Lock())
+    with lock:
+        _cleanup_task_environment(task_id, lock)
+
+
+def cleanup_all_environments():
+    with _env_lock:
+        task_ids = list(_active_environments)
+    cleaned = 0
+    for task_id in task_ids:
         try:
-            from arnold.agent.tools.file_tools import clear_file_ops_cache
-            clear_file_ops_cache(task_id)
-        except Exception:
-            pass
-        try:
-            environment.cleanup()
+            cleanup_vm(task_id)
+            cleaned += 1
         except Exception:
             logger.warning("Error cleaning local environment for %s", task_id, exc_info=True)
+    return cleaned
 
 
 def _cleanup_thread_worker():
@@ -231,34 +299,6 @@ def get_active_environments_info() -> dict[str, Any]:
         }
 
 
-def cleanup_vm(task_id: str):
-    with _env_lock:
-        environment = _active_environments.pop(task_id, None)
-        _last_activity.pop(task_id, None)
-    with _creation_locks_lock:
-        _creation_locks.pop(task_id, None)
-    try:
-        from arnold.agent.tools.file_tools import clear_file_ops_cache
-        clear_file_ops_cache(task_id)
-    except Exception:
-        pass
-    if environment is not None:
-        environment.cleanup()
-
-
-def cleanup_all_environments():
-    with _env_lock:
-        task_ids = list(_active_environments)
-    cleaned = 0
-    for task_id in task_ids:
-        try:
-            cleanup_vm(task_id)
-            cleaned += 1
-        except Exception:
-            logger.warning("Error cleaning local environment %s", task_id, exc_info=True)
-    return cleaned
-
-
 def _atexit_cleanup():
     _stop_cleanup_thread()
     cleanup_all_environments()
@@ -268,11 +308,119 @@ atexit.register(_atexit_cleanup)
 
 
 def _dangerous_command(command: str) -> bool:
-    """Classify commands requiring an external approval authority."""
-    return bool(re.search(
-        r"(?:^|[;&|]\s*|\s)(?:rm\s+-rf|rmdir\b|mkfs\b|shutdown\b|reboot\b|git\s+(?:push|reset|clean|checkout)\b|sudo\b)",
-        command, re.IGNORECASE,
-    )) or bool(re.search(r"[^>]>(?!>)", command))
+    """Classify bounded destructive command forms requiring approval."""
+    if not isinstance(command, str):
+        return True
+    # Do not let shell nesting hide a destructive child from the top-level
+    # segment scanner.  These forms are intentionally fail-closed rather than
+    # recursively interpreted as a second shell language.
+    if "`" in command or re.search(r"(?<!\\)\$\(", command):
+        return True
+    try:
+        # shlex treats newlines as ordinary whitespace.  Turn only
+        # unquoted newlines into an explicit command separator so a second
+        # command cannot evade classification; quoted newlines remain data.
+        normalized: list[str] = []
+        quote: str | None = None
+        escaped = False
+        for character in command:
+            if escaped:
+                normalized.append(character)
+                escaped = False
+            elif character == "\\":
+                normalized.append(character)
+                escaped = True
+            elif quote:
+                normalized.append(character)
+                if character == quote:
+                    quote = None
+            elif character in {"'", '"'}:
+                normalized.append(character)
+                quote = character
+            elif character == "\n":
+                normalized.extend((" ", ";", " "))
+            else:
+                normalized.append(character)
+        lexer = shlex.shlex("".join(normalized), posix=True, punctuation_chars=";&|")
+        lexer.whitespace_split = True
+        tokens = list(lexer)
+    except (ValueError, TypeError):
+        return True
+
+    def is_separator(token: str) -> bool:
+        return bool(token) and set(token) <= {";", "&", "|"}
+
+    destructive_git = {"push", "reset", "clean", "checkout"}
+
+    def rm_segment_is_dangerous(segment: list[str], start: int) -> bool:
+        recursive = force_flag = False
+        for token in segment[start + 1:]:
+            if token == "--":
+                break
+            if token == "--recursive":
+                recursive = True
+            elif token == "--force":
+                force_flag = True
+            elif token.startswith("-") and not token.startswith("--"):
+                recursive = recursive or "r" in token[1:]
+                force_flag = force_flag or "f" in token[1:]
+        return recursive and force_flag
+
+    def git_segment_is_dangerous(segment: list[str], start: int) -> bool:
+        j = start + 1
+        while j < len(segment):
+            token = segment[j]
+            if token in {"-C", "-c", "--git-dir", "--work-tree", "--namespace", "--config-env"}:
+                j += 2
+                continue
+            if token.startswith("-c") and len(token) > 2:
+                j += 1
+                continue
+            if any(token.startswith(option + "=") for option in
+                   ("--git-dir", "--work-tree", "--namespace", "--config-env")):
+                j += 1
+                continue
+            if token.startswith("-"):
+                j += 1
+                continue
+            return token.lower() in destructive_git
+        return False
+
+    i = 0
+    while i < len(tokens):
+        if is_separator(tokens[i]):
+            i += 1
+            continue
+        start = i
+        while i < len(tokens) and not is_separator(tokens[i]):
+            i += 1
+        segment = tokens[start:i]
+        if not segment:
+            continue
+        executable = segment[0].lower()
+        if executable in {"rmdir", "mkfs", "shutdown", "reboot", "sudo"}:
+            return True
+        if executable in {"bash", "sh", "zsh"} and any(
+            token == "-c" or token == "--command" or token.startswith("-c")
+            for token in segment[1:]
+        ):
+            return True
+        if executable in {"env", "command", "xargs"}:
+            # These wrappers can execute a later argv element.  Inspect only
+            # the bounded rm/git forms; ordinary `env echo` and `command pwd`
+            # remain safe classifications.
+            for index, token in enumerate(segment[1:], start=1):
+                if token.lower() == "rm" and rm_segment_is_dangerous(segment, index):
+                    return True
+                if token.lower() == "git" and git_segment_is_dangerous(segment, index):
+                    return True
+        if executable == "rm":
+            if rm_segment_is_dangerous(segment, 0):
+                return True
+        if executable == "git":
+            if git_segment_is_dangerous(segment, 0):
+                return True
+    return bool(re.search(r"[^>]>(?!>)", command))
 
 
 def _check_dangerous_command(command: str, env_type: str) -> dict[str, Any]:
@@ -289,7 +437,10 @@ def _check_dangerous_command(command: str, env_type: str) -> dict[str, Any]:
         decision = _approval_callback(command, "dangerous local command")
     except Exception:
         decision = "deny"
-    approved = decision in {"once", "session", "always", True}
+    approved = decision is True or (
+        isinstance(decision, str)
+        and decision in {"once", "session", "always"}
+    )
     return {
         "approved": approved,
         "status": "allowed" if approved else "blocked",
@@ -311,10 +462,9 @@ def _handle_sudo_failure(output: str, env_type: str) -> str:
 def terminal_tool(command: str, background: bool = False, timeout: Optional[int] = None,
                  task_id: Optional[str] = None, force: bool = False,
                  workdir: Optional[str] = None, check_interval: Optional[int] = None,
-                 pty: bool = False) -> str:
+    pty: bool = False) -> str:
     """Execute one foreground command in the canonical local environment."""
     try:
-        config = _get_env_config()
         if background:
             return json.dumps({
                 "output": "", "exit_code": -1,
@@ -323,19 +473,24 @@ def terminal_tool(command: str, background: bool = False, timeout: Optional[int]
             })
         if not isinstance(command, str) or not command.strip():
             return json.dumps({"output": "", "exit_code": -1, "error": "command is required"})
-        if not force:
-            approval = _check_all_guards(command, "local")
-            if not approval.get("approved"):
-                return json.dumps({
-                    "output": "", "exit_code": -1,
-                    "error": approval.get("message", "Command denied"),
-                    "status": approval.get("status", "blocked"),
-                    "description": approval.get("description", "command flagged"),
-                }, ensure_ascii=False)
+        # Retain force for API compatibility, but never let it bypass the
+        # approval authority.  Denial precedes config/environment access.
+        approval = _check_all_guards(command, "local")
+        if not approval.get("approved"):
+            return json.dumps({
+                "output": "", "exit_code": -1,
+                "error": approval.get("message", "Command denied"),
+                "status": approval.get("status", "blocked"),
+                "description": approval.get("description", "command flagged"),
+            }, ensure_ascii=False)
+        config = _get_env_config()
         effective_timeout = timeout or config["timeout"]
         environment = _environment_for(task_id or "default", timeout=effective_timeout)
         _start_cleanup_thread()
-        result = environment.execute(command, cwd=workdir or config["cwd"], timeout=effective_timeout)
+        # An omitted workdir means the task-bound environment owns cwd.  The
+        # global configured cwd is only used when creating that environment;
+        # reinjecting it here breaks persistent-shell directory continuity.
+        result = environment.execute(command, cwd=workdir or "", timeout=effective_timeout)
         output = _handle_sudo_failure(result.get("output", ""), "local")
         output = redact_sensitive_text(strip_ansi(_truncate_tool_result(output).strip())) if output else ""
         return json.dumps({"output": output, "exit_code": result.get("returncode", 0), "error": None}, ensure_ascii=False)

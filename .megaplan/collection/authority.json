@@ -1,0 +1,19 @@
+{
+  "schema": "megaplan.collection-layout.v1",
+  "scope": "initiative_collection",
+  "initiative_owner": null,
+  "authority_scope": "placement_only",
+  "root": ".megaplan/collection",
+  "bindings": [
+    {
+      "artifact_type": "cloud_guidance",
+      "source": ".megaplan/initiatives/CLOUD.md",
+      "destination": ".megaplan/collection/CLOUD.md"
+    },
+    {
+      "artifact_type": "aggregate_chain_snapshot",
+      "source": ".megaplan/initiatives/chain.yaml",
+      "destination": ".megaplan/collection/chain.yaml"
+    }
+  ]
+}

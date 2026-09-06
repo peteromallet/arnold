@@ -1,0 +1,133 @@
+{
+  "schema": "native-build-forward-continuation-handoff.v1",
+  "initiative": "native-build-forward-continuation-20260903-r9",
+  "source": {
+    "ref": "main",
+    "head": "7eeb0d2e7f9594c549dd405136bda8e8b042e6f4",
+    "branch": "fixer/native-build-forward-c2-d58a0346-20260903-r9"
+  },
+  "artifacts": {
+    "chain.yaml": "25584b139379cd166570498465919891ba64887c8e961761ea12c957e227483d",
+    "HANDOFF.md": "1b7818445fbb26120cea541b46d9e3db5ff1693ea18caac9f7532c8841d40c36",
+    "NORTHSTAR.md": "5edf0673142580ea922849c27538cb0c18e20983c5af4c26d9b9d5efd791699d",
+    "cloud.yaml": "01b6bead1a18adbd16e40e447c65df23aa9c925a48824a76eceadf993e1b2cb0",
+    "arnold_pipelines/megaplan/profiles/all-muse-spark-openrouter.toml": "99f6f336ac561cb58b389252ebab1e3652b8f1da8b0eb835eae05c45c0158b1a"
+  },
+  "predecessor": {
+    "chain_spec": "/workspace/runtime-candidates/native-build-forward/.megaplan/initiatives/native-build-forward/chain.yaml",
+    "chain_spec_sha256": "60a6cfc151e935de8308f4bee2316b5948827d5e9610e3a11adc93a1e5ef99b1",
+    "chain_state": "/workspace/runtime-candidates/native-build-forward/.megaplan/plans/.chains/chain-672f8a08988a.json",
+    "chain_state_sha256": "fb4c58d491a1c47c7f744d2fc8c344b1656ea012f9b4a53d6f935d9f21808ad6",
+    "cursor": 6,
+    "completed_count": 6,
+    "old_head": "57ce08b200df95323f77538acc81484353051479",
+    "old_branch": "fixer/native-build-forward-nbf08-final-20260901",
+    "retired_c2_state_sha256": "65a32e32a74f27ba534fb62a2e15f9551af8944ba8d42e34c655625c1836d7a6",
+    "retired_c2_binding_sha256": "98ba17eb1490cefbe9b2ee2999d420226560f6075a450a8a05af404b774c0df2",
+    "retired_c2_execution_sha256": "16a9bca8cf53e22636a98fae43a5eb8f0550a1268d141bbfca12b9db88018e3b",
+    "operational_refresh_manifest_sha256": "b82e8e1916165bd95d7f22f7ad47296c1c05a11bc2ee90d79eea7723ec75e4c6",
+    "operational_refresh_ledger_sha256": "693170b7ae1837646a06ceea621192cc057516bea842df7a66315bac5eaff33c",
+    "promotion_receipt_digest_inventory_prefix": "7f14d25a",
+    "custody_manifest_digest_inventory_prefix": "c06bc802",
+    "archived_ledger_digest_inventory_prefix": "e5d8c648"
+  },
+  "policy": {
+    "old_chain": "paused_immutable_historical_authority",
+    "new_chain": "fresh_empty_history_starts_at_native-c2-completion-evaluation",
+    "replay_omitted_completed_prefix": false,
+    "release_or_resume_performed": false,
+    "remote_mutation_performed": false,
+    "launch_performed": false
+  },
+  "superseded_continuation": {
+    "initiative": "native-build-forward-continuation-20260902-r2",
+    "namespace": "native-build-forward-c2-c4b0c102-20260902-r2",
+    "source_head": "c4b0c102e3c72ac8a28ff85f9af6e1a4728e2d52",
+    "failed_wbc_receipt_preserved": true,
+    "history_reused": false
+  },
+  "failed_r3_launch": {
+    "namespace": "native-build-forward-c2-ec69ede3-20260902-r3",
+    "runtime": "/workspace/runtime-candidates/native-build-forward-c2-ec69ede3-20260902-r3",
+    "marker": "/workspace/.megaplan/cloud-sessions/native-build-forward-c2-ec69ede3-20260902-r3.json",
+    "failure_code": "engine_ref_probe_failed",
+    "chain_started": false,
+    "runtime_and_marker_preserved": true,
+    "reused_by_r4": false
+  },
+  "failed_r4_launch": {
+    "namespace": "native-build-forward-c2-bb000694-20260903-r4",
+    "runtime": "/workspace/runtime-candidates/native-build-forward-continuation-20260902-r4",
+    "manifest": "/workspace/.megaplan/native-build-forward-continuation-20260902-r4.json",
+    "source_head_at_recovery": "780129da0750661d47e6425859936181ca0e60a9",
+    "partial_runtime_head": "bbe1b41e5285c26b96353975193d0f4f6295292c",
+    "failure_code": "chain_runtime_create_failed",
+    "failure_boundary": "partial_runtime_base_ref_and_origin_divergence",
+    "chain_started": false,
+    "runtime_and_manifest_preserved": true,
+    "reused_by_r5": false
+  },
+  "failed_r5_launch": {
+    "namespace": "native-build-forward-c2-780129da-20260903-r5",
+    "runtime": "/workspace/runtime-candidates/native-build-forward-continuation-20260903-r5",
+    "manifest": "/workspace/.megaplan/native-build-forward-continuation-20260903-r5.json",
+    "session": "native-build-forward-c2-780129da-20260903-r5-f1914ce1b1fae926",
+    "failure_code": "chain_runtime_create_failed",
+    "failure_boundary": "stale_installed_runtime_wrapper",
+    "chain_started": false,
+    "marker_created": false,
+    "owner_created": false,
+    "runtime_and_manifest_preserved": true,
+    "reused_by_r9": false
+  },
+  "failed_r6_launch": {
+    "namespace": "native-build-forward-c2-4635fc27-20260903-r6",
+    "runtime": "/workspace/runtime-candidates/native-build-forward-c2-4635fc27-20260903-r6",
+    "source_checkout": "/workspace/runtime-candidates/native-build-forward-c2-4635fc27-20260903-r6-arnold",
+    "session": "native-build-forward-c2-4635fc27-20260903-r6-137b89c9f6dc8fcf",
+    "failure_code": "chain_runtime_create_failed",
+    "failure_boundary": "launch_canonicalization_mutated_reviewed_source",
+    "chain_started": false,
+    "marker_created": false,
+    "owner_created": false,
+    "provider_receipt_created": false,
+    "fixer_started": false,
+    "partial_runtime_preserved": true,
+    "reused_by_r9": false
+  },
+  "failed_r7_launch": {
+    "namespace": "native-build-forward-c2-a8baedf1-20260903-r7",
+    "runtime": "/workspace/runtime-candidates/native-build-forward-c2-a8baedf1-20260903-r7",
+    "source_checkout": "/workspace/runtime-candidates/native-build-forward-c2-a8baedf1-20260903-r7-arnold",
+    "manifest": "/workspace/.megaplan/native-build-forward-continuation-20260903-r7.json",
+    "session": "native-build-forward-c2-a8baedf1-20260903-r7-41065c6b4caf139f",
+    "failure_code": "chain_runtime_probe_unreadable",
+    "failure_boundary": "on_box_git_classification_suppressed_probe_stdout",
+    "wbc_events_sha256": "de852c7da389b07cca28cf7b25be470e2dea98c417b44758c20959f7385933df",
+    "chain_started": false,
+    "marker_created": false,
+    "owner_created": false,
+    "provider_receipt_created": true,
+    "fixer_started": false,
+    "partial_runtime_preserved": true,
+    "runtime_manifest_preserved": true,
+    "reused_by_r9": false
+  },
+  "failed_r8_launch": {
+    "namespace": "native-build-forward-c2-9707ce4a-20260903-r8",
+    "runtime": "/workspace/runtime-candidates/native-build-forward-continuation-20260903-r8",
+    "source_checkout": "/workspace/runtime-candidates/native-build-forward-c2-9707ce4a-20260903-r8-arnold",
+    "source_head": "d58a034625dc45559c74b82503e765832aa4f143",
+    "source_tree": "247464c685351a8583ea3fc9cc43595b3a0ec706",
+    "failure_code": "chain_runtime_create_failed",
+    "failure_boundary": "github_push_auth_unavailable",
+    "error": "git push could not read Username for the canonical GitHub origin",
+    "chain_started": false,
+    "marker_created": false,
+    "owner_created": false,
+    "provider_receipt_created": true,
+    "runtime_manifest_created": false,
+    "partial_runtime_preserved": true,
+    "reused_by_r9": false
+  }
+}

@@ -12,8 +12,12 @@ from __future__ import annotations
 import ast
 import copy
 import fnmatch
+import hashlib
 import json
+import re
+import subprocess
 from pathlib import Path
+from pathlib import PurePosixPath
 from typing import Any, Callable, Collection, Mapping
 
 from arnold.conformance import ConformanceCheckResult
@@ -54,6 +58,387 @@ _MEGAPLAN_INITIATIVE_SUBDIRS = frozenset(
         "evidence",
     }
 )
+
+_PLACEMENT_SHA1 = re.compile(r"^[0-9a-f]{40}$")
+_PLACEMENT_SHA256 = re.compile(r"^[0-9a-f]{64}$")
+_PLACEMENT_KINDS = frozenset({"move", "promote_preserving_source"})
+_COLLECTION_SCHEMA = "megaplan.collection-layout.v1"
+_COLLECTION_SCOPE = "initiative_collection"
+_COLLECTION_ROOT = ".megaplan/collection"
+_COLLECTION_AUTHORITY = f"{_COLLECTION_ROOT}/authority.json"
+_COLLECTION_SOURCE_REVISION = "4023fdd9b2027561e221dac98e234b59289e0ca6"
+_COLLECTION_BINDINGS = (
+    {
+        "artifact_type": "cloud_guidance",
+        "source": ".megaplan/initiatives/CLOUD.md",
+        "destination": f"{_COLLECTION_ROOT}/CLOUD.md",
+    },
+    {
+        "artifact_type": "aggregate_chain_snapshot",
+        "source": ".megaplan/initiatives/chain.yaml",
+        "destination": f"{_COLLECTION_ROOT}/chain.yaml",
+    },
+)
+_COLLECTION_PATHS = frozenset(
+    path
+    for binding in _COLLECTION_BINDINGS
+    for path in (binding["source"], binding["destination"])
+)
+_CANONICAL_ROOT_GENERATORS = frozenset(
+    {
+        "chain.prelaunch_disposition.v1",
+        "critique_ledger_completion.validator.v1",
+        "finite_canary.package.v1",
+    }
+)
+
+
+def validate_collection_artifact_placements(
+    record: Mapping[str, Any],
+    *,
+    repo_root: Path,
+) -> tuple[str, ...]:
+    """Validate the ownerless, placement-only collection contract.
+
+    The collection is deliberately a sibling of ``initiatives``.  Its
+    authority file names exactly two source-preserving bindings; the release
+    record must contain exactly one typed promotion row for each binding.
+    """
+
+    def _safe_path(value: Any, label: str) -> str:
+        if not isinstance(value, str) or not value:
+            raise ValueError(f"{label} must be a non-empty repository-relative path")
+        path = PurePosixPath(value)
+        if path.is_absolute() or ".." in path.parts or path.as_posix() != value:
+            raise ValueError(f"{label} must be normalized and repository-relative")
+        resolved = (repo_root / Path(*path.parts)).resolve()
+        try:
+            resolved.relative_to(repo_root.resolve())
+        except ValueError as exc:
+            raise ValueError(f"{label} escapes the repository") from exc
+        return value
+
+    def _sha256(path: Path, label: str) -> str:
+        if not path.is_file():
+            raise ValueError(f"{label} is missing: {path}")
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+
+    authority_path = repo_root / Path(*PurePosixPath(_COLLECTION_AUTHORITY).parts)
+    if not authority_path.is_file():
+        raise ValueError(f"collection authority is missing: {_COLLECTION_AUTHORITY}")
+    try:
+        authority = json.loads(authority_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"collection authority is not valid JSON: {exc}") from exc
+    if not isinstance(authority, dict) or set(authority) != {
+        "schema", "scope", "initiative_owner", "authority_scope", "root", "bindings"
+    }:
+        raise ValueError("collection authority has unknown or missing fields")
+    if authority["schema"] != _COLLECTION_SCHEMA:
+        raise ValueError("collection authority schema is unsupported")
+    if authority["scope"] != _COLLECTION_SCOPE:
+        raise ValueError("collection authority scope is invalid")
+    if authority["initiative_owner"] is not None:
+        raise ValueError("collection authority must be ownerless")
+    if authority["authority_scope"] != "placement_only":
+        raise ValueError("collection authority scope must be placement_only")
+    if authority["root"] != _COLLECTION_ROOT:
+        raise ValueError("collection authority root is invalid")
+    bindings = authority["bindings"]
+    if not isinstance(bindings, list) or bindings != list(_COLLECTION_BINDINGS):
+        raise ValueError("collection authority bindings do not match the exact contract")
+    if len({binding["artifact_type"] for binding in bindings}) != len(bindings):
+        raise ValueError("collection authority contains duplicate bindings")
+    for index, binding in enumerate(bindings):
+        for key in ("source", "destination"):
+            _safe_path(binding[key], f"collection authority bindings[{index}].{key}")
+        if not binding["destination"].startswith(_COLLECTION_ROOT + "/"):
+            raise ValueError("collection authority destination escapes collection root")
+        if not binding["source"].startswith(".megaplan/initiatives/"):
+            raise ValueError("collection authority source is not an initiative artifact")
+        source = repo_root / Path(*PurePosixPath(binding["source"]).parts)
+        destination = repo_root / Path(*PurePosixPath(binding["destination"]).parts)
+        if _sha256(source, f"collection source {binding['source']}") != _sha256(
+            destination, f"collection destination {binding['destination']}"
+        ):
+            raise ValueError(f"collection source/destination bytes differ for {binding['artifact_type']}")
+
+    rows = record.get("canonical_artifact_moves")
+    if not isinstance(rows, list):
+        raise ValueError("canonical_artifact_moves must be a list")
+    collection_rows = []
+    for index, row in enumerate(rows):
+        if not isinstance(row, dict):
+            continue
+        if any(
+            isinstance(row.get(key), str)
+            and (
+                row[key] in _COLLECTION_PATHS
+                or row[key].startswith(_COLLECTION_ROOT + "/")
+            )
+            for key in ("from", "to")
+        ):
+            collection_rows.append((index, row))
+    if len(collection_rows) != len(_COLLECTION_BINDINGS):
+        raise ValueError("collection authority and promotion rows must correspond one-to-one")
+
+    authority_hash = _sha256(authority_path, _COLLECTION_AUTHORITY)
+    seen_types: set[str] = set()
+    covered: list[str] = [_COLLECTION_AUTHORITY]
+    for index, row in collection_rows:
+        label = f"canonical_artifact_moves[{index}]"
+        expected_fields = {
+            "kind", "from", "to", "source_revision", "source_sha256",
+            "destination_sha256", "collection_scope", "artifact_type", "authority",
+        }
+        if set(row) != expected_fields:
+            raise ValueError(f"{label} collection row has unknown or missing fields")
+        if row["kind"] != "promote_preserving_source":
+            raise ValueError(f"{label} collection rows must preserve their sources")
+        if row["collection_scope"] != _COLLECTION_SCOPE:
+            raise ValueError(f"{label}.collection_scope is invalid")
+        artifact_type = row["artifact_type"]
+        if artifact_type in seen_types:
+            raise ValueError(f"{label} duplicates a collection binding")
+        seen_types.add(artifact_type)
+        binding = next((item for item in _COLLECTION_BINDINGS if item["artifact_type"] == artifact_type), None)
+        if binding is None or row["from"] != binding["source"] or row["to"] != binding["destination"]:
+            raise ValueError(f"{label} has an unknown artifact type or exact mapping")
+        if row["source_revision"] != _COLLECTION_SOURCE_REVISION:
+            raise ValueError(f"{label}.source_revision is not the pinned source revision")
+        authority_binding = row["authority"]
+        if not isinstance(authority_binding, dict) or set(authority_binding) != {"path", "sha256"}:
+            raise ValueError(f"{label}.authority has unknown or missing fields")
+        if authority_binding["path"] != _COLLECTION_AUTHORITY or authority_binding["sha256"] != authority_hash:
+            raise ValueError(f"{label}.authority does not bind the collection manifest")
+        if row["source_sha256"] != row["destination_sha256"]:
+            raise ValueError(f"{label} collection promotion must be equal-byte")
+        source = repo_root / Path(*PurePosixPath(binding["source"]).parts)
+        destination = repo_root / Path(*PurePosixPath(binding["destination"]).parts)
+        if _sha256(source, f"{label}.from") != row["source_sha256"]:
+            raise ValueError(f"{label}.from hash mismatch")
+        if _sha256(destination, f"{label}.to") != row["destination_sha256"]:
+            raise ValueError(f"{label}.to hash mismatch")
+        source_blob = subprocess.run(
+            ["git", "show", f"{_COLLECTION_SOURCE_REVISION}:{binding['source']}"],
+            cwd=repo_root, capture_output=True, check=False,
+        )
+        if source_blob.returncode or hashlib.sha256(source_blob.stdout).hexdigest() != row["source_sha256"]:
+            raise ValueError(f"{label}.source_revision hash mismatch")
+        covered.extend((binding["source"], binding["destination"]))
+    if seen_types != {binding["artifact_type"] for binding in _COLLECTION_BINDINGS}:
+        raise ValueError("collection promotion rows do not cover every authority binding")
+    return tuple(covered)
+
+
+def validate_canonical_artifact_placements(
+    record: Mapping[str, Any],
+    *,
+    repo_root: Path,
+) -> tuple[str, ...]:
+    """Validate and return paths covered by typed post-M11 placements.
+
+    Placement rows are deliberately exact and content-addressed.  This helper
+    is shared by the release-evidence validator and the layout check so a
+    layout exemption can only be earned by the authoritative placement record.
+    """
+
+    rows = record.get("canonical_artifact_moves")
+    if not isinstance(rows, list) or not rows:
+        raise ValueError("canonical_artifact_moves must be a non-empty list")
+
+    collection_touched = any(
+        isinstance(item, dict)
+        and any(
+            isinstance(item.get(key), str)
+            and (
+                item[key] in _COLLECTION_PATHS
+                or item[key].startswith(_COLLECTION_ROOT + "/")
+            )
+            for key in ("from", "to")
+        )
+        for item in rows
+    )
+    if collection_touched:
+        validate_collection_artifact_placements(record, repo_root=repo_root)
+
+    def _safe_path(value: Any, label: str) -> str:
+        if not isinstance(value, str) or not value:
+            raise ValueError(f"{label} must be a non-empty repository-relative path")
+        path = PurePosixPath(value)
+        if path.is_absolute() or ".." in path.parts or path.as_posix() != value:
+            raise ValueError(f"{label} must be normalized and repository-relative")
+        resolved = (repo_root / Path(*path.parts)).resolve()
+        try:
+            resolved.relative_to(repo_root.resolve())
+        except ValueError as exc:
+            raise ValueError(f"{label} escapes the repository") from exc
+        return value
+
+    def _sha256(path: Path, label: str) -> str:
+        if not path.is_file():
+            raise ValueError(f"{label} is missing: {path}")
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+
+    def _git_blob(revision: str, path: str, label: str) -> bytes:
+        if not isinstance(revision, str) or not _PLACEMENT_SHA1.fullmatch(revision):
+            raise ValueError(f"{label} must be a lowercase 40-character Git SHA")
+        probe = subprocess.run(
+            ["git", "cat-file", "-e", f"{revision}^{{commit}}"],
+            cwd=repo_root,
+            capture_output=True,
+            check=False,
+        )
+        if probe.returncode:
+            raise ValueError(f"{label} does not name a Git commit")
+        result = subprocess.run(
+            ["git", "show", f"{revision}:{path}"],
+            cwd=repo_root,
+            capture_output=True,
+            check=False,
+        )
+        if result.returncode:
+            raise ValueError(f"{label} does not contain {path}")
+        return result.stdout
+
+    covered: list[str] = []
+    for index, item in enumerate(rows):
+        label = f"canonical_artifact_moves[{index}]"
+        if not isinstance(item, dict):
+            raise ValueError(f"{label} must be an object")
+        kind = item.get("kind")
+        if kind not in _PLACEMENT_KINDS:
+            raise ValueError(f"{label}.kind is unknown")
+        expected = {
+            "kind", "from", "to", "source_revision",
+            "source_sha256", "destination_sha256",
+        }
+        if kind == "move" or "destination_revision" in item:
+            expected.add("destination_revision")
+        if "authority" in item:
+            expected.add("authority")
+        if kind == "promote_preserving_source":
+            source_hash = item.get("source_sha256")
+            destination_hash = item.get("destination_sha256")
+            if source_hash != destination_hash:
+                expected.add("supersession")
+        if collection_touched and any(
+            isinstance(item.get(key), str)
+            and (
+                item[key] in _COLLECTION_PATHS
+                or item[key].startswith(_COLLECTION_ROOT + "/")
+            )
+            for key in ("from", "to")
+        ):
+            expected.update({"collection_scope", "artifact_type", "authority"})
+        if set(item) != expected:
+            raise ValueError(f"{label} has unknown or missing fields")
+        source_rel = _safe_path(item["from"], f"{label}.from")
+        destination_rel = _safe_path(item["to"], f"{label}.to")
+        if source_rel == destination_rel:
+            raise ValueError(f"{label} source and destination must differ")
+        for key in ("source_sha256", "destination_sha256"):
+            if not isinstance(item[key], str) or not _PLACEMENT_SHA256.fullmatch(item[key]):
+                raise ValueError(f"{label}.{key} must be a lowercase SHA-256")
+
+        source = repo_root / Path(*PurePosixPath(source_rel).parts)
+        destination = repo_root / Path(*PurePosixPath(destination_rel).parts)
+        source_blob = _git_blob(item["source_revision"], source_rel, f"{label}.source_revision")
+        if hashlib.sha256(source_blob).hexdigest() != item["source_sha256"]:
+            raise ValueError(f"{label}.source_revision hash mismatch")
+        if "destination_revision" in item:
+            destination_blob = _git_blob(
+                item["destination_revision"], destination_rel,
+                f"{label}.destination_revision",
+            )
+            if hashlib.sha256(destination_blob).hexdigest() != item["destination_sha256"]:
+                raise ValueError(f"{label}.destination_revision hash mismatch")
+        if _sha256(destination, f"{label}.to") != item["destination_sha256"]:
+            raise ValueError(f"{label}.to hash mismatch")
+
+        if "authority" in item:
+            authority = item["authority"]
+            if not isinstance(authority, dict) or set(authority) != {"path", "sha256"}:
+                raise ValueError(f"{label}.authority has unknown or missing fields")
+            authority_path = _safe_path(authority["path"], f"{label}.authority.path")
+            authority_hash = authority["sha256"]
+            if not isinstance(authority_hash, str) or not _PLACEMENT_SHA256.fullmatch(authority_hash):
+                raise ValueError(f"{label}.authority.sha256 is invalid")
+            if _sha256(repo_root / Path(*PurePosixPath(authority_path).parts), f"{label}.authority.path") != authority_hash:
+                raise ValueError(f"{label}.authority hash mismatch")
+
+        if kind == "move":
+            if source.exists():
+                raise ValueError(f"{label}.from must be absent for move")
+        else:
+            if _sha256(source, f"{label}.from") != item["source_sha256"]:
+                raise ValueError(f"{label}.from historical bytes mismatch")
+            if item["source_sha256"] == item["destination_sha256"]:
+                if "supersession" in item:
+                    raise ValueError(f"{label} equal-byte promotion cannot declare supersession")
+            else:
+                supersession = item.get("supersession")
+                if not isinstance(supersession, dict) or set(supersession) != {"relation", "evidence"}:
+                    raise ValueError(f"{label} requires an exact supersession relation")
+                if supersession["relation"] != "canonical_destination_supersedes_historical_source":
+                    raise ValueError(f"{label}.supersession.relation is invalid")
+                evidence = supersession["evidence"]
+                if (
+                    not isinstance(evidence, dict)
+                    or set(evidence) != {"commit", "source", "destination"}
+                    or "destination_revision" not in item
+                    or evidence["commit"] != item["destination_revision"]
+                    or evidence["source"] != source_rel
+                    or evidence["destination"] != destination_rel
+                ):
+                    raise ValueError(f"{label}.supersession.evidence is invalid")
+        covered.extend((source_rel, destination_rel))
+    return tuple(covered)
+
+
+def validate_canonical_root_artifacts(
+    record: Mapping[str, Any],
+    *,
+    repo_root: Path,
+) -> tuple[str, ...]:
+    """Validate exact generator-owned initiative-root artifact declarations."""
+
+    rows = record.get("canonical_root_artifacts")
+    if not isinstance(rows, list):
+        raise ValueError("canonical_root_artifacts must be a list")
+    covered: list[str] = []
+    for index, item in enumerate(rows):
+        label = f"canonical_root_artifacts[{index}]"
+        if not isinstance(item, dict) or set(item) != {
+            "path", "generator", "authority", "sha256", "authority_sha256"
+        }:
+            raise ValueError(f"{label} has unknown or missing fields")
+        if item["generator"] not in _CANONICAL_ROOT_GENERATORS:
+            raise ValueError(f"{label}.generator is unknown")
+        path = PurePosixPath(item["path"])
+        authority = PurePosixPath(item["authority"])
+        for name, value in (("path", path), ("authority", authority)):
+            if value.is_absolute() or ".." in value.parts or value.as_posix() != item[name]:
+                raise ValueError(f"{label}.{name} must be normalized and repository-relative")
+            resolved = (repo_root / Path(*value.parts)).resolve()
+            try:
+                resolved.relative_to(repo_root.resolve())
+            except ValueError as exc:
+                raise ValueError(f"{label}.{name} escapes the repository") from exc
+        if not isinstance(item["sha256"], str) or not _PLACEMENT_SHA256.fullmatch(item["sha256"]):
+            raise ValueError(f"{label}.sha256 is invalid")
+        if not isinstance(item["authority_sha256"], str) or not _PLACEMENT_SHA256.fullmatch(item["authority_sha256"]):
+            raise ValueError(f"{label}.authority_sha256 is invalid")
+        target = repo_root / Path(*path.parts)
+        source = repo_root / Path(*authority.parts)
+        if not target.is_file() or hashlib.sha256(target.read_bytes()).hexdigest() != item["sha256"]:
+            raise ValueError(f"{label}.path is missing or hash-mismatched")
+        if not source.is_file() or hashlib.sha256(source.read_bytes()).hexdigest() != item["authority_sha256"]:
+            raise ValueError(f"{label}.authority is missing or hash-mismatched")
+        covered.append(path.as_posix())
+    if len(covered) != len(set(covered)):
+        raise ValueError("canonical_root_artifacts contains duplicate paths")
+    return tuple(covered)
 _MEGAPLAN_INITIATIVE_ROOT_FILES = frozenset(
     {
         "README.md",
@@ -797,11 +1182,58 @@ def check_megaplan_artifact_layout(
                 return True
         return False
 
+    placement_paths: set[str] = set()
+    placement_record = root / "docs" / "megaplan" / "post-m11-release-evidence-20260731.json"
+    collection_root = root / Path(*PurePosixPath(_COLLECTION_ROOT).parts)
+    if collection_root.exists() or (root / Path(*PurePosixPath(_COLLECTION_AUTHORITY).parts)).is_file():
+        try:
+            placement_paths.update(
+                validate_collection_artifact_placements(
+                    json.loads(placement_record.read_text(encoding="utf-8"))
+                    if placement_record.is_file()
+                    else {},
+                    repo_root=root,
+                )
+            )
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            unexpected[_COLLECTION_ROOT] = (
+                f"invalid typed collection layout contract: {exc}",
+            )
+    if placement_record.is_file():
+        try:
+            placement_paths.update(
+                validate_canonical_artifact_placements(
+                    json.loads(placement_record.read_text(encoding="utf-8")),
+                    repo_root=root,
+                )
+            )
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            unexpected[placement_record.relative_to(root).as_posix()] = (
+                f"invalid typed canonical placement record: {exc}",
+            )
+    root_artifact_paths: set[str] = set()
+    if placement_record.is_file():
+        try:
+            root_artifact_paths.update(
+                validate_canonical_root_artifacts(
+                    json.loads(placement_record.read_text(encoding="utf-8")),
+                    repo_root=root,
+                )
+            )
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            unexpected[placement_record.relative_to(root).as_posix()] = (
+                f"invalid typed canonical root-artifact record: {exc}",
+            )
+
     for path in sorted(root.rglob("*")):
         if not path.is_file():
             continue
         rel = path.relative_to(root).as_posix()
         if _is_allowed(rel):
+            continue
+        if rel in placement_paths:
+            continue
+        if rel in root_artifact_paths:
             continue
         if rel in declared_proof_paths:
             continue
@@ -826,6 +1258,8 @@ def check_megaplan_artifact_layout(
                 reason = None
             else:
                 reason = "initiative artifact outside canonical subdirectories"
+        elif rel.startswith(_COLLECTION_ROOT + "/"):
+            reason = "collection artifact outside validated authority bindings"
         elif rel.endswith("/chain.yaml"):
             reason = "chain spec outside .megaplan/initiatives/<initiative>/chain.yaml"
         if reason:
@@ -1594,8 +2028,12 @@ __all__ = [
     "check_import_coupling",
     "check_legacy_reference_allowlist",
     "check_never_port_artifacts",
+    "check_megaplan_artifact_layout",
     "check_package_name_staleness",
     "check_public_workflow_layering",
     "check_security_coverage_matrix",
     "check_semantic_coupling",
+    "validate_collection_artifact_placements",
+    "validate_canonical_artifact_placements",
+    "validate_canonical_root_artifacts",
 ]

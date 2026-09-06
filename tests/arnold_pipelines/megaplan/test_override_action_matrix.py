@@ -4,7 +4,7 @@ Covers:
 * Every legacy-handler or control-only canonical action is present in the matrix.
 * Every matrix entry is classified as either ``terminal_route`` or
   ``additive_config``.
-* Classification sets are disjoint and cover all 13 keys (12 legacy/cutover + reconcile-plan-ledger).
+* Classification sets are disjoint and cover all 14 canonical keys.
 * No key is double-classified or misclassified as ``additive_config`` when
   it has explicit route bindings in the OVERRIDE step component.
 * Convenience exports (``TERMINAL_ROUTE_ACTIONS``, ``ADDITIVE_CONFIG_ACTIONS``)
@@ -42,8 +42,8 @@ from arnold_pipelines.megaplan.workflows.override_matrix import (
 _ALL_KEYS = frozenset(_OVERRIDE_ACTIONS.keys()) | frozenset(CONTROL_ROUTED_ACTIONS)
 
 # Actions with explicit native source route bindings in the override interface
-# (abort→halt, force-proceed→finalize, replan→revise).
-_OVERRIDE_ROUTE_BINDING_ACTIONS = frozenset({"abort", "force-proceed", "replan"})
+# (abort→halt, force-proceed→finalize, replan/cap-revise-once→revise).
+_OVERRIDE_ROUTE_BINDING_ACTIONS = frozenset({"abort", "force-proceed", "replan", "cap-revise-once"})
 
 
 # ---------------------------------------------------------------------------
@@ -54,9 +54,9 @@ _OVERRIDE_ROUTE_BINDING_ACTIONS = frozenset({"abort", "force-proceed", "replan"}
 class TestOverrideActionMatrixCompleteness:
     """Every canonical override key participates in the matrix."""
 
-    def test_all_12_keys_present(self) -> None:
+    def test_all_14_keys_present(self) -> None:
         matrix_keys = frozenset(entry.action for entry in OVERRIDE_ACTION_MATRIX)
-        assert len(matrix_keys) == 13, f"Expected 13 keys, got {len(matrix_keys)}: {sorted(matrix_keys)}"
+        assert len(matrix_keys) == 14, f"Expected 14 keys, got {len(matrix_keys)}: {sorted(matrix_keys)}"
         assert matrix_keys == _ALL_KEYS, (
             f"Matrix keys do not match canonical dispatch registries.\n"
             f"  Missing from matrix: {sorted(_ALL_KEYS - matrix_keys)}\n"
@@ -124,8 +124,8 @@ class TestOverrideActionMatrixDisjointClassification:
         )
 
     def test_terminal_route_count(self) -> None:
-        assert len(TERMINAL_ROUTE_ACTIONS) == 8, (
-            f"Expected 7 terminal-route actions, got {len(TERMINAL_ROUTE_ACTIONS)}: "
+        assert len(TERMINAL_ROUTE_ACTIONS) == 9, (
+            f"Expected 9 terminal-route actions, got {len(TERMINAL_ROUTE_ACTIONS)}: "
             f"{TERMINAL_ROUTE_ACTIONS}"
         )
 
@@ -145,7 +145,7 @@ class TestOverrideActionMatrixRouteBindingConsistency:
             for binding in planning.declared_step_route_bindings("override")
             if binding.get("target_ref") in {"halt", "finalize", "revise"}
         }
-        assert labels == {"abort", "force_proceed", "replan"}
+        assert labels == {"abort", "force_proceed", "replan", "cap_revise_once"}
 
     def test_route_binding_actions_are_terminal(self) -> None:
         for action in _OVERRIDE_ROUTE_BINDING_ACTIONS:

@@ -615,7 +615,7 @@ def test_megaplan_boundary_contracts_importable_from_workflow_api() -> None:
     )
 
     # Verify imports resolve
-    assert len(BOUNDARY_CONTRACTS) == 51
+    assert len(BOUNDARY_CONTRACTS) == 52
     assert len(list(BoundaryTemplateKind)) == 10
     assert len(list(AdapterTemplateKind)) == 7
 

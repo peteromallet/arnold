@@ -106,7 +106,13 @@ RUNTIME_BRANCH_VOCABULARY = MappingProxyType(
         "tiebreaker_decision": ("proceed", "iterate", "escalate", "replan"),
         "tiebreaker_decide": ("proceed", "iterate", "escalate", "replan"),  # compatibility bridge
         "review": ("pass", "rework", "blocked", "force_proceeded", "deferred_human"),
-        "override": ("abort", "cutover", "force_proceed", "replan"),
+        "override": (
+            "abort",
+            "cap_revise_once",
+            "cutover",
+            "force_proceed",
+            "replan",
+        ),
         "revise": ("completed",),
     }
 )

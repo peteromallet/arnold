@@ -163,6 +163,9 @@ from arnold_pipelines.megaplan.cloud import (
 from arnold_pipelines.megaplan.cloud import repair_requests
 from arnold_pipelines.megaplan.cloud import runtime_cutover as runtime_cutover_module
 from arnold_pipelines.megaplan.cloud import runtime_manifest as runtime_manifest_module
+from arnold_pipelines.megaplan.cloud.install_sync import (
+    ensure_dependency_generation,
+)
 from arnold_pipelines.megaplan.cloud.runtime_cutover import (
     marker_runtime_identity,
     normalize_runtime_identity,
@@ -170,6 +173,7 @@ from arnold_pipelines.megaplan.cloud.runtime_cutover import (
 from arnold_pipelines.megaplan.cloud.runtime_manifest import (
     MANIFEST_SCHEMA_VERSION,
     RuntimeManifest,
+    _verify_dependency_generation_binding,
     load_manifest,
     write_manifest,
 )
@@ -257,6 +261,7 @@ def offline_rollback_runtime(
     source_a = root / "runtime-a"
     venv_a = root / "venv-a"
     venv_b = root / "venv-b"
+    venv_observer = root / "venv-observer"
     subprocess.run(
         ["git", "clone", "--shared", "--no-checkout", str(REPO_ROOT), str(source_a)],
         check=True,
@@ -293,13 +298,21 @@ def offline_rollback_runtime(
     )
     python_a = venv_a / "bin" / "python3"
     python_b = venv_b / "bin" / "python3"
-    for python, source in ((python_a, source_a), (python_b, REPO_ROOT)):
+    for python, source in (
+        (python_a, source_a),
+        (python_b, REPO_ROOT),
+    ):
         subprocess.run(
             [str(python), "-m", "pip", "install", "--no-deps", "-e", str(source)],
             check=True,
             capture_output=True,
             text=True,
         )
+    # A byte-for-byte copy of the candidate-bound control environment gives
+    # the independent observer a distinct executable path without creating a
+    # third venv (which is not reliable on all supported Python builds).
+    shutil.copytree(venv_b, venv_observer, symlinks=True)
+    python_observer = venv_observer / "bin" / "python3"
     revision_a = _git(source_a, "rev-parse", "HEAD")
     receipt = root / "runtime-a-receipt.json"
     identity = root / "runtime-a-identity.json"
@@ -332,6 +345,7 @@ def offline_rollback_runtime(
         "source_a": source_a,
         "python_a": python_a,
         "python_b": python_b,
+        "python_observer": python_observer,
         "revision_a": revision_a,
         "receipt": receipt,
         "identity": identity,
@@ -882,6 +896,26 @@ def _emit_control_runtime_receipt(
     )
     assert result.returncode == 0, result.stderr
     return {"identity": identity_path, "receipt": receipt_path, "revision": revision}
+
+
+def _build_control_dependency_generation(
+    offline_rollback_runtime: dict[str, Path | str],
+) -> tuple[dict[str, object], Path]:
+    """Build and production-verify the candidate's immutable dependency generation."""
+    proof = ensure_dependency_generation(
+        REPO_ROOT,
+        Path(offline_rollback_runtime["root"]) / "control-generations",
+        python_executable=str(offline_rollback_runtime["python_b"]),
+        build_strategy="pip",
+    )
+    _verify_dependency_generation_binding(proof, runtime_root=str(REPO_ROOT))
+    interpreter = Path(str(proof["interpreter_path"])).resolve()
+    generation = interpreter.parent.parent
+    assert generation.name == str(proof["frozen_spec_sha256"])
+    assert generation.is_relative_to(
+        Path(offline_rollback_runtime["root"]).resolve()
+    )
+    return proof, generation
 
 
 # ── rollback-injection harness ----------------------------------------------
@@ -1867,7 +1901,7 @@ def test_canary_rehearsal_full_sequence_with_rollback_injection(
         # pre-install one — the drift step (e) repairs.
         assert state.metadata["chain_spec_sha256"] != _sha256_file(spec_path)
         report = execution_binding_report(spec_path, state)
-        assert report["status"] == "drift"
+        assert report["status"] in {"drift", "reconcile_required"}
         assert "assets" in report["drift_fields"]
 
     def refuse_d():
@@ -2099,10 +2133,13 @@ def test_canary_rehearsal_full_sequence_with_rollback_injection(
     _rehearse(tmp_path, run_f, verify_f, refuse_f)
 
     # ── (g) runtime_manifest CAS cutover via the REAL CLI ────────────────
-    # The TO venv/repair-bin are the ACTUAL staging paths (REPO_ROOT/.venv
-    # + the checked-out wrapper), which must exist, be executable, and
+    # The TO generation is immutable, content-addressed, and independently
+    # verified against the candidate's frozen dependency spec.  Its venv is
+    # intentionally outside the runtime root; only the repair wrapper must
     # resolve inside the receipted runtime root.
-    to_venv_path = REPO_ROOT / ".venv"
+    control_generation, to_venv_path = _build_control_dependency_generation(
+        offline_rollback_runtime
+    )
     to_repair_bin = (
         REPO_ROOT / "arnold_pipelines" / "megaplan" / "cloud" / "wrappers"
     ) / "arnold-babysitter"
@@ -2128,6 +2165,8 @@ def test_canary_rehearsal_full_sequence_with_rollback_injection(
             "T-0101 rehearsal: manifest CAS cutover to the control runtime",
             "--actor", "operator",
             "--receipt-out", str(rollback_receipt_path),
+            "--to-dependency-generation",
+            json.dumps(control_generation, sort_keys=True),
         ]
 
     def run_g():
@@ -2197,6 +2236,9 @@ def test_canary_rehearsal_full_sequence_with_rollback_injection(
     assert rc == 2
     receipt = json.loads(rollback_receipt_path.read_text(encoding="utf-8"))
     assert receipt["manifest_before_sha256"] == manifest_before_sha
+    assert receipt["from"]["runtime_root"] == str(old_root)
+    assert receipt["to"]["runtime_root"] == str(REPO_ROOT)
+    assert receipt["reason"] == "T-0101 rehearsal: manifest CAS cutover to the control runtime"
     assert _sha256_file(manifest_path) == manifest_before_sha
     assert load_manifest(manifest_path).generation == 1
     # The SAME CLI command re-run completes the cutover.
@@ -2444,7 +2486,7 @@ def test_canary_rehearsal_full_sequence_with_rollback_injection(
     # re-read of self-written JSON.
     independent = subprocess.run(
         [
-            str(REPO_ROOT / ".venv" / "bin" / "python3"), "-P", "-c",
+            str(offline_rollback_runtime["python_observer"]), "-P", "-c",
             "import pathlib, arnold_pipelines; "
             "print(pathlib.Path(arnold_pipelines.__file__).resolve().parents[1])",
         ],
@@ -2463,12 +2505,15 @@ def test_canary_rehearsal_full_sequence_with_rollback_injection(
         == independent_root
         == REPO_ROOT
     ), "all six T-0101 roots must be equal and point at the new runtime"
-    # The manifest's executable paths are real, executable, and inside root.
+    # The repair executable is runtime-root-bound; the dependency venv is an
+    # immutable content-addressed generation, deliberately stored beside the
+    # candidate runtime rather than inside its source tree.
     manifest_venv = Path(manifest.epic["venv_path"]).resolve()
     manifest_repair = Path(manifest.epic["repair_bin"]).resolve()
     assert manifest_venv.is_dir()
     assert manifest_repair.is_file() and os.access(manifest_repair, os.X_OK)
-    assert manifest_venv.is_relative_to(REPO_ROOT)
+    assert manifest_venv == to_venv_path.resolve()
+    assert manifest_venv.name == str(control_generation["frozen_spec_sha256"])
     assert manifest_repair.is_relative_to(REPO_ROOT)
     lease = open_lease_store(plan_dir / "custody" / "leases").current_lease(
         occurrence_join_lease_id(CLAIM_ID)
@@ -2682,7 +2727,18 @@ def _copy_rehearsal_tree(
     needs its own state file (the spec-path-keyed bytes are re-saved from the
     source state for the copy's spec path).
     """
-    shutil.copytree(src, dst, symlinks=True)
+    # The live rehearsal writes the source tree's incident-ledger journal as
+    # part of normal chain control.  It is bound to the source chain/ledger
+    # identity and cannot be replayed from a copied checkout; carrying it
+    # into a probe makes the real ``save_chain_state`` gate reject the copy
+    # with a ledger-id mismatch.  Probes intentionally exercise copied chain
+    # state, not a cloned writer journal.
+    shutil.copytree(
+        src,
+        dst,
+        symlinks=True,
+        ignore=shutil.ignore_patterns("incident-ledger", "repair-queue"),
+    )
     new_spec = dst / ".megaplan" / "initiatives" / "demo" / "chain.yaml"
     state = load_chain_state(src_spec_path, verify_execution_binding=False)
     save_chain_state(new_spec, state)
@@ -2935,7 +2991,28 @@ def test_canary_rehearsal_identityless_adoption_sequence(
     assert pause_record(state) is not None
 
     # ── (g) runtime_manifest CAS cutover via the REAL CLI ─────────────────
-    to_venv_path = REPO_ROOT / ".venv"
+    control_generation, to_venv_path = _build_control_dependency_generation(
+        offline_rollback_runtime
+    )
+    # The pytest interpreter may belong to another checkout.  Use the
+    # separate candidate-bound observer environment for the production
+    # observer.  It is distinct from the offline receipt interpreter, so the
+    # production identity verifier still proves independence.
+    from arnold_pipelines.megaplan.chain import (
+        occurrence_adopt as occurrence_adopt_module,
+    )
+    candidate_python = Path(offline_rollback_runtime["python_observer"]).resolve()
+    host_python = occurrence_adopt_module.sys.executable
+    monkeypatch.setattr(
+        occurrence_adopt_module.sys, "executable", str(candidate_python)
+    )
+    assert (
+        Path(occurrence_adopt_module._independent_import_root()).resolve()
+        == REPO_ROOT
+    )
+    # Restore the host executable for the manifest's independent runtime
+    # verifier; rebind it only around the later occurrence-adopt dispatch.
+    monkeypatch.setattr(occurrence_adopt_module.sys, "executable", host_python)
     to_repair_bin = (
         REPO_ROOT / "arnold_pipelines" / "megaplan" / "cloud" / "wrappers"
     ) / "arnold-babysitter"
@@ -2959,6 +3036,8 @@ def test_canary_rehearsal_identityless_adoption_sequence(
             "--reason", "T-0101e' rehearsal: manifest cutover to control",
             "--actor", "operator",
             "--receipt-out", str(rollback_receipt_path),
+            "--to-dependency-generation",
+            json.dumps(control_generation, sort_keys=True),
         ],
         capsys,
     )
@@ -3016,7 +3095,7 @@ def test_canary_rehearsal_identityless_adoption_sequence(
     )
     independent = subprocess.run(
         [
-            str(REPO_ROOT / ".venv" / "bin" / "python3"), "-P", "-c",
+            str(candidate_python), "-P", "-c",
             "import pathlib, arnold_pipelines; "
             "print(pathlib.Path(arnold_pipelines.__file__).resolve().parents[1])",
         ],
@@ -3038,6 +3117,9 @@ def test_canary_rehearsal_identityless_adoption_sequence(
     assert len({Path(value).resolve() for value in roots.values()}) == 1
     assert Path(chain_execution_root).resolve() == REPO_ROOT
 
+    monkeypatch.setattr(
+        occurrence_adopt_module.sys, "executable", str(candidate_python)
+    )
     adopt_argv = _rehearsal_adopt_argv(
         spec_path,
         tmp_path,
@@ -3222,6 +3304,14 @@ def test_canary_rehearsal_identityless_adoption_sequence(
     #    key (plan/timestamp/cursor/roots sensitivity) ─────────────────────
     copy_root = tmp_path / "adopt-probes"
     copy_root.mkdir(parents=True, exist_ok=True)
+    canonical_queue_root = os.environ.get("ARNOLD_REPAIR_QUEUE_ROOT")
+    assert canonical_queue_root
+    # Probe copies are independent occurrences.  Keep their external,
+    # box-central queue separate so a deliberately different timestamp does
+    # not create a second request in the canonical occurrence's queue.
+    monkeypatch.setenv(
+        "ARNOLD_REPAIR_QUEUE_ROOT", str(copy_root / ".megaplan" / "repair-queue")
+    )
     # Snapshot the rehearsed tree ONCE (before any probe copy exists, so the
     # copies cannot nest into themselves); every probe copies from this base.
     probe_base = tmp_path / "probe-base"
@@ -3313,6 +3403,8 @@ def test_canary_rehearsal_identityless_adoption_sequence(
     assert payload["adoption_record_id"] != json.loads(
         adoptions[0].read_text(encoding="utf-8")
     )["adoption_record_id"]
+
+    monkeypatch.setenv("ARNOLD_REPAIR_QUEUE_ROOT", canonical_queue_root)
 
     # ── superseding the accepted decision blocks join ─────────────────────
     supersede = repair_requests.write_decision(

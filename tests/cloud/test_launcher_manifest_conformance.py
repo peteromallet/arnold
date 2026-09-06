@@ -157,7 +157,7 @@ def test_watchdog_fail_closed_manifest_gate_and_reactive_dispatch() -> None:
     # The watchdog wires the gate BEFORE field reads.
     assert "arnold_runtime_manifest_authority watchdog" in text
     assert text.index("arnold_runtime_manifest_authority watchdog") < text.index(
-        "MANIFEST_RUNTIME_ROOT="
+        'MANIFEST_RUNTIME_ROOT="$(arnold_runtime_manifest_epic_field epic.runtime_root)"'
     )
     # Dispatch through the babysitter seam; the layered repair-bin resolution
     # was removed with the layered repair stack.

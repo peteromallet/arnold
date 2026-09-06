@@ -1232,7 +1232,9 @@ def _override_cap_revise_once(
         },
     )
     state["meta"][CAP_REVISE_ONCE_GRANT_KEY] = grant
-    state["current_state"] = STATE_CRITIQUED
+    # Keep the route transition on the workflow-owned projection surface; the
+    # handler records the grant, but does not make a local route decision.
+    apply_state_projection(state, STATE_CRITIQUED, route_signal="cap_revise_once")
     save_state_merge_meta(plan_dir, state)
     try:
         from arnold_pipelines.megaplan.observability.events import emit, EventKind

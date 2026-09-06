@@ -169,7 +169,6 @@ semantic-coupling arnold.workflow.semantic_evidence
 semantic-coupling arnold.workflow.source_compiler
 semantic-coupling arnold.workflow.validation
 
-megaplan-artifact-layout .megaplan/initiatives/CLOUD.md
 megaplan-artifact-layout .megaplan/initiatives/native-python-pipelines-completion/dependency-completion-proof.json
 megaplan-artifact-layout .megaplan/initiatives/superfixer-repair-custody/load-bearing-questions.md
 megaplan-artifact-layout .megaplan/initiatives/superfixer-repair-custody/megaplan-prep.md
@@ -184,4 +183,3 @@ megaplan-artifact-layout .megaplan/initiatives/critique-ledger-post-relaunch-com
 megaplan-artifact-layout .megaplan/initiatives/superfixer-repair-custody/**
 megaplan-artifact-layout .megaplan/initiatives/critique-ledger-accountability-v3-r7-20260805/**
 megaplan-artifact-layout .megaplan/initiatives/critique-ledger-accountability-v3-r6-20260805/**
-megaplan-artifact-layout .megaplan/initiatives/CLOUD.md

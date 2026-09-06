@@ -109,6 +109,7 @@ class OverrideOutcome(StrEnum):
     """Closed routing vocabulary for the override step."""
 
     ABORT = "abort"
+    CAP_REVISE_ONCE = "cap_revise_once"
     CUTOVER = "cutover"
     FORCE_PROCEED = "force_proceed"
     REPLAN = "replan"

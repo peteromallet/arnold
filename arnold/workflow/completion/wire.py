@@ -32,6 +32,7 @@ from arnold.workflow.completion.evaluation import (
 )
 from arnold.workflow.completion.hashing import canonical_json, hash_canonical
 from arnold.workflow.completion.spec import CompletionSpec
+from ._wire_support import _envelope, _future, _json_object, _kind, _strict_result
 
 
 WIRE_SCHEMA_VERSION = "arnold.workflow.completion_wire.v1"
@@ -250,58 +251,6 @@ _SUPPORTED: dict[WireRecordKind, frozenset[str]] = {
 _VERSION_RE = re.compile(r"\.v(\d+)(?:$|[-.])")
 
 
-def _kind(value: Any) -> WireRecordKind:
-    try:
-        return _KIND_ALIASES[str(value)]
-    except KeyError as exc:
-        raise UnsupportedRecordKindError(f"unsupported record_kind: {value!r}") from exc
-
-
-def _json_object(value: bytes | bytearray | memoryview | str | Mapping[str, Any]) -> dict[str, Any]:
-    if isinstance(value, Mapping):
-        result = dict(value)
-    else:
-        try:
-            raw = value.tobytes() if isinstance(value, memoryview) else value
-            if isinstance(raw, (bytes, bytearray)):
-                raw = bytes(raw).decode("utf-8")
-            result = json.loads(raw)
-        except (UnicodeDecodeError, json.JSONDecodeError, TypeError) as exc:
-            raise CorruptWireError("wire payload is not valid UTF-8 JSON") from exc
-    if not isinstance(result, dict):
-        raise CorruptWireError("wire payload must be a JSON object")
-    return result
-
-
-def _future(version: str, supported: frozenset[str]) -> bool:
-    if not isinstance(version, str):
-        return False
-    match = _VERSION_RE.search(version)
-    if not match:
-        return False
-    version_number = int(match.group(1))
-    supported_numbers = [
-        int(item.group(1))
-        for item in (_VERSION_RE.search(item) for item in supported)
-        if item
-    ]
-    return bool(supported_numbers) and version_number > max(supported_numbers)
-
-
-def _envelope(
-    kind: WireRecordKind,
-    record: Mapping[str, Any],
-    schema_version: str,
-) -> bytes:
-    return canonical_json(
-        {
-            "record_kind": kind.value,
-            "schema_version": schema_version,
-            "payload": dict(record),
-        }
-    )
-
-
 def encode_spec(spec: CompletionSpec) -> bytes:
     """Encode a spec in canonical, byte-stable wire form."""
 
@@ -412,92 +361,9 @@ def decode_record(
     expected_kind: WireRecordKind | str | None = None,
     expected_binding_hash: str | None = None,
 ) -> WireDecodeResult:
-    """Decode one record and return an explicit matrix disposition.
-
-    The decoder validates kind and version before invoking any body parser.
-    This is the authoritative internal behavior; strict family helpers below
-    raise for the same non-success dispositions.
-    """
-
-    requested_kind = _kind(expected_kind) if expected_kind is not None else None
-    kind_text = requested_kind.value if requested_kind else ""
-    version: str | None = None
-    try:
-        kind, version, payload, _ = _split_wire(value, requested_kind)
-        kind_text = kind.value
-        supported = _SUPPORTED[kind]
-        if version not in supported:
-            if _future(version, supported):
-                return WireDecodeResult(
-                    kind_text,
-                    version,
-                    DecodeDisposition.UNKNOWN_FUTURE,
-                    error=f"unsupported future {kind.value} schema version: {version}",
-                )
-            return WireDecodeResult(
-                kind_text,
-                version,
-                DecodeDisposition.CORRUPT,
-                error=f"unsupported {kind.value} schema version: {version}",
-            )
-
-        if kind is WireRecordKind.SPEC:
-            record: Any = CompletionSpec.from_dict(payload)
-        elif kind is WireRecordKind.BINDING:
-            try:
-                record = CompletionBinding.from_dict(payload)
-            except (AmbiguousBindingError, BindingVersionError, ValueError, TypeError) as exc:
-                # A C1-shaped record remains explicitly unknown, including
-                # ambiguity between legacy coordinates and C2 lock fields.
-                if version == LEGACY_BINDING_SCHEMA_VERSION or (
-                    version == CANONICAL_BINDING_SCHEMA_VERSION
-                    and "evidence_window" in payload
-                    and "evidence_scope" not in payload
-                ):
-                    return WireDecodeResult(
-                        kind_text,
-                        version,
-                        DecodeDisposition.LEGACY_UNKNOWN,
-                        error=str(exc),
-                    )
-                raise
-        elif kind is WireRecordKind.VERDICT:
-            record = CompletionVerdict.from_dict(payload)
-        else:
-            record = ShadowAcceptanceReference.from_dict(payload)
-
-        if expected_binding_hash is not None and kind in {
-            WireRecordKind.BINDING,
-            WireRecordKind.VERDICT,
-            WireRecordKind.SHADOW_ACCEPTANCE_REFERENCE,
-        }:
-            actual = getattr(record, "binding_hash", "")
-            if actual != expected_binding_hash:
-                return WireDecodeResult(
-                    kind_text,
-                    version,
-                    DecodeDisposition.CHANGED_BINDING,
-                    error=(
-                        f"{kind.value} binding changed: expected "
-                        f"{expected_binding_hash!r}, got {actual!r}"
-                    ),
-                )
-
-        disposition = (
-            DecodeDisposition.LEGACY_UNKNOWN
-            if kind is WireRecordKind.BINDING and getattr(record, "is_legacy", False)
-            else DecodeDisposition.DECODED
-        )
-        return WireDecodeResult(kind_text, version, disposition, record=record)
-    except UnknownFutureVersionError:
-        raise
-    except (WireDecodeError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
-        return WireDecodeResult(
-            kind_text,
-            version,
-            DecodeDisposition.CORRUPT,
-            error=str(exc) or exc.__class__.__name__,
-        )
+    """Decode one record and return an explicit matrix disposition."""
+    from ._wire_support import decode_record_impl
+    return decode_record_impl(value, expected_kind=expected_kind, expected_binding_hash=expected_binding_hash)
 
 
 def decode_spec(value: bytes | bytearray | memoryview | str | Mapping[str, Any]) -> CompletionSpec:

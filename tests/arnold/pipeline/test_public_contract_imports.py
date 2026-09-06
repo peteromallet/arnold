@@ -8,6 +8,7 @@ import pytest
 
 import arnold.pipeline as pipeline
 import arnold.pipeline.native as native
+import arnold.execution.step_invocation as step_invocation
 from arnold.workflow.builder import PipelineBuilder
 from arnold.pipeline.native import NativeInstruction, NativeProgram, project_graph
 from arnold.pipeline.types import Edge, Stage, StepContext, StepResult
@@ -68,12 +69,24 @@ def test_graph_era_symbols_absent_from_root_all() -> None:
     graph_era = [
         "Edge", "Stage", "ParallelStage",
         "PipelineBuilder", "PipelineRegistry",
-        "StepInvocation",
         "ExecutorHooks", "NullExecutorHooks",
         "run_pipeline", "run_pipeline_resume",
     ]
     present = [g for g in graph_era if g in pipeline.__all__]
     assert not present, f"graph-era symbols in root __all__: {present}"
+
+
+def test_step_invocation_exports_are_retained_and_canonical() -> None:
+    names = (
+        "StepInvocation",
+        "StepInvocationAdapter",
+        "StepInvocationAdapterRegistry",
+        "StepInvocationResult",
+        "unwrap_step_invocation_result",
+    )
+    for name in names:
+        assert name in pipeline.__all__
+        assert getattr(pipeline, name) is getattr(step_invocation, name)
 
 
 def test_discovery_names_in_root_all() -> None:

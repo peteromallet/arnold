@@ -1931,15 +1931,17 @@ def test_fresh_continuation_cloud_spec_uses_unique_workspace_root() -> None:
         Path(__file__).parents[2]
         / ".megaplan/initiatives/native-build-forward-main-continuation-20260904/cloud.yaml"
     )
+    raw = yaml.safe_load(path.read_text(encoding="utf-8"))
     spec = load_spec(path)
     assert spec.ssh is not None
-    assert spec.ssh.workspace_dir == (
-        "/opt/megaplan-cloud/workspace/"
-        "nbf-main-continuation-final-clean1-20260904"
-    )
-    assert spec.repo.workspace == (
-        "/workspace/nbf-main-continuation-final-clean1-20260904/Arnold"
-    )
+    # The checked-in continuation spec is authoritative for both the host
+    # mount and the candidate-bound project root.  Keep this assertion tied
+    # to that contract rather than baking in a superseded run's path.
+    assert spec.ssh.workspace_dir == raw["ssh"]["workspace_dir"]
+    assert spec.repo.workspace == raw["repo"]["workspace"]
+    assert spec.repo.workspace != spec.megaplan.src_path
+    assert spec.repo.workspace.startswith("/workspace/")
+    assert spec.ssh.workspace_dir.rstrip("/").endswith(spec.ssh.container)
     assert spec.resources.volume is None
 
 
@@ -3144,6 +3146,7 @@ def test_cloud_preflight_expands_vendor_depth_like_init() -> None:
                 {
                     "label": "m1",
                     "idea": "idea.md",
+                    "profile": "partnered-codex",
                     "vendor": "codex",
                     "depth": "high",
                 }
@@ -3159,8 +3162,8 @@ def test_cloud_preflight_expands_vendor_depth_like_init() -> None:
 
     phase_map = summary["milestones"][0]["resolved_phase_map"]
     assert phase_map["plan"] == "codex:gpt-5.6-sol:high"
-    assert phase_map["revise"] == "codex:gpt-5.6-sol:high"
-    assert phase_map["execute"] == "codex:gpt-5.6-sol:high"
+    assert phase_map["revise"] == "codex:gpt-5.6-luna:high"
+    assert phase_map["execute"] == "codex:gpt-5.6-sol:medium"
 
 
 def test_cloud_preflight_reports_dependencies_for_every_spec_in_each_chain() -> None:
@@ -3188,8 +3191,7 @@ def test_cloud_preflight_reports_dependencies_for_every_spec_in_each_chain() -> 
     milestone = summary["milestones"][0]
     assert milestone["resolved_phase_map"]["plan"] == "codex:high"
     assert milestone["resolved_phase_chains"]["plan"] == ["codex:high", "claude:sonnet"]
-    assert sorted(summary["required_agents"]) == ["claude", "codex", "hermes"]
-    assert "bun" in summary["runtime_commands"]
+    assert sorted(summary["required_agents"]) == ["claude", "codex", "omp"]
     assert "codex" in summary["runtime_commands"]
     assert "claude" in summary["runtime_commands"]
     assert "DEEPSEEK_API_KEY" in summary["env_hints"]

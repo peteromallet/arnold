@@ -266,7 +266,6 @@ def test_exceptional_proofs_terminal_policy_taint_and_independence_are_typed() -
     assert blocked_verdict.status is EvaluationStatus.BLOCKED
     assert not blocked_verdict.accepted
     assert blocked_verdict.from_dict(blocked_verdict.to_dict()) == blocked_verdict
-
     waiver = WaiverProof(
         authority_provenance={"authority": "run-authority"},
         scope={"scope_hash": scope.scope_hash},
@@ -328,5 +327,4 @@ def test_exceptional_proofs_terminal_policy_taint_and_independence_are_typed() -
         },
         require_verifier_independence=True,
     )
-    assert relabeled.independent is False
-    assert any(item.code == "VERIFIER_NOT_INDEPENDENT" for item in relabeled.diagnostics)
+    assert relabeled.independent is False; assert any(item.code == "VERIFIER_NOT_INDEPENDENT" for item in relabeled.diagnostics)

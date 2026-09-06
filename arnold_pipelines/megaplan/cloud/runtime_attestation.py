@@ -83,6 +83,32 @@ _SUPERVISOR_COMPONENTS = {
     "progress-auditor",
 }
 
+# ``uv venv --seed`` (and virtualenv) installs one executable ``.pth`` file
+# which imports its distutils compatibility bootstrap.  It is not owned by a
+# distribution in a seeded environment, so treating every unowned executable
+# ``.pth`` as hostile would reject an otherwise genuine uv/virtualenv runtime.
+#
+# This is deliberately a finite, byte-addressed exception.  The pth filename
+# and bytes are exact, its adjacent module must be a regular non-symlink file,
+# and the complete module must match a known generated bootstrap.  In
+# particular, a syntax/AST check is not sufficient: the module is imported by
+# Python before this process can attest the environment and an attacker could
+# hide arbitrary code behind an apparently similar structure.  These hashes
+# are the complete ``_virtualenv.py`` payloads emitted by the uv-bundled
+# virtualenv used by the project and by virtualenv 21.2.x respectively.
+_VIRTUALENV_PTH_FILENAME = "_virtualenv.pth"
+# uv writes this exact 18-byte payload (without a trailing newline).
+_VIRTUALENV_PTH_CONTENT = b"import _virtualenv"
+_VIRTUALENV_BOOTSTRAP_FILENAME = "_virtualenv.py"
+_VIRTUALENV_BOOTSTRAP_SHA256 = frozenset(
+    {
+        # uv 0.11.x bundled bootstrap (also present in the project .venv).
+        "6cf30c56faf2a55228914dbbd17f8088ed371ebb08f5e7fa6fd931f913fcaf1d",
+        # virtualenv 21.2.0 bootstrap.
+        "e8c426ce260f866254ff35cefedc8b3efbd6d1446d99d7a4cdeb0095f98a8b8f",
+    }
+)
+
 
 def _sha256_bytes(value: bytes) -> str:
     return hashlib.sha256(value).hexdigest()
@@ -297,6 +323,39 @@ def _pth_owners(site_dir: Path) -> dict[Path, list[str]]:
     return owners
 
 
+def _is_regular_non_symlink(path: Path) -> bool:
+    """Return whether *path* is a regular file without following symlinks."""
+
+    try:
+        mode = path.lstat().st_mode
+    except OSError:
+        return False
+    return stat.S_ISREG(mode) and not stat.S_ISLNK(mode)
+
+
+def _is_trusted_virtualenv_bootstrap(path: Path) -> bool:
+    """Recognize only the finite uv/virtualenv executable-pth exception.
+
+    This helper intentionally authenticates bytes rather than accepting an
+    arbitrary adjacent module.  ``Path.read_bytes`` follows symlinks, so the
+    lstat checks are required before reading either file.
+    """
+
+    if path.name != _VIRTUALENV_PTH_FILENAME:
+        return False
+    if not _is_regular_non_symlink(path):
+        return False
+    bootstrap = path.with_name(_VIRTUALENV_BOOTSTRAP_FILENAME)
+    if not _is_regular_non_symlink(bootstrap):
+        return False
+    try:
+        if path.read_bytes() != _VIRTUALENV_PTH_CONTENT:
+            return False
+        return _sha256_file(bootstrap) in _VIRTUALENV_BOOTSTRAP_SHA256
+    except OSError:
+        return False
+
+
 def _arnold_import_root() -> Path | None:
     """Root checkout of the ``arnold_pipelines`` package this interpreter imports.
 
@@ -360,7 +419,11 @@ def _pth_vector(expected_root: Path) -> tuple[list[dict[str, Any]], list[str]]:
                         # (mirrors runtime_provenance's shadowed-editable rule).
                         kind = "shadowed"
                 lines.append({"kind": kind, "raw": raw, "resolved": resolved})
-                if kind == "executable" and not owners.get(path):
+                if (
+                    kind == "executable"
+                    and not owners.get(path)
+                    and not _is_trusted_virtualenv_bootstrap(path)
+                ):
                     errors.append(f"unowned_executable_pth:{path}")
                 if kind == "path" and resolved:
                     candidate = Path(resolved)

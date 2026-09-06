@@ -313,6 +313,74 @@ def test_unowned_executable_pth_is_recorded_and_rejected(
     assert errors == [f"unowned_executable_pth:{pth}"]
 
 
+def _write_generated_virtualenv_bootstrap(site_dir: Path) -> Path:
+    """Copy the real uv-seeded bootstrap used by this test interpreter."""
+
+    source = (
+        Path(sys.prefix)
+        / "lib"
+        / f"python{sys.version_info.major}.{sys.version_info.minor}"
+        / "site-packages"
+        / "_virtualenv.py"
+    )
+    if not source.is_file() or source.is_symlink():
+        pytest.skip("tests require a uv/virtualenv-seeded interpreter")
+    bootstrap = site_dir / "_virtualenv.py"
+    shutil.copyfile(source, bootstrap)
+    return bootstrap
+
+
+def test_generated_virtualenv_bootstrap_is_the_only_unowned_executable_pth_exception(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    site_dir = tmp_path / "site-packages"
+    site_dir.mkdir()
+    _write_generated_virtualenv_bootstrap(site_dir)
+    pth = site_dir / "_virtualenv.pth"
+    pth.write_bytes(attestation._VIRTUALENV_PTH_CONTENT)
+    monkeypatch.setattr(attestation, "_active_site_dirs", lambda: [site_dir])
+    monkeypatch.setattr(attestation, "_pth_owners", lambda _path: {})
+
+    vector, errors = attestation._pth_vector(tmp_path / "runtime")
+
+    assert errors == []
+    assert vector[0]["path"] == str(pth)
+    assert vector[0]["lines"] == [
+        {"kind": "executable", "raw": "import _virtualenv", "resolved": ""}
+    ]
+
+
+@pytest.mark.parametrize("mutation", ["pth", "module", "missing", "symlink"])
+def test_virtualenv_bootstrap_exception_fails_closed_on_any_drift(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mutation: str,
+) -> None:
+    site_dir = tmp_path / "site-packages"
+    site_dir.mkdir()
+    bootstrap = _write_generated_virtualenv_bootstrap(site_dir)
+    pth = site_dir / "_virtualenv.pth"
+    pth.write_bytes(attestation._VIRTUALENV_PTH_CONTENT)
+    if mutation == "pth":
+        pth.write_bytes(b"import _virtualenv; __import__('os')\n")
+    elif mutation == "module":
+        bootstrap.write_bytes(bootstrap.read_bytes() + b"# altered\n")
+    elif mutation == "missing":
+        bootstrap.unlink()
+    else:
+        target = tmp_path / "trusted-copy.py"
+        shutil.copyfile(bootstrap, target)
+        bootstrap.unlink()
+        bootstrap.symlink_to(target)
+    monkeypatch.setattr(attestation, "_active_site_dirs", lambda: [site_dir])
+    monkeypatch.setattr(attestation, "_pth_owners", lambda _path: {})
+
+    _vector, errors = attestation._pth_vector(tmp_path / "runtime")
+
+    assert errors == [f"unowned_executable_pth:{pth}"]
+
+
 @pytest.mark.parametrize("drift_target", ["wrapper", "seed_doc", "hot_env"])
 def test_release_seed_rejects_runtime_and_seed_input_drift(
     tmp_path: Path,

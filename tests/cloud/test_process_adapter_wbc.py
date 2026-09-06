@@ -172,8 +172,25 @@ def test_on_box_manifest_probe_preserves_json_stdout_without_git_classification(
     wrapper = source / "arnold_pipelines/megaplan/cloud/wrappers/arnold-runtime-create"
     wrapper.parent.mkdir(parents=True)
     (source / "arnold_pipelines/__init__.py").write_text("\n", encoding="utf-8")
-    wrapper.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
-    wrapper.chmod(0o755)
+    # The reviewed runtime-create wrapper validates the complete operational
+    # wrapper set before emitting a manifest.  Keep this clean fixture
+    # faithful to that provenance contract instead of testing against a
+    # deliberately incomplete checkout.
+    for name in (
+        "arnold-runtime-create",
+        "arnold-supervisor-runtime",
+        "arnold-supervise",
+        "arnold-chain",
+        "arnold-run",
+        "arnold-launch-boundary",
+    ):
+        path = wrapper.parent / name
+        path.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        path.chmod(0o755)
+    # The source-bound probe imports this checkout before checking its dirty
+    # state. Ignore interpreter bytecode so that the clean provenance check is
+    # about source files, not an incidental import cache.
+    (source / ".gitignore").write_text("__pycache__/\n", encoding="utf-8")
     subprocess.run(["git", "-C", str(source), "add", "."], check=True)
     subprocess.run(
         [
@@ -222,11 +239,28 @@ def test_on_box_manifest_probe_preserves_json_stdout_without_git_classification(
     result = OnBoxProvider(_cloud_spec(tmp_path, provider="ssh")).ssh_exec(command)
 
     assert result.returncode == 0
-    assert json.loads(result.stdout) == {
+    binding = json.loads(result.stdout)
+    runtime_identity = binding.pop("runtime_identity")
+    assert binding == {
         "created": 0, "epic_id": "demo", "present": True,
         "runtime_id": "demo-runtime", "runtime_revision": head,
         "runtime_src": str(tmp_path / "runtime"),
     }
+    assert runtime_identity == {
+        "content_sha256": runtime_identity["content_sha256"],
+        "direct_url": {},
+        "editable_revision": "",
+        "editable_root": "",
+        "import_root": str(tmp_path / "runtime"),
+        "imports": {
+            "arnold": str(tmp_path / "runtime" / "arnold/__init__.py"),
+            "arnold_pipelines": str(tmp_path / "runtime" / "arnold_pipelines/__init__.py"),
+            "megaplan": str(tmp_path / "runtime" / "arnold_pipelines/megaplan/__init__.py"),
+        },
+        "pth": [],
+        "source_revision": head,
+    }
+    assert len(runtime_identity["content_sha256"]) == 64
 
 
 def test_on_box_compound_wrapper_inherits_path_only_git_helper_and_json_stdout(

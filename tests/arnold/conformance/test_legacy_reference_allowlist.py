@@ -44,7 +44,9 @@ def test_allowlisted_scanner_target_passes(tmp_path: Path) -> None:
 def test_unallowlisted_live_reference_fails(tmp_path: Path) -> None:
     _write(
         tmp_path,
+        "live.py",
         """
+        VALUE = "arnold.pipelines.megaplan"
         """,
     )
 
@@ -54,6 +56,7 @@ def test_unallowlisted_live_reference_fails(tmp_path: Path) -> None:
     assert "unallowlisted legacy references" in result.message
     assert result.details["unallowlisted"] == [
         {
+            "path": "live.py",
             "pattern": "arnold.pipelines.megaplan",
         }
     ]

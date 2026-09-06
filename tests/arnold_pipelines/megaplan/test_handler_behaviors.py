@@ -425,8 +425,8 @@ class TestAdaptiveCritiqueRouting:
 
         scope_mode = checks[0]["_resolved_agent_mode"]
         correctness_mode = checks[1]["_resolved_agent_mode"]
-        assert scope_mode.agent == "hermes"
-        assert scope_mode.resolved_model == "deepseek:deepseek-v4-pro"
+        assert scope_mode.agent == "omp"
+        assert scope_mode.resolved_model == "deepseek/deepseek-v4-pro"
         assert checks[0]["_routing_selected_spec"] == "omp:deepseek/deepseek-v4-pro"
         assert correctness_mode.agent == "codex"
         assert correctness_mode.resolved_model == "gpt-5.4"

@@ -178,8 +178,8 @@ def parse_agent_spec(spec: str) -> AgentSpec:
     treated as a model name, with an optional second ``:<effort>``
     segment.
 
-    For **hermes** and **shannon**, the entire string after the first
-    colon is the model — colons in the model name are preserved
+    For **omp**, the entire string after the first colon is the model —
+    slashes and provider path separators in the model name are preserved
     unchanged.
 
     Examples
@@ -194,7 +194,7 @@ def parse_agent_spec(spec: str) -> AgentSpec:
     >>> parse_agent_spec("codex:gpt-5.3-codex:high")
     AgentSpec(agent='codex', model='gpt-5.3-codex', effort='high')
     >>> parse_agent_spec("omp:fireworks/accounts/foo")
-    AgentSpec(agent='hermes', model='fireworks:accounts/foo', effort=None)
+    AgentSpec(agent='omp', model='fireworks/accounts/foo', effort=None)
     """
     if ":" not in spec:
         return AgentSpec(agent=spec)
@@ -243,7 +243,7 @@ def format_agent_spec(spec: AgentSpec) -> str:
     'claude:low'
     >>> format_agent_spec(AgentSpec("codex", model="gpt-5.3-codex", effort="high"))
     'codex:gpt-5.3-codex:high'
-    >>> format_agent_spec(AgentSpec("hermes", model="fireworks:accounts/foo"))
+    >>> format_agent_spec(AgentSpec("omp", model="fireworks/accounts/foo"))
     'omp:fireworks/accounts/foo'
     """
     if spec.model is not None:

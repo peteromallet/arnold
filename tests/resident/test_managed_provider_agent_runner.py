@@ -110,8 +110,8 @@ def test_omp_resident_runner_persists_artifacts_and_resumes_exact_session(
     first = asyncio.run(runner.run(_request(), ToolRegistry()))
     second = asyncio.run(runner.run(_request(), ToolRegistry()))
 
-    assert first.final_text == "HERMES_RESIDENT_OK"
-    assert second.final_text == "HERMES_RESIDENT_OK"
+    assert first.final_text == "OMP_RESIDENT_OK"
+    assert second.final_text == "OMP_RESIDENT_OK"
     assert first.metadata["session_id"] == second.metadata["session_id"]
     assert first.metadata["session_mode"] == "new"
     assert second.metadata["session_mode"] == "resume"

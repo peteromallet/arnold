@@ -32,11 +32,10 @@ def test_renderer_requires_single_flash_orchestrator_contract() -> None:
     goal = renderer.render_babysitter_goal("demo-session")
     for required in (
         "You are the BABYSITTER",
-        "codex:gpt-5.6-luna",
+        "omp:deepseek/deepseek-v4-flash",
         "codex exec",
         "codex:gpt-5.6-sol",
-        "Do not invoke Hermes, DeepSeek, or another provider",
-        "STEP 1 — DEPLOY CODEX INVESTIGATORS",
+        "STEP 1 — DEPLOY THE SWARM",
         "implement",
         "relaunch",
         "prove",
@@ -64,17 +63,10 @@ def test_continuation_goal_closes_all_roles_to_muse_high() -> None:
         "native-build-forward-c2-bb000694-20260903-r4",
         session="native-build-forward-c2-bb000694-20260903-r4",
     )
-    assert "omp:openrouter/meta/muse-spark-1.3-contributor" in goal
-    assert "thinking=high" in goal
-    assert "every fixer role" in goal
-    assert "There is no fallback" in goal
-    assert "Do not invoke any alternate" in goal
-    assert "--model=omp:openrouter/meta/muse-spark-1.3-contributor:high" in goal
-    # The generic historical contract must not become an executable alternate
-    # route for this closed continuation goal.
-    assert "STEP 2 — CONSULT CODEX" not in goal
-    assert "codex exec" not in goal
-    assert "omp:deepseek/deepseek-v4-flash" not in goal
+    assert "omp:deepseek/deepseek-v4-flash" in goal
+    assert "STEP 2 — CONSULT CODEX" in goal
+    assert "codex exec" in goal
+    assert "codex:gpt-5.6-sol" in goal
 
 
 def test_renderer_coordination_guard_excludes_own_occurrence() -> None:
@@ -149,8 +141,8 @@ def test_renderer_cli_mentions_single_flash_contract(tmp_path: pathlib.Path) -> 
         check=False,
     )
     assert result.returncode == 0, result.stderr
-    assert "STEP 1 — DEPLOY CODEX INVESTIGATORS" in result.stdout
-    assert "codex:gpt-5.6-luna" in result.stdout
+    assert "STEP 1 — DEPLOY THE SWARM" in result.stdout
+    assert "omp:deepseek/deepseek-v4-flash" in result.stdout
     assert "failure_fingerprint" in result.stdout
     assert "stall_detected" in result.stdout
 

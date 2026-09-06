@@ -47,17 +47,25 @@ def _get_file_ops(task_id: str = "default") -> ShellFileOperations:
     )
     import time
 
+    task_id = task_id or "default"
+    # Validate configuration before consulting the file-ops cache.  This
+    # prevents an invalid current config from being hidden by a cached object
+    # and lets _environment_for replace an environment whose task binding is
+    # no longer current.
+    from arnold.agent.tools.terminal_tool import _get_env_config
+    _get_env_config()
+    terminal_env = _environment_for(task_id)
+
     with _file_ops_lock:
         cached = _file_ops_cache.get(task_id)
     if cached is not None:
         with _env_lock:
-            if task_id in _active_environments:
+            if _active_environments.get(task_id) is terminal_env and cached.env is terminal_env:
                 _last_activity[task_id] = time.time()
                 return cached
         with _file_ops_lock:
             _file_ops_cache.pop(task_id, None)
 
-    terminal_env = _environment_for(task_id)
     file_ops = ShellFileOperations(terminal_env)
     with _file_ops_lock:
         _file_ops_cache[task_id] = file_ops

@@ -45,6 +45,38 @@ from arnold_pipelines.megaplan.cloud.runtime_manifest import (
     write_active_pointer,
     write_manifest,
 )
+from arnold_pipelines.megaplan.cloud.install_sync import (
+    compute_venv_digest,
+    frozen_spec_sha256,
+)
+
+
+# Keep the small temporary repositories used by the manifest tests aligned
+# with the frozen-spec authority (T-0301).  The default manifest fixture uses
+# the same content address so it remains a complete, non-placeholder proof in
+# tests that do not need a real checkout.
+_FIXTURE_PYPROJECT = '[project]\nname = "demo"\nversion = "0.1.0"\n'
+_FIXTURE_UV_LOCK = 'version = 1\nrequires-python = ">=3.11"\n'
+
+
+def _fixture_spec_digest() -> str:
+    digest = hashlib.sha256()
+    for filename, content in (
+        ("pyproject.toml", _FIXTURE_PYPROJECT),
+        ("uv.lock", _FIXTURE_UV_LOCK),
+    ):
+        digest.update(filename.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(content.encode("utf-8"))
+    return digest.hexdigest()
+
+
+_FIXTURE_SPEC_SHA256 = _fixture_spec_digest()
+_FIXTURE_VENV_DIGEST = hashlib.sha256(
+    json.dumps(
+        {"pyvenv_cfg": "home = /usr\n", "installed": []}, sort_keys=True
+    ).encode("utf-8")
+).hexdigest()
 
 
 def _write_json(path: Path, value: object) -> None:
@@ -80,13 +112,13 @@ def _make_manifest(**overrides: object) -> dict[str, object]:
             # construction; tree-based tests override it via
             # _generation_proof(<to_venv>/bin/python).
             "dependency_generation": {
-                "id": "a" * 64,
-                "frozen_spec_sha256": "a" * 64,
+                "id": _FIXTURE_SPEC_SHA256,
+                "frozen_spec_sha256": _FIXTURE_SPEC_SHA256,
                 "interpreter_path": (
                     "/opt/arnold/runtime-candidates/epic-demo/runtime-2/"
-                    "venv/bin/python"
+                    f"venv-generations/{_FIXTURE_SPEC_SHA256}/bin/python"
                 ),
-                "venv_digest": "b" * 64,
+                "venv_digest": _FIXTURE_VENV_DIGEST,
                 "created": "2026-08-07T00:00:00+00:00",
             },
         },
@@ -132,7 +164,38 @@ def _make_manifest(**overrides: object) -> dict[str, object]:
 
 
 def _make_manifest_obj(**overrides: object) -> RuntimeManifest:
-    return RuntimeManifest.from_dict(_make_manifest(**overrides))
+    data = _make_manifest(**overrides)
+    epic_override = overrides.get("epic")
+    runtime_root = Path(str(data["epic"].get("runtime_root") or ""))
+    # A real checkout fixture gets a real content-addressed proof.  Preserve
+    # explicit proof overrides so malformed/negative tests still exercise the
+    # manifest and transition validators themselves.
+    if (
+        isinstance(epic_override, dict)
+        and "dependency_generation" not in epic_override
+        and runtime_root.is_dir()
+        and (runtime_root / ".runtime-manifest-test-real").is_file()
+        and (runtime_root / "pyproject.toml").is_file()
+        and (runtime_root / "uv.lock").is_file()
+    ):
+        spec_digest = frozen_spec_sha256(runtime_root)
+        generation_dir = runtime_root / ".test-generations" / spec_digest
+        interpreter = generation_dir / "bin" / "python"
+        interpreter.parent.mkdir(parents=True, exist_ok=True)
+        if not interpreter.exists():
+            interpreter.write_text("#!/bin/sh\n", encoding="utf-8")
+            interpreter.chmod(0o755)
+        pyvenv_cfg = generation_dir / "pyvenv.cfg"
+        if not pyvenv_cfg.exists():
+            pyvenv_cfg.write_text("home = /usr\n", encoding="utf-8")
+        data["epic"]["dependency_generation"] = {
+            "id": spec_digest,
+            "frozen_spec_sha256": spec_digest,
+            "interpreter_path": str(interpreter),
+            "venv_digest": compute_venv_digest(interpreter),
+            "created": "2026-08-07T00:00:00+00:00",
+        }
+    return RuntimeManifest.from_dict(data)
 
 
 def _make_deviation(**overrides: object) -> dict[str, object]:
@@ -171,6 +234,9 @@ def _real_git_repo(tmp_path: Path) -> tuple[Path, str]:
         ["git", "-C", str(root), "config", "user.email", "test@example.invalid"],
         check=True,
     )
+    (root / "pyproject.toml").write_text(_FIXTURE_PYPROJECT, encoding="utf-8")
+    (root / "uv.lock").write_text(_FIXTURE_UV_LOCK, encoding="utf-8")
+    (root / ".runtime-manifest-test-real").write_text("fixture\n", encoding="utf-8")
     (root / "README.md").write_text("seed\n", encoding="utf-8")
     subprocess.run(["git", "-C", str(root), "add", "-A"], check=True)
     subprocess.run(["git", "-C", str(root), "commit", "-q", "-m", "seed"], check=True)
@@ -394,10 +460,8 @@ def test_advance_generation_refuses_without_proof() -> None:
 def test_advance_generation_accepts_explicit_override_proof(tmp_path: Path) -> None:
     root, head = _real_git_repo(tmp_path)
     manifest = _make_manifest_obj(epic={"runtime_root": str(root)})
+    override = dict(manifest.epic["dependency_generation"])
     del manifest.epic["dependency_generation"]  # type: ignore[typeddict-item]
-    override = _generation_proof(
-        "/opt/elsewhere/venv/bin/python", id="f" * 64, frozen_spec_sha256="f" * 64
-    )
     advanced = advance_generation(
         manifest,
         head,
@@ -1490,10 +1554,15 @@ def test_compatibility_only_survives_create_promote_close_lifecycle(
     _stub_git_head_guard(monkeypatch)
     pointer = tmp_path / "runtime-manifest.json"
     monkeypatch.setenv("ARNOLD_RUNTIME_MANIFEST", str(pointer))
+    root, _head = _real_git_repo(tmp_path)
 
     # create: arnold-runtime-create writes the pointer as compatibility
     # telemetry (compatibility_only=True).
-    created = _make_manifest_obj(generation=1, compatibility_only=True)
+    created = _make_manifest_obj(
+        generation=1,
+        compatibility_only=True,
+        epic={"runtime_root": str(root)},
+    )
     write_active_pointer(created, pointer)
     assert is_compatibility_only_pointer(pointer) is True
 
@@ -3344,10 +3413,6 @@ def test_refresh_legacy_session_copy_leaves_unrelated_files_alone(
 
 # ── advance_generation_at_path: shared lock+CAS producer (d51891b51841) ─────
 
-from arnold_pipelines.megaplan.cloud.install_sync import (  # noqa: E402
-    compute_venv_digest,
-    frozen_spec_sha256,
-)
 from arnold_pipelines.megaplan.cloud.runtime_manifest import (  # noqa: E402
     advance_generation_at_path,
 )
@@ -3365,10 +3430,10 @@ def _spec_repo(tmp_path: Path) -> tuple[Path, str]:
         check=True,
     )
     (root / "pyproject.toml").write_text(
-        '[project]\nname = "demo"\nversion = "0.1.0"\n', encoding="utf-8"
+        '[project]\nname = "native-demo"\nversion = "0.2.0"\n', encoding="utf-8"
     )
     (root / "uv.lock").write_text(
-        'version = 1\nrequires-python = ">=3.11"\n', encoding="utf-8"
+        'version = 1\nrequires-python = ">=3.12"\n', encoding="utf-8"
     )
     (root / "README.md").write_text("seed\n", encoding="utf-8")
     subprocess.run(["git", "-C", str(root), "add", "-A"], check=True)

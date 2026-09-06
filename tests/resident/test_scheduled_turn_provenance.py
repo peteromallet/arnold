@@ -253,7 +253,9 @@ def test_superfixer_launch_origin_is_scheduled_turn_with_occurrence_custody(
         captured.update(kwargs)
         manifest.write_text(json.dumps({"status": "launching"}), encoding="utf-8")
         return SimpleNamespace(
-            run_id="sfx-provenance-run", manifest_path=str(manifest), status="launching"
+            ok=True,
+            returncode=0,
+            run_id="sfx-provenance-run", manifest_path=str(manifest), status="running"
         )
 
     monkeypatch.setattr(

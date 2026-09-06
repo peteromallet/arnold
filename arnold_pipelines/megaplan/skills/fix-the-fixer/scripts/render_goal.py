@@ -129,10 +129,6 @@ def main() -> int:
     return 0
 
 
-if __name__ == "__main__":
-    raise SystemExit(main())
-
-
 def _editable_install_charge() -> str:
     """Explicit editable-install + durable-launch charge appended to the /goal."""
     return """
@@ -157,3 +153,7 @@ def _editable_install_charge() -> str:
 
 def render_goal_with_charge(target: str) -> str:
     return _render_goal_original(target) + _editable_install_charge()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -195,7 +195,7 @@
     }
   ],
   "id": "megaplan",
-  "manifest_hash": "sha256:09255e89b8ec7f90612ccae382bf01b4ff39228c47f777c73f2d253042dcf362",
+  "manifest_hash": "sha256:962e57e7f8bb15761cc2a6a2e2bb64924eb6681bc86ed5fbf0de295df1ab5504",
   "metadata": {
     "max_critique_iterations": 4,
     "policy_refs": [
@@ -250,10 +250,10 @@
       },
       "source_span": {
         "end_column": 10,
-        "end_line": 416,
+        "end_line": 433,
         "path": "arnold_pipelines/megaplan/workflows/workflow.pypeline",
         "start_column": 28,
-        "start_line": 410
+        "start_line": 427
       }
     },
     {
@@ -361,10 +361,10 @@
       },
       "source_span": {
         "end_column": 14,
-        "end_line": 427,
+        "end_line": 444,
         "path": "arnold_pipelines/megaplan/workflows/workflow.pypeline",
         "start_column": 31,
-        "start_line": 421
+        "start_line": 438
       }
     },
     {
@@ -409,10 +409,10 @@
       },
       "source_span": {
         "end_column": 97,
-        "end_line": 420,
+        "end_line": 437,
         "path": "arnold_pipelines/megaplan/workflows/workflow.pypeline",
         "start_column": 32,
-        "start_line": 420
+        "start_line": 437
       }
     },
     {
@@ -493,10 +493,10 @@
       },
       "source_span": {
         "end_column": 89,
-        "end_line": 417,
+        "end_line": 434,
         "path": "arnold_pipelines/megaplan/workflows/workflow.pypeline",
         "start_column": 29,
-        "start_line": 417
+        "start_line": 434
       }
     },
     {
@@ -535,10 +535,10 @@
       },
       "source_span": {
         "end_column": 78,
-        "end_line": 436,
+        "end_line": 453,
         "path": "arnold_pipelines/megaplan/workflows/workflow.pypeline",
         "start_column": 17,
-        "start_line": 436
+        "start_line": 453
       }
     },
     {
@@ -563,6 +563,7 @@
           "abort",
           "add-note",
           "adopt-execution",
+          "cap-revise-once",
           "cutover",
           "force-proceed",
           "reconcile-plan-ledger",
@@ -679,6 +680,15 @@
             ]
           },
           {
+            "condition_ref": "override.action.eq.cap-revise-once",
+            "overlay_id": "override:cap-revise-once",
+            "overlay_type": "terminal_route",
+            "source_ref": "override.action",
+            "target_refs": [
+              "revise"
+            ]
+          },
+          {
             "condition_ref": "override.action.eq.cutover",
             "overlay_id": "override:cutover",
             "overlay_type": "terminal_route",
@@ -772,10 +782,10 @@
       },
       "source_span": {
         "end_column": 91,
-        "end_line": 472,
+        "end_line": 489,
         "path": "arnold_pipelines/megaplan/workflows/workflow.pypeline",
         "start_column": 17,
-        "start_line": 472
+        "start_line": 489
       }
     },
     {
@@ -815,10 +825,10 @@
       },
       "source_span": {
         "end_column": 71,
-        "end_line": 406,
+        "end_line": 423,
         "path": "arnold_pipelines/megaplan/workflows/workflow.pypeline",
         "start_column": 20,
-        "start_line": 406
+        "start_line": 423
       }
     },
     {
@@ -858,10 +868,10 @@
       },
       "source_span": {
         "end_column": 57,
-        "end_line": 405,
+        "end_line": 422,
         "path": "arnold_pipelines/megaplan/workflows/workflow.pypeline",
         "start_column": 19,
-        "start_line": 405
+        "start_line": 422
       }
     },
     {
@@ -1000,10 +1010,10 @@
       },
       "source_span": {
         "end_column": 14,
-        "end_line": 434,
+        "end_line": 451,
         "path": "arnold_pipelines/megaplan/workflows/workflow.pypeline",
         "start_column": 35,
-        "start_line": 428
+        "start_line": 445
       }
     },
     {
@@ -1054,10 +1064,10 @@
       },
       "source_span": {
         "end_column": 98,
-        "end_line": 457,
+        "end_line": 474,
         "path": "arnold_pipelines/megaplan/workflows/workflow.pypeline",
         "start_column": 21,
-        "start_line": 457
+        "start_line": 474
       }
     },
     {
@@ -1097,10 +1107,10 @@
       },
       "source_span": {
         "end_column": 14,
-        "end_line": 494,
+        "end_line": 511,
         "path": "arnold_pipelines/megaplan/workflows/workflow.pypeline",
         "start_column": 34,
-        "start_line": 491
+        "start_line": 508
       }
     },
     {
@@ -1179,10 +1189,10 @@
       },
       "source_span": {
         "end_column": 14,
-        "end_line": 503,
+        "end_line": 520,
         "path": "arnold_pipelines/megaplan/workflows/workflow.pypeline",
         "start_column": 24,
-        "start_line": 500
+        "start_line": 517
       }
     },
     {
@@ -1222,10 +1232,10 @@
       },
       "source_span": {
         "end_column": 14,
-        "end_line": 490,
+        "end_line": 507,
         "path": "arnold_pipelines/megaplan/workflows/workflow.pypeline",
         "start_column": 33,
-        "start_line": 487
+        "start_line": 504
       }
     },
     {
@@ -1269,10 +1279,10 @@
       },
       "source_span": {
         "end_column": 14,
-        "end_line": 499,
+        "end_line": 516,
         "path": "arnold_pipelines/megaplan/workflows/workflow.pypeline",
         "start_column": 34,
-        "start_line": 495
+        "start_line": 512
       }
     }
   ],

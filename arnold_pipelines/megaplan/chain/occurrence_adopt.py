@@ -437,16 +437,30 @@ def _adoption_transaction_lock(state_path: Path) -> Iterator[None]:
 def _independent_import_root() -> str:
     """Observe the import root of the control runtime independently.
 
-    Runs ``sys.executable -P`` (isolated: no PYTHONPATH, no cwd) so the
-    answer comes from the INSTALLED package location, never from an
-    environment variable or the working directory.
+    Runs the source-bound runtime interpreter with ``-P`` (isolated: no
+    PYTHONPATH, no cwd) so the answer comes from the INSTALLED package
+    location, never from the working directory.  ``ARNOLD_RUNTIME_PYTHON``
+    is the launch runtime's existing explicit interpreter selector; when it
+    is absent, retain the local control interpreter fallback.
     """
+    configured = os.environ.get("ARNOLD_RUNTIME_PYTHON", "").strip()
+    executable = Path(configured).expanduser() if configured else Path(sys.executable)
+    if (
+        not executable.is_absolute()
+        or not executable.is_file()
+        or not os.access(executable, os.X_OK)
+    ):
+        raise CliError(
+            "independent_import_root_unavailable",
+            "configured independent runtime interpreter is unavailable: "
+            f"{configured or sys.executable}",
+        )
     code = (
         "import pathlib, arnold_pipelines; "
         "print(pathlib.Path(arnold_pipelines.__file__).resolve().parents[1])"
     )
     proc = subprocess.run(
-        [sys.executable, "-P", "-c", code],
+        [str(executable.resolve()), "-P", "-c", code],
         check=False,
         capture_output=True,
         text=True,

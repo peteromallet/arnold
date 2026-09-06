@@ -44,6 +44,40 @@ def test_release_evidence_record_is_structurally_valid() -> None:
     validate(RECORD)
 
 
+def test_ownerless_collection_promotions_bind_both_preserved_sources(
+    tmp_path: Path,
+) -> None:
+    data = json.loads(RECORD.read_text(encoding="utf-8"))
+    rows = data["canonical_artifact_moves"]
+    collection_rows = [
+        row for row in rows if row.get("collection_scope") == "initiative_collection"
+    ]
+    assert len(rows) == 28
+    assert {(row["artifact_type"], row["from"], row["to"]) for row in collection_rows} == {
+        (
+            "cloud_guidance",
+            ".megaplan/initiatives/CLOUD.md",
+            ".megaplan/collection/CLOUD.md",
+        ),
+        (
+            "aggregate_chain_snapshot",
+            ".megaplan/initiatives/chain.yaml",
+            ".megaplan/collection/chain.yaml",
+        ),
+    }
+    assert all(
+        row["authority"]["path"] == ".megaplan/collection/authority.json"
+        for row in collection_rows
+    )
+
+    candidate = tmp_path / "release-evidence.json"
+    mutated = deepcopy(data)
+    mutated["canonical_artifact_moves"][-2]["collection_scope"] = "initiative"
+    candidate.write_text(json.dumps(mutated), encoding="utf-8")
+    with pytest.raises(ValueError):
+        validate(candidate)
+
+
 def test_runtime_promotion_converges_split_authorities_without_fake_prebind() -> None:
     text = RUNBOOK.read_text(encoding="utf-8")
 

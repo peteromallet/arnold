@@ -103,6 +103,16 @@ def test_brief_epic_scaffolds_chain_and_milestones(tmp_path: Path) -> None:
             "depth": "high",
             "with_prep": True,
         },
+        {
+            "label": "reconcile",
+            "kind": "reconcile",
+            "idea": ".megaplan/initiatives/artifact-store/briefs/reconcile.md",
+            "branch": "reconcile/artifact-store-20260905",
+            "target_branch": "main",
+            "merge_policy": "review",
+            "phase_model": ["execute=codex"],
+            "depends_on": ["m2-api"],
+        },
     ]
     assert chain["merge_policy"] == "auto"
     assert chain["driver"]["auto_approve"] is True

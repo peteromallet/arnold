@@ -104,6 +104,14 @@ the canonical explicit-node manifest for the Megaplan pipeline.
   explicit alias mapping; they do not silently replay against the new manifest.
 * New volatile golden fields: none; normalization follows
   ``tests/fixtures/workflow/README.md``.
+* Current canonical identity: ``manifest_hash`` is
+  ``sha256:962e57e7f8bb15761cc2a6a2e2bb64924eb6681bc86ed5fbf0de295df1ab5504``
+  and ``topology_hash`` is
+  ``sha256:295e0ad28430ff465334a36c6ff5add25fba1d21d7ba2449da6b081150098260``.
+  The fourteen-action override matrix includes the CAS-fenced
+  ``cap-revise-once`` route to ``revise``; its typed route, authority row,
+  normalized shape, and golden overlay are part of the same canonical
+  reconciliation.
 * Owner: ``m4-megaplan-product-migration``.
 * Tests: ``tests/arnold_pipelines/megaplan/test_topology_amendment.py``,
   ``tests/arnold_pipelines/megaplan/test_parity_harness.py``.

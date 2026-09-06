@@ -224,7 +224,7 @@ def _action_result_for_decision(
         verdict=verdict,
         summary=summary,
         action_id=action_id,
-        metadata={"decision": decision, "source": "arnold.cli.execution"},
+        metadata={"decision": decision, "source": "cli-execution"},
     )
 
 
@@ -319,7 +319,7 @@ def _cmd_resume(args: argparse.Namespace) -> int:
     return 0
 
 
-def main(argv: Sequence[str] | None = None, *, prog: str = "megaplan execution") -> int:
+def main(argv: Sequence[str] | None = None, *, prog: str = "arnold") -> int:
     parser = argparse.ArgumentParser(
         prog=prog,
         description="Run compiled Arnold workflow manifests and broker approval gates.",

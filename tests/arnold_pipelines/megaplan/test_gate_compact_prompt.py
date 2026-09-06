@@ -104,7 +104,7 @@ def test_normal_gate_prompt_is_oversized(tmp_path: Path) -> None:
     """The regression premise: with many flags the normal gate prompt exceeds 600K."""
     plan_dir = _make_plan_dir(tmp_path, flag_count=54)
     state = _make_state(plan_dir, tmp_path / "project")
-    prompt = create_prompt("hermes", "gate", state, plan_dir)
+    prompt = create_prompt("omp", "gate", state, plan_dir)
     assert len(prompt) > 600_000
     # and the guard actually fires for the gate phase
     try:

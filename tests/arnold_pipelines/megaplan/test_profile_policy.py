@@ -5,7 +5,11 @@ from pathlib import Path
 
 import pytest
 
-from arnold_pipelines.megaplan.fallback_chains import encode_phase_model_value, is_encoded_fallback_specs
+from arnold_pipelines.megaplan.fallback_chains import (
+    configured_fallback_chain_for_phase,
+    encode_phase_model_value,
+    is_encoded_fallback_specs,
+)
 from arnold_pipelines.megaplan.profiles.policy import (
     _profile_has_premium_slots,
     _validate_named_profile_invariants,
@@ -43,7 +47,7 @@ class TestVendorRewriteScalarPreservation:
         result = apply_vendor_rewrite(profile, "claude")
         assert isinstance(result["plan"], list)
         assert len(result["plan"]) == 3
-        # First element (codex) swapped to claude; second stays claude; third (hermes) unchanged
+        # First element (codex) swapped to claude; second stays claude; third OMP unchanged
         assert result["plan"][0] != "codex:gpt-5.4"
         assert result["plan"][1] == "claude:sonnet"
         assert result["plan"][2] == "omp:deepseek/deepseek-v4-pro"
@@ -122,7 +126,7 @@ class TestCriticRewriteScalarPreservation:
         result = apply_critic_rewrite(profile, "cross", vendor="codex")
         assert isinstance(result["critique"], list)
         assert len(result["critique"]) == 2
-        # codex premium → swapped to claude; hermes non-premium → unchanged
+        # codex premium → swapped to claude; OMP non-premium → unchanged
         assert result["critique"][1] == "omp:deepseek/deepseek-v4-pro"
 
 
@@ -145,7 +149,7 @@ class TestDepthRewriteScalarPreservation:
         result = apply_depth_rewrite(profile, "max")
         assert isinstance(result["plan"], list)
         assert len(result["plan"]) == 3
-        # premium agents get depth appended; hermes (non-premium) unchanged
+        # premium agents get depth appended; OMP (non-premium) unchanged
         assert "max" in result["plan"][0]
         assert "max" in result["plan"][1]
         assert result["plan"][2] == "omp:deepseek/deepseek-v4-pro"
@@ -419,7 +423,12 @@ def test_profile_expansion_without_cli_keeps_profile_execute_tier_models(tmp_pat
 
     apply_profile_expansion(args, tmp_path)
 
-    assert "execute=codex:gpt-5.6-sol:high" in args.phase_model
+    execute_chain = configured_fallback_chain_for_phase(args.phase_model, "execute")
+    assert execute_chain is not None
+    assert execute_chain.specs == (
+        "omp:deepseek/deepseek-v4-pro",
+        "codex:gpt-5.6-sol:high",
+    )
     assert args.tier_models is not None
     assert "execute" in args.tier_models
     assert args.tier_models["execute"][3] == "omp:deepseek/deepseek-v4-flash"
@@ -441,14 +450,19 @@ def test_profile_expansion_execute_tiers_survive_profile_fallback_pin(tmp_path: 
 
     apply_profile_expansion(args, tmp_path)
 
-    assert "execute=codex:gpt-5.6-sol:high" in args.phase_model
+    execute_chain = configured_fallback_chain_for_phase(args.phase_model, "execute")
+    assert execute_chain is not None
+    assert execute_chain.specs == (
+        "omp:deepseek/deepseek-v4-pro",
+        "codex:gpt-5.6-sol:high",
+    )
     tier_map = _extract_execute_tier_map(args.tier_models)
     assert tier_map is not None
     assert tier_map[1] == "omp:deepseek/deepseek-v4-flash"
     assert tier_map[3] == "omp:deepseek/deepseek-v4-flash"
     assert tier_map[5] == "omp:deepseek/deepseek-v4-flash"
-    assert tier_map[9] == "codex:gpt-5.6-sol:medium"
-    assert tier_map[10] == "codex:gpt-5.6-sol:high"
+    assert tier_map[9] == "omp:deepseek/deepseek-v4-pro"
+    assert tier_map[10] == "omp:deepseek/deepseek-v4-pro"
 
 
 def test_profile_expansion_with_persisted_execute_pin_keeps_execute_pinned_and_suppressed(

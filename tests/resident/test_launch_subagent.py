@@ -29,6 +29,24 @@ from arnold_pipelines.megaplan.resident.subagent import (
 from arnold_pipelines.megaplan.store import FileStore
 
 
+@pytest.fixture(autouse=True)
+def _fake_worker_process_identity(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Model only this module's fake worker PID at the OS custody seam."""
+
+    real_start_ticks = subagent_module._pid_start_ticks
+    real_pid_live = subagent_module._pid_live
+    monkeypatch.setattr(
+        subagent_module,
+        "_pid_start_ticks",
+        lambda pid: "test-start-4321" if pid == 4321 else real_start_ticks(pid),
+    )
+    monkeypatch.setattr(
+        subagent_module,
+        "_pid_live",
+        lambda pid: True if pid == 4321 else real_pid_live(pid),
+    )
+
+
 def test_local_resident_launch_seam_uses_injected_provenance(tmp_path, monkeypatch, capsys) -> None:
     import arnold_pipelines.megaplan.resident.subagent as module
     from arnold_pipelines.megaplan.resident.provenance import DELEGATION_CONTEXT_ENV
@@ -196,6 +214,9 @@ def test_codex_background_launch_writes_durable_manifest(tmp_path, monkeypatch) 
     class _Process:
         pid = 4321
 
+        def poll(self):
+            return None
+
     def fake_popen(argv, **kwargs):
         captured["argv"] = argv
         captured["kwargs"] = kwargs
@@ -218,10 +239,10 @@ def test_codex_background_launch_writes_durable_manifest(tmp_path, monkeypatch) 
     )
     result = asyncio.run(
         launch_subagent_task(
-            ResidentConfig(model_name="gpt-test"),
+            ResidentConfig(model_name="gpt-5.6-terra"),
             task="do the work",
             project_dir=str(tmp_path),
-            model="gpt-test",
+            model="gpt-5.6-terra",
             reasoning_effort="xhigh",
             launch_origin={
                 "transport": "discord",
@@ -245,8 +266,9 @@ def test_codex_background_launch_writes_durable_manifest(tmp_path, monkeypatch) 
     assert manifest["schema_version"] == "arnold-managed-agent-run-v2"
     assert manifest["run_kind"] == "resident_delegated_agent"
     assert manifest["custodian"] == "arnold.megaplan.managed_agent"
+    assert manifest["supervisor_start_ticks"] == "test-start-4321"
     assert manifest["sandbox"] == "danger-full-access"
-    assert manifest["model"] == "gpt-test"
+    assert manifest["model"] == "gpt-5.6-terra"
     assert manifest["task_kind"] == "routine"
     assert manifest["difficulty"] == 4
     assert manifest["route_class"] == "explicit_override"
@@ -308,6 +330,9 @@ def test_scheduled_standalone_dm_manifest_has_no_reply_or_source_custody(
 ) -> None:
     class _Process:
         pid = 4321
+
+        def poll(self):
+            return None
 
     monkeypatch.setattr(subagent_module.subprocess, "Popen", lambda *args, **kwargs: _Process())
     result = asyncio.run(

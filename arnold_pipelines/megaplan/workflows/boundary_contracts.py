@@ -83,6 +83,7 @@ S5_FINAL_PROJECTION_ROW_ID = "s5.final_projection.1"
 # ── S6 override authority stable row ID namespace ────────────────────────
 
 S6_OVERRIDE_ABORT_ROW_ID = "s6.override.abort.1"
+S6_OVERRIDE_CAP_REVISE_ONCE_ROW_ID = "s6.override.cap_revise_once.1"
 S6_OVERRIDE_FORCE_PROCEED_ROW_ID = "s6.override.force_proceed.1"
 S6_OVERRIDE_REPLAN_ROW_ID = "s6.override.replan.1"
 S6_OVERRIDE_RECOVER_BLOCKED_ROW_ID = "s6.override.recover_blocked.1"
@@ -1261,6 +1262,36 @@ override_abort_authority = BoundaryContract(
     },
 )
 
+override_cap_revise_once_authority = BoundaryContract(
+    boundary_id="override_cap_revise_once_authority",
+    workflow_id="megaplan-review",
+    row_id=S6_OVERRIDE_CAP_REVISE_ONCE_ROW_ID,
+    required_artifacts=(),
+    expected_state_delta={},
+    expected_history_entry=None,
+    phase_result_required=False,
+    receipt_required=False,
+    authority_required=True,
+    details={
+        "description": (
+            "Override cap-revise-once authority: granting a single revise "
+            "round after a critique-cap park binds the grant to the fenced "
+            "state, iteration, and event sequence."
+        ),
+        "authority_transition": "cap-revise-once",
+        "authority_scope": "override.cap_revise_once",
+        "route_signal": "cap_revise_once",
+        "target_ref": "revise",
+        "required_evidence_refs": ("state.json", "events.ndjson"),
+        "optional_evidence_refs": ("gate.json", "phase_result.json"),
+        "evidence_hashes_ref": "authority_records[].details.evidence_hashes",
+        "freshness_token_ref": "state.meta.current_invocation_id",
+        "actor_role_ref": "authority_records[].{actor,role}",
+        "override_entry_ref": "state.meta.overrides[action=cap-revise-once]",
+        "cas_fence_ref": "cap_revise_once_grant.fence",
+    },
+)
+
 override_force_proceed_authority = BoundaryContract(
     boundary_id="override_force_proceed_authority",
     workflow_id="megaplan-review",
@@ -1981,6 +2012,7 @@ BOUNDARY_CONTRACTS: tuple[BoundaryContract, ...] = (
     finalize_fallback,
     final_projection,
     override_abort_authority,
+    override_cap_revise_once_authority,
     override_force_proceed_authority,
     override_replan_authority,
     override_recover_blocked_authority,
@@ -2008,6 +2040,7 @@ BOUNDARY_CONTRACTS: tuple[BoundaryContract, ...] = (
 
 OVERRIDE_AUTHORITY_CONTRACTS: tuple[BoundaryContract, ...] = (
     override_abort_authority,
+    override_cap_revise_once_authority,
     override_force_proceed_authority,
     override_replan_authority,
     override_recover_blocked_authority,
@@ -2023,12 +2056,12 @@ BOUNDARY_CONTRACTS_BY_ID: dict[str, BoundaryContract] = {
     c.boundary_id: c for c in BOUNDARY_CONTRACTS
 }
 
-# Ensure the registry has exactly fifty-one entries with no duplicates.
-assert len(BOUNDARY_CONTRACTS) == 51, (
-    f"BOUNDARY_CONTRACTS must have exactly 51 entries, got {len(BOUNDARY_CONTRACTS)}"
+# Ensure the registry has exactly fifty-two entries with no duplicates.
+assert len(BOUNDARY_CONTRACTS) == 52, (
+    f"BOUNDARY_CONTRACTS must have exactly 52 entries, got {len(BOUNDARY_CONTRACTS)}"
 )
-assert len(BOUNDARY_CONTRACTS_BY_ID) == 51, (
-    "BOUNDARY_CONTRACTS_BY_ID must have exactly 51 entries "
+assert len(BOUNDARY_CONTRACTS_BY_ID) == 52, (
+    "BOUNDARY_CONTRACTS_BY_ID must have exactly 52 entries "
     "(duplicate boundary_id detected)"
 )
 

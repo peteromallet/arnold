@@ -14,10 +14,43 @@ from arnold_pipelines.megaplan.resident.provenance import DELEGATION_CONTEXT_ENV
 class _DetachedProcess:
     pid = 4321
 
+    def poll(self):
+        return None
+
 
 @pytest.fixture(autouse=True)
-def _isolate_resident_provenance(monkeypatch: pytest.MonkeyPatch) -> None:
+def _isolate_resident_provenance(
+    request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch
+) -> None:
     monkeypatch.delenv(DELEGATION_CONTEXT_ENV, raising=False)
+    real_start_ticks = subagent._pid_start_ticks
+    real_pid_live = subagent._pid_live
+    monkeypatch.setattr(
+        subagent,
+        "_pid_start_ticks",
+        lambda pid: (
+            f"test-start-{pid}"
+            if pid in {4321, 223}
+            else real_start_ticks(pid)
+        ),
+    )
+    monkeypatch.setattr(
+        subagent,
+        "_pid_live",
+        lambda pid: True if pid in {4321, 223} else real_pid_live(pid),
+    )
+    # The parameterized route test explicitly owns provider-admission coverage.
+    # Supply only its two intentionally synthetic provider credentials; all
+    # other tests and all other providers retain the real read-only scan.
+    if request.node.name.startswith("test_auto_route_creates_one_durable_provider_manifest"):
+        monkeypatch.setenv("ZAI_API_KEY", "c1-test-zai-key")
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "c1-test-anthropic-key")
+        real_has_keys = subagent.key_pool.has_keys
+        monkeypatch.setattr(
+            subagent.key_pool,
+            "has_keys",
+            lambda provider: True if provider == "zai" else real_has_keys(provider),
+        )
 
 
 @pytest.mark.parametrize(
@@ -55,6 +88,7 @@ def test_auto_route_creates_one_durable_provider_manifest(
     manifest = json.loads(Path(result.manifest_path or "").read_text(encoding="utf-8"))
     assert result.status == "running"
     assert manifest["backend"] == backend
+    assert manifest["supervisor_start_ticks"] == "test-start-4321"
     assert manifest["model"] == runtime_model
     assert manifest["model_spec"] == (
         "omp:zai/glm-5.2" if backend == "omp" else model_spec
@@ -518,12 +552,14 @@ def test_provider_timeout_is_enforced_and_captured_durably(
         subagent.subprocess, "Popen", lambda *args, **kwargs: _TimedOutWorker()
     )
 
-    assert subagent._run_managed_manifest(manifest_path) == 124
+    # A timeout whose managed signal door cannot certify the child is held
+    # for custody reconciliation rather than misreported as a terminal 124.
+    assert subagent._run_managed_manifest(manifest_path) == 75
     manifest = json.loads(manifest_path.read_text())
-    assert manifest["status"] == "failed"
-    assert manifest["returncode"] == 124
-    assert manifest["failure"]["category"] == "timeout"
-    assert manifest["lifecycle"]["work"]["status"] == "worker_failed"
+    assert manifest["status"] == "running"
+    assert manifest["cleanup_hold"]["classification"] == "cleanup_held"
+    assert manifest["error_class"] == "WorkerCleanupHeld"
+    assert "signal_result" in manifest["cleanup_hold"]
     assert Path(manifest["provider_events_path"]).is_file()
 
 

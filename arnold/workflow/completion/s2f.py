@@ -14,10 +14,9 @@ from arnold.workflow.completion.source_declaration import (
 )
 
 DEFAULT_S2F_SCAN_DIRS: tuple[str, ...] = (
-    ".megaplan/plans",
-    ".megaplan/plans/*",
+    "plans",
+    "plans/*",
     "s2f_templates",
-    ".megaplan/s2f_templates",
     "gates/s2f_templates",
 )
 

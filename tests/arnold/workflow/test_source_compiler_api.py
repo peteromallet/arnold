@@ -2785,10 +2785,11 @@ def test_source_compiler_megaplan_declared_step_interfaces_survive_metadata_stri
         "megaplan:artifact-contract",
     )
     assert steps["override"].metadata["override_actions"] == (
-        "abort",
-        "add-note",
-        "adopt-execution",
-        "cutover",
+            "abort",
+            "add-note",
+            "adopt-execution",
+            "cap-revise-once",
+            "cutover",
         "force-proceed",
         "reconcile-plan-ledger",
         "recover-blocked",

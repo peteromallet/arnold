@@ -3378,7 +3378,15 @@ def _resident_credentials_observation(manifest: Mapping[str, Any]) -> dict[str, 
     if backend == "omp":
         route = model if model.startswith("omp:") else f"omp:{model}" if model else "omp"
     else:
-        route = f"{backend}:{model}" if model else backend
+        # ``model_spec`` is normally already a fully-qualified route for the
+        # provider-specific backends (for example ``codex:gpt-5``).  Do not
+        # turn that valid route into ``codex:codex:gpt-5`` while constructing
+        # the observation used by the launch gate.
+        route = (
+            model
+            if model.startswith(f"{backend}:")
+            else f"{backend}:{model}" if model else backend
+        )
     try:
         parsed = parse_agent_spec(route)
     except (TypeError, ValueError):
@@ -4809,14 +4817,19 @@ def _interrupt_parent_for_followup(
             parent["completion_delivery"] = delivery
         _atomic_json(parent_path, parent)
         try:
-            signal_managed_process(
+            signal_accepted = signal_managed_process(
                 parent_path,
                 parent,
                 pid,
                 signal.SIGINT,
                 cause_kind="terminate",
                 ladder_step="term",
+                worker=False,
             )
+            if not signal_accepted:
+                raise SubagentFollowupError(
+                    "managed supervisor signal was refused; refusing to report interruption"
+                )
         except ProcessLookupError:
             latest = _read_managed_resident_manifest(parent_path)
             if str(latest.get("status") or "") not in {

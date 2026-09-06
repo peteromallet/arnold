@@ -212,7 +212,7 @@ class TestM10ExternalMutationDiscovery:
         modules = self._modules()
         for path in (
             "arnold_pipelines/megaplan/skills/subagent-launcher/launch_claude_agent.py",
-            "arnold_pipelines/megaplan/skills/subagent-launcher/launch_hermes_agent.py",
+            "arnold_pipelines/megaplan/skills/subagent-launcher/launch_omp_agent.py",
         ):
             mutations = modules[path]["external_mutations"]
             subprocess_calls = [
@@ -220,6 +220,12 @@ class TestM10ExternalMutationDiscovery:
                 for mutation in mutations
                 if mutation["call"] == "subprocess.run"
             ]
+            if not subprocess_calls:
+                subprocess_calls = [
+                    mutation
+                    for mutation in mutations
+                    if mutation["call"] == "subprocess.Popen"
+                ]
             assert subprocess_calls, path
             assert all(
                 mutation["disposition"] == "action_off"

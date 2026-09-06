@@ -10,6 +10,7 @@ from arnold_pipelines.megaplan.resident.agent_loop import (
 )
 from arnold_pipelines.megaplan.resident.auth import AuthorizationSubject
 from arnold_pipelines.megaplan.resident.provenance import normalize_delegation_provenance
+from arnold_pipelines.megaplan.resident import subagent as subagent_module
 from arnold_pipelines.megaplan.resident.query_relationship import (
     classify_query_relationship,
     correlate_semantic_follow_up,
@@ -28,6 +29,25 @@ from arnold_pipelines.megaplan.store import FileStore, ResidentConversationInput
 
 
 CONVERSATION_KEY = "discord:dm:42"
+
+
+@pytest.fixture(autouse=True)
+def _fake_worker_process_identity(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Bind this module's synthetic Popen PIDs to real custody checks only."""
+
+    real_start_ticks = subagent_module._pid_start_ticks
+    real_pid_live = subagent_module._pid_live
+    fake_pids = {4201, 4301, 4401}
+    monkeypatch.setattr(
+        subagent_module,
+        "_pid_start_ticks",
+        lambda pid: f"test-start-{pid}" if pid in fake_pids else real_start_ticks(pid),
+    )
+    monkeypatch.setattr(
+        subagent_module,
+        "_pid_live",
+        lambda pid: True if pid in fake_pids else real_pid_live(pid),
+    )
 
 
 def _conversation_and_queries(tmp_path: Path):
@@ -338,6 +358,9 @@ def test_independent_launches_do_not_share_delivery_ownership(
     class Process:
         pid = 4201
 
+        def poll(self):
+            return None
+
     monkeypatch.setattr(
         "arnold_pipelines.megaplan.resident.subagent.subprocess.Popen",
         lambda *args, **kwargs: Process(),
@@ -366,6 +389,9 @@ def test_launch_retry_identity_includes_canonical_description(
     class Process:
         pid = 4301
 
+        def poll(self):
+            return None
+
     def launch(*args, **kwargs):
         nonlocal calls
         calls += 1
@@ -388,6 +414,8 @@ def test_launch_retry_identity_includes_canonical_description(
     assert replay.run_id == first.run_id
     assert changed.run_id != first.run_id
     assert calls == 2
+    changed_manifest = json.loads(Path(changed.manifest_path).read_text())
+    assert changed_manifest["supervisor_start_ticks"] == "test-start-4301"
 
 
 def test_delivered_synthesis_group_rejects_second_owner(
@@ -396,6 +424,9 @@ def test_delivered_synthesis_group_rejects_second_owner(
     monkeypatch.delenv("ARNOLD_RESIDENT_DELEGATION_CONTEXT", raising=False)
     class Process:
         pid = 4401
+
+        def poll(self):
+            return None
 
     monkeypatch.setattr(
         "arnold_pipelines.megaplan.resident.subagent.subprocess.Popen",

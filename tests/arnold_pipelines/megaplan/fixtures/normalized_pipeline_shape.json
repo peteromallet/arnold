@@ -860,6 +860,7 @@
           "abort",
           "add-note",
           "adopt-execution",
+          "cap-revise-once",
           "cutover",
           "force-proceed",
           "reconcile-plan-ledger",

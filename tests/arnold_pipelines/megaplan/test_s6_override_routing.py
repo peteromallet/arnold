@@ -193,6 +193,7 @@ def test_s6_override_matrix_distinguishes_routing_and_effect_only_actions() -> N
     assert set(routing_entries) == {
         "abort",
         "adopt-execution",
+        "cap-revise-once",
         "cutover",
         "force-proceed",
         "reconcile-plan-ledger",
@@ -242,8 +243,8 @@ def test_s6_override_gap_table_is_explicit_in_current_native_surface() -> None:
         if signal not in policy_surface
     }
 
-    assert typed_surface == {"abort", "cutover", "force_proceed", "replan"}
-    assert workflow_surface == {"abort", "cutover", "force_proceed", "replan"}
+    assert typed_surface == {"abort", "cap_revise_once", "cutover", "force_proceed", "replan"}
+    assert workflow_surface == {"abort", "cap_revise_once", "cutover", "force_proceed", "replan"}
     assert policy_surface == {
         "adopt_execution",
         "reconcile_plan_ledger",
@@ -268,6 +269,16 @@ def test_s6_override_outcome_targets_are_declared_in_canonical_source() -> None:
             "terminal_state_ref": "aborted",
             "description": (
                 "Terminate the workflow through the halt node and land in the aborted terminal state."
+            ),
+        },
+        "cap-revise-once": {
+            "route_signal": "cap_revise_once",
+            "target_ref": "revise",
+            "declared_target_ref": "revise",
+            "reentry_target_ref": "critique",
+            "description": (
+                "Grant one CAS-fenced revise round after a critique-cap blocked park, "
+                "then re-enter the critique gate for normal validation."
             ),
         },
         "force-proceed": {
@@ -459,6 +470,7 @@ def test_s6_override_and_human_gate_transitions_have_authority_contracts() -> No
 
     assert set(authority_contracts) == {
         "abort",
+        "cap-revise-once",
         "cutover",
         "force-proceed",
         "replan",

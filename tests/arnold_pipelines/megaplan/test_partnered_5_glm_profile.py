@@ -49,9 +49,25 @@ def _replace_phase_model_gpt_specs(entries: list[str]) -> list[str]:
 
 
 def _expected_glm_profile(base: dict[str, Any]) -> dict[str, Any]:
-    expected = _replace_gpt_specs(base)
+    # The canonical GLM profile is an explicit OMP policy, not a mechanical
+    # provider rewrite of the partnered-5 fallback lists.  Only finalize keeps
+    # its deliberate Codex premium route; prep/critique remain DeepSeek and
+    # every other phase is routed to the OMP GLM provider.
+    expected = {phase: GLM_SPEC for phase in base}
+    expected["prep"] = "omp:deepseek/deepseek-v4-pro"
+    expected["critique"] = "omp:deepseek/deepseek-v4-pro"
     expected["finalize"] = FINALIZE_SPEC
     return expected
+
+
+def _expected_glm_critique_tiers() -> dict[int, Any]:
+    return {
+        1: "omp:deepseek/deepseek-v4-flash",
+        2: "omp:deepseek/deepseek-v4-pro",
+        3: "omp:deepseek/deepseek-v4-pro",
+        4: [GLM_SPEC, FIREWORKS_GLM_SPEC, GLM_SPEC],
+        5: GLM_SPEC,
+    }
 
 
 def _profile_args(profile: str) -> Namespace:
@@ -80,9 +96,7 @@ def test_partnered_5_glm_preserves_phase_shape_with_finalize_as_only_gpt_route(
     expected = _expected_glm_profile(base)
     assert glm == expected
     assert glm_metadata["adaptive_critique"] == base_metadata["adaptive_critique"]
-    assert glm_metadata["tier_models"]["critique"] == _replace_gpt_specs(
-        base_metadata["tier_models"]["critique"]
-    )
+    assert glm_metadata["tier_models"]["critique"] == _expected_glm_critique_tiers()
 
 
 def test_partnered_5_glm_resolution_contains_only_finalize_gpt_route(
@@ -112,15 +126,12 @@ def test_partnered_5_glm_preserves_non_gpt_phase_and_critique_routes(
     apply_profile_expansion(base_args, tmp_path)
     apply_profile_expansion(glm_args, tmp_path)
 
-    expected_phase_models = _replace_phase_model_gpt_specs(base_args.phase_model)
     expected_phase_models = [
-        f"finalize={FINALIZE_SPEC}" if entry.startswith("finalize=") else entry
-        for entry in expected_phase_models
+        f"{phase}={spec}"
+        for phase, spec in _expected_glm_profile(load_profiles(project_dir=tmp_path)["partnered-5"]).items()
     ]
     assert glm_args.phase_model == expected_phase_models
-    assert glm_args.tier_models["critique"] == _replace_gpt_specs(
-        base_args.tier_models["critique"]
-    )
+    assert glm_args.tier_models["critique"] == _expected_glm_critique_tiers()
     assert glm_args.prep_models == _replace_gpt_specs(base_args.prep_models)
 
 

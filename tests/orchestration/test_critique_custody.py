@@ -814,7 +814,7 @@ def test_runtime_producer_binding_captures_available_hermes_attempt_identity(
     binding = critique_runtime._critique_producer_binding(
         {"meta": {"current_invocation_id": "inv-1"}},
         worker,
-        agent="hermes",
+        agent="omp",
         scratch_filename="critique_output.json",
         scratch_status="filled",
         plan_dir=tmp_path,
@@ -823,7 +823,7 @@ def test_runtime_producer_binding_captures_available_hermes_attempt_identity(
 
     assert binding["attempt_id"] == "inv-1:1"
     assert binding["selected_spec"] == "omp:zai/glm-5.2"
-    assert binding["provider"] == "zhipu"
+    assert binding["provider"] == "zai/glm-5.2"
     assert binding["model_actual"] == "glm-5.2"
     assert binding["scratch_sha256"] == critique_custody.sha256_file(
         tmp_path / "critique_output.json"

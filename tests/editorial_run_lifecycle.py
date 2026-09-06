@@ -71,6 +71,10 @@ def test_resume_plan_reenters_cursor_and_clears_failure_after_success(tmp_path: 
             ),
             encoding="utf-8",
         )
+        (plan_dir / "phase_result.json").write_text(
+            json.dumps({"phase": "execute", "exit_kind": "success"}),
+            encoding="utf-8",
+        )
         state["current_state"] = "executed"
         (plan_dir / "state.json").write_text(json.dumps(state), encoding="utf-8")
         return 0, "ok", ""

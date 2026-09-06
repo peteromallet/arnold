@@ -52,6 +52,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import tomllib
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Mapping
@@ -280,6 +281,207 @@ def frozen_requirements(uv_lock_text: str) -> list[str]:
         if package.get("source") != "registry" or not name or not version:
             continue
         requirements.append(f"{name}=={version}")
+    return sorted(set(requirements))
+
+
+def _marker_aware_frozen_requirements(uv_lock_text: str) -> list[str]:
+    """Return frozen registry pins with lock dependency markers preserved.
+
+    ``uv.lock`` contains packages for every supported interpreter, while the
+    old pip fallback flattened every registry package into an unconditional
+    ``name==version`` requirement.  That turns a valid conditional edge such
+    as discord-py's ``audioop-lts`` dependency (Python >= 3.13) into an
+    impossible install on Python 3.11/3.12.  Keep the exact frozen pin but
+    carry the marker along each dependency path so pip evaluates it against
+    the generation's bound interpreter.
+
+    Only registry packages reachable from an editable workspace package are
+    emitted.  Optional dependencies are selected only when the lock includes
+    them in the package's ``dependencies`` list; merely declaring an
+    ``optional-dependencies`` table does not activate an extra.
+
+    The lock is an executable dependency graph for this fallback.  A missing
+    or ambiguous required edge is therefore an invalid frozen spec, not a
+    reason to guess or install an unrelated package.
+    """
+    try:
+        lock = tomllib.loads(uv_lock_text)
+    except tomllib.TOMLDecodeError as exc:
+        raise GenerationError(f"cannot parse frozen uv.lock: {exc}") from exc
+    packages = lock.get("package")
+    if not isinstance(packages, list):
+        raise GenerationError("frozen uv.lock has no package graph")
+
+    def normalize(name: object) -> str:
+        return str(name or "").replace("_", "-").replace(".", "-").lower()
+
+    by_name: dict[str, list[dict[str, Any]]] = {}
+    for package in packages:
+        if not isinstance(package, dict) or not package.get("name"):
+            raise GenerationError("frozen uv.lock has a package with no name")
+        by_name.setdefault(normalize(package["name"]), []).append(package)
+    roots = [
+        package
+        for package in packages
+        if isinstance(package, dict)
+        and isinstance(package.get("source"), dict)
+        and "editable" in package["source"]
+    ]
+    if not roots:
+        raise GenerationError("frozen uv.lock has no editable project root")
+
+    def source_kind(package: dict[str, Any]) -> str:
+        source = package.get("source")
+        if source is None or source == {}:
+            return "registry"
+        if not isinstance(source, dict):
+            raise GenerationError(
+                f"frozen uv.lock package {package.get('name')!r} has an invalid source"
+            )
+        kinds = [
+            kind
+            for kind in ("registry", "git", "url", "editable", "directory", "path")
+            if kind in source
+        ]
+        if len(kinds) != 1:
+            raise GenerationError(
+                f"frozen uv.lock package {package.get('name')!r} has an ambiguous source"
+            )
+        return kinds[0]
+
+    for root in roots:
+        root_name = normalize(root.get("name"))
+        if len(by_name.get(root_name, [])) != 1:
+            raise GenerationError(
+                f"frozen uv.lock has an ambiguous project root {root.get('name')!r}"
+            )
+
+    # Each entry is one marker expression for a path from the editable root.
+    # ``None`` means that path is unconditional.  The graph is small enough
+    # that keeping all paths is clearer and safer than boolean-expression
+    # simplification.
+    paths: dict[str, set[str | None]] = {}
+    visiting: set[tuple[str, str | None, tuple[str, ...]]] = set()
+
+    def selected_extras(dependency: dict[str, Any]) -> tuple[str, ...]:
+        """Read extras requested by a lock dependency edge."""
+        if "extra" in dependency and "extras" in dependency:
+            raise GenerationError(
+                f"frozen uv.lock dependency {dependency.get('name')!r} has ambiguous extras"
+            )
+        raw = dependency.get("extra", dependency.get("extras", []))
+        if raw is None:
+            return ()
+        if not isinstance(raw, list) or any(not isinstance(item, str) or not item for item in raw):
+            raise GenerationError(
+                f"frozen uv.lock dependency {dependency.get('name')!r} has invalid extras"
+            )
+        return tuple(sorted(set(raw)))
+
+    def walk(
+        package: dict[str, Any],
+        inherited: str | None,
+        extras: tuple[str, ...] = (),
+    ) -> None:
+        package_name = normalize(package.get("name"))
+        state = (package_name, inherited, extras)
+        if state in visiting:
+            return
+        visiting.add(state)
+        dependencies = package.get("dependencies", [])
+        if not isinstance(dependencies, list):
+            raise GenerationError(
+                f"frozen uv.lock package {package.get('name')!r} has invalid dependencies"
+            )
+        optional = package.get("optional-dependencies", {})
+        if optional is None:
+            optional = {}
+        if not isinstance(optional, dict):
+            raise GenerationError(
+                f"frozen uv.lock package {package.get('name')!r} has invalid optional dependencies"
+            )
+        selected_optional: list[dict[str, Any]] = []
+        for extra in extras:
+            entries = optional.get(extra)
+            if not isinstance(entries, list):
+                raise GenerationError(
+                    f"frozen uv.lock package {package.get('name')!r} is missing selected extra {extra!r}"
+                )
+            selected_optional.extend(entries)
+
+        for dependency in [*dependencies, *selected_optional]:
+            if not isinstance(dependency, dict) or not dependency.get("name"):
+                raise GenerationError(
+                    f"frozen uv.lock package {package.get('name')!r} has a missing dependency edge"
+                )
+            dependency_name = normalize(dependency.get("name"))
+            candidates = by_name.get(dependency_name, [])
+            if not candidates:
+                raise GenerationError(
+                    f"frozen uv.lock package {package.get('name')!r} requires missing package "
+                    f"{dependency.get('name')!r}"
+                )
+            if len(candidates) != 1:
+                raise GenerationError(
+                    f"frozen uv.lock dependency {dependency.get('name')!r} is ambiguous"
+                )
+            edge_marker = dependency.get("marker")
+            if edge_marker is not None and not isinstance(edge_marker, str):
+                raise GenerationError(
+                    f"frozen uv.lock dependency {dependency.get('name')!r} has an invalid marker"
+                )
+            if edge_marker == "":
+                raise GenerationError(
+                    f"frozen uv.lock dependency {dependency.get('name')!r} has an invalid marker"
+                )
+            edge_marker = edge_marker or None
+            child_extras = selected_extras(dependency)
+            if inherited and edge_marker:
+                marker = f"({inherited}) and ({edge_marker})"
+            else:
+                marker = inherited or edge_marker
+            paths.setdefault(dependency_name, set()).add(marker)
+            walk(candidates[0], marker, child_extras)
+
+    for root in roots:
+        if source_kind(root) != "editable":
+            raise GenerationError(
+                f"frozen uv.lock project root {root.get('name')!r} is not editable"
+            )
+        walk(root, None)
+
+    requirements: list[str] = []
+    for package in packages:
+        if not isinstance(package, dict):
+            continue
+        name = str(package.get("name") or "")
+        version = str(package.get("version") or "")
+        if not name:
+            continue
+        package_name = normalize(name)
+        if package_name not in paths:
+            continue
+        if source_kind(package) != "registry":
+            continue
+        if not version:
+            raise GenerationError(
+                f"frozen uv.lock registry package {name!r} has no pinned version"
+            )
+        markers = paths[package_name]
+        # An unconditional path makes the marker unnecessary; conditional
+        # paths are OR-ed for pip in stable lexical order.
+        marker = None
+        if markers and None not in markers:
+            marker_values = sorted(value for value in markers if value)
+            if marker_values:
+                marker = " or ".join(
+                    value if len(marker_values) == 1 else f"({value})"
+                    for value in marker_values
+                )
+        requirement = f"{name}=={version}"
+        if marker:
+            requirement += f"; {marker}"
+        requirements.append(requirement)
     return sorted(set(requirements))
 
 
@@ -523,14 +725,19 @@ def _build_generation(
     use_uv = strategy == "uv" or (
         strategy == "auto" and shutil.which("uv") is not None
     )
-    requirements = [] if use_uv else frozen_requirements(lock_text)
+    requirements = [] if use_uv else _marker_aware_frozen_requirements(lock_text)
     path_sources = [] if use_uv else _frozen_path_source_roots(project, lock_text)
     install_args = requirements + [source_path for source_path, _ in path_sources]
     # A dependency-FREE generation needs no pip inside the venv (the digest
     # reads package metadata, never pip): create it with --without-pip so
     # the build is fast and hermetic.  A generation with dependencies needs
     # pip for the install step (or uv, which manages its own packages).
-    venv_args = [base_python, "-m", "venv"]
+    # The production binding verifier resolves the interpreter path and
+    # requires it to remain inside the content-addressed generation.  A
+    # platform-default venv symlink resolves back to the base interpreter and
+    # would make an otherwise valid generation unverifiable, so generations
+    # must carry their own interpreter copy.
+    venv_args = [base_python, "-m", "venv", "--copies"]
     if not install_args:
         venv_args.append("--without-pip")
     venv_args.append(str(gen_dir))

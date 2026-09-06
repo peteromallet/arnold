@@ -76,12 +76,27 @@ def _persist_source(root: Path, *, source: str, message: str, conversation: str 
 class _Process:
     pid = 4321
 
+    def poll(self):
+        return None
+
 
 @pytest.fixture(autouse=True)
 def _isolate_process_provenance(monkeypatch) -> None:
-    """Each test declares process custody explicitly instead of inheriting the test runner's."""
+    """Keep the fake worker's custody narrow and preserve real process checks."""
 
     monkeypatch.delenv(DELEGATION_CONTEXT_ENV, raising=False)
+    real_start_ticks = subagent_module._pid_start_ticks
+    real_pid_live = subagent_module._pid_live
+    monkeypatch.setattr(
+        subagent_module,
+        "_pid_start_ticks",
+        lambda pid: "test-start-4321" if pid == 4321 else real_start_ticks(pid),
+    )
+    monkeypatch.setattr(
+        subagent_module,
+        "_pid_live",
+        lambda pid: True if pid == 4321 else real_pid_live(pid),
+    )
 
 
 def test_launch_time_duplicate_is_idempotent(tmp_path, monkeypatch) -> None:
@@ -98,12 +113,16 @@ def test_launch_time_duplicate_is_idempotent(tmp_path, monkeypatch) -> None:
         launch_subagent_task(
             ResidentConfig(), task="same work", project_dir=str(tmp_path),
             request_id=source, launch_origin=_origin(source=source, message=message),
+            mutation_claim="none",
+            work_intent="review",
         )
     )
     second = asyncio.run(
         launch_subagent_task(
             ResidentConfig(), task="same work", project_dir=str(tmp_path),
             request_id=source, launch_origin=_origin(source=source, message=message),
+            mutation_claim="none",
+            work_intent="review",
         )
     )
 
@@ -113,6 +132,8 @@ def test_launch_time_duplicate_is_idempotent(tmp_path, monkeypatch) -> None:
     assert len(owned_calls) == 1
     assert first.run_id == second.run_id
     assert first.manifest_path == second.manifest_path
+    manifest = json.loads(Path(first.manifest_path).read_text(encoding="utf-8"))
+    assert manifest["supervisor_start_ticks"] == "test-start-4321"
 
 
 def test_two_concurrent_messages_keep_distinct_exact_reply_targets(tmp_path, monkeypatch) -> None:
@@ -215,6 +236,8 @@ def test_inherited_discord_custody_commits_pending_outbox_before_process_start(
             task="work inherited from Discord",
             project_dir=str(tmp_path),
             request_id="caller-selected-request",
+            mutation_claim="none",
+            work_intent="review",
         )
     )
 
@@ -225,6 +248,7 @@ def test_inherited_discord_custody_commits_pending_outbox_before_process_start(
     assert manifest["launch_provenance"]["source_record_id"] == source
     assert manifest["discord_origin"]["reply_to_message_id"] == message
     assert observed["child_provenance"]["source_record_id"] == source
+    assert manifest["supervisor_start_ticks"] == "test-start-4321"
 
 
 def test_caller_request_id_cannot_change_discord_launch_identity(tmp_path, monkeypatch) -> None:
@@ -242,12 +266,16 @@ def test_caller_request_id_cannot_change_discord_launch_identity(tmp_path, monke
     monkeypatch.setattr(subagent_module.subprocess, "Popen", fake_popen)
     first = asyncio.run(
         launch_subagent_task(
-            ResidentConfig(), task="same work", project_dir=str(tmp_path), request_id="first"
+            ResidentConfig(), task="same work", project_dir=str(tmp_path), request_id="first",
+            mutation_claim="none",
+            work_intent="review",
         )
     )
     second = asyncio.run(
         launch_subagent_task(
-            ResidentConfig(), task="same work", project_dir=str(tmp_path), request_id="second"
+            ResidentConfig(), task="same work", project_dir=str(tmp_path), request_id="second",
+            mutation_claim="none",
+            work_intent="review",
         )
     )
 
@@ -256,6 +284,7 @@ def test_caller_request_id_cannot_change_discord_launch_identity(tmp_path, monke
     manifest = json.loads(Path(first.manifest_path).read_text(encoding="utf-8"))
     assert manifest["request_id"] == source
     assert manifest["caller_request_id"] == "first"
+    assert manifest["supervisor_start_ticks"] == "test-start-4321"
 
 
 def test_caller_origin_cannot_override_inherited_reply_route(tmp_path, monkeypatch) -> None:

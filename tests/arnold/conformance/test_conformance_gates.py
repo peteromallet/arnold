@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import subprocess
 import sys
 import textwrap
@@ -22,11 +23,15 @@ from arnold.conformance.checks import (
     check_package_name_staleness,
     check_public_workflow_layering,
     check_semantic_coupling,
+    validate_collection_artifact_placements,
+    validate_canonical_artifact_placements,
+    validate_canonical_root_artifacts,
 )
 from arnold.conformance.deleted_surfaces import (
     DELETED_IMPORT_MODULES,
     DELETED_IMPORT_PREFIXES,
 )
+from arnold_pipelines.megaplan.layout import is_canonical_chain_spec, is_collection_chain_spec
 
 
 def _clear_deleted_megaplan_modules() -> None:
@@ -100,7 +105,7 @@ def test_normative_initiative_artifacts_use_canonical_semantic_subdirectories() 
         ".megaplan/initiatives/standardized-completion-specifications/"
         "evidence/SUPERSESSION_CROSSWALK.yaml",
     }
-    obsolete = {
+    preserved_historical = {
         ".megaplan/initiatives/megaplan-native-parity-corrective/"
         "GOLDEN_TRACE_CONTRACT.md",
         ".megaplan/initiatives/megaplan-north-star-sense-checks-revise-design/"
@@ -112,7 +117,91 @@ def test_normative_initiative_artifacts_use_canonical_semantic_subdirectories() 
     }
 
     assert all((repo_root / path).is_file() for path in canonical)
-    assert all(not (repo_root / path).exists() for path in obsolete)
+    assert all((repo_root / path).is_file() for path in preserved_historical)
+    for source, destination in zip(sorted(preserved_historical), sorted(canonical)):
+        if source.endswith("PLATFORM_CONTRACT.md"):
+            assert (repo_root / source).read_bytes() != (repo_root / destination).read_bytes()
+        else:
+            assert (repo_root / source).read_bytes() == (repo_root / destination).read_bytes()
+
+
+def test_typed_canonical_placement_rows_fail_closed_on_unknown_fields() -> None:
+    repo_root = Path(__file__).resolve().parents[3]
+    record = json.loads(
+        (repo_root / "docs/megaplan/post-m11-release-evidence-20260731.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    validate_canonical_artifact_placements(record, repo_root=repo_root)
+    declared = validate_canonical_root_artifacts(record, repo_root=repo_root)
+    assert len(declared) == 20
+    record["canonical_artifact_moves"][0]["untrusted_allowlist"] = True
+    with pytest.raises(ValueError, match="unknown or missing fields"):
+        validate_canonical_artifact_placements(record, repo_root=repo_root)
+    root_record = json.loads(
+        (repo_root / "docs/megaplan/post-m11-release-evidence-20260731.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    root_record["canonical_root_artifacts"][0]["generator"] = "glob"
+    with pytest.raises(ValueError, match="generator is unknown"):
+        validate_canonical_root_artifacts(root_record, repo_root=repo_root)
+
+
+def test_ownerless_collection_promotions_are_typed_and_source_preserving() -> None:
+    repo_root = Path(__file__).resolve().parents[3]
+    record = json.loads(
+        (repo_root / "docs/megaplan/post-m11-release-evidence-20260731.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    covered = validate_collection_artifact_placements(record, repo_root=repo_root)
+    assert len(record["canonical_artifact_moves"]) == 28
+    assert covered == (
+        ".megaplan/collection/authority.json",
+        ".megaplan/initiatives/CLOUD.md",
+        ".megaplan/collection/CLOUD.md",
+        ".megaplan/initiatives/chain.yaml",
+        ".megaplan/collection/chain.yaml",
+    )
+
+    for field, value in (
+        ("collection_scope", "invented_scope"),
+        ("artifact_type", "invented_type"),
+    ):
+        candidate = json.loads(json.dumps(record))
+        row = candidate["canonical_artifact_moves"][-2]
+        row[field] = value
+        with pytest.raises(ValueError):
+            validate_collection_artifact_placements(candidate, repo_root=repo_root)
+
+    missing_authority = json.loads(json.dumps(record))
+    del missing_authority["canonical_artifact_moves"][-1]["authority"]
+    with pytest.raises(ValueError, match="unknown or missing fields"):
+        validate_canonical_artifact_placements(missing_authority, repo_root=repo_root)
+
+
+def test_collection_layout_rejects_unregistered_files_and_keeps_root_paths_visible(
+    tmp_path: Path,
+) -> None:
+    _write(tmp_path, ".megaplan/initiatives/CLOUD.md", "cloud\n")
+    _write(tmp_path, ".megaplan/initiatives/chain.yaml", "milestones: []\n")
+    _write(tmp_path, ".megaplan/collection/unknown.txt", "unregistered\n")
+
+    default = check_megaplan_artifact_layout(repo_root=tmp_path)
+    explicit = check_megaplan_artifact_layout(repo_root=tmp_path, allowlist=set())
+    assert default.details["unexpected"] == explicit.details["unexpected"]
+    assert ".megaplan/collection" in default.details["unexpected"]
+    assert ".megaplan/initiatives/CLOUD.md" in default.details["unexpected"]
+    assert ".megaplan/initiatives/chain.yaml" in default.details["unexpected"]
+
+
+def test_collection_chain_is_not_an_initiative_or_canonical_cloud_chain() -> None:
+    repo_root = Path(__file__).resolve().parents[3]
+    collection_chain = repo_root / ".megaplan/collection/chain.yaml"
+    assert collection_chain.is_file()
+    assert is_collection_chain_spec(collection_chain, repo_root)
+    assert not is_canonical_chain_spec(collection_chain, repo_root)
 
 
 def test_conformance_package_import_does_not_import_megaplan() -> None:

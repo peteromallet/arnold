@@ -22,9 +22,9 @@ def test_agent_spec_round_trips_premium_and_provider_specs() -> None:
         model="gpt-5.3-codex",
         effort="high",
     )
-    hermes = parse_agent_spec("omp:fireworks/accounts/foo")
-    assert hermes == AgentSpec("hermes", model="fireworks:accounts/foo")
-    assert format_agent_spec(hermes) == "omp:fireworks/accounts/foo"
+    omp_spec = parse_agent_spec("omp:fireworks/accounts/foo")
+    assert omp_spec == AgentSpec("omp", model="fireworks/accounts/foo")
+    assert format_agent_spec(omp_spec) == "omp:fireworks/accounts/foo"
 
 
 def test_invalid_premium_spec_fails_closed() -> None:

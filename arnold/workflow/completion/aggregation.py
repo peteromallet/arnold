@@ -41,20 +41,23 @@ def _text(value: Any, field: str, *, empty: bool = False) -> str:
     if not empty and not result:
         raise ValueError(f"{field} must be non-empty")
     return result
+def _id_values(value: Any) -> tuple[Any, ...]:
+    if isinstance(value, bytes):
+        return (value.decode(),)
+    if isinstance(value, str):
+        return (value,)
+    if isinstance(value, Mapping):
+        return tuple(value.keys())
+    try:
+        return tuple(value)
+    except TypeError:
+        return (value,)
+
+
 def _ids(value: Any, field: str, *, sort: bool = False) -> tuple[str, ...]:
     if value is None or value == "":
         return ()
-    if isinstance(value, bytes):
-        values = (value.decode(),)
-    elif isinstance(value, str):
-        values = (value,)
-    elif isinstance(value, Mapping):
-        values = tuple(value.keys())
-    else:
-        try:
-            values = tuple(value)
-        except TypeError:
-            values = (value,)
+    values = _id_values(value)
     result = tuple(_text(item, field) for item in values)
     if len(set(result)) != len(result):
         raise ValueError(f"{field} cannot contain duplicates")
