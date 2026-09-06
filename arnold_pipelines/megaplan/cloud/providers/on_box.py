@@ -13,6 +13,7 @@ import shutil
 import subprocess
 from collections.abc import Mapping
 from pathlib import Path
+from typing import Any
 
 from arnold_pipelines.megaplan.cloud.auth import on_box_git_credential_env
 from arnold_pipelines.megaplan.cloud import chain_drive
@@ -121,6 +122,17 @@ class OnBoxProvider(Provider):
 
     def __init__(self, spec: CloudSpec) -> None:
         self._spec = spec
+        # Fresh-child admission binds the canonical read context before any
+        # repository, upload, or engine effect.  Keep the same provider-owned
+        # seam as the SSH adapter so the on-box venue cannot silently fall
+        # back to an unbound authority read.
+        self.fresh_child_authority_context: Any | None = None
+
+    def bind_authority_context(self, context: Any) -> None:
+        """Bind the admitted fresh-child authority read context once."""
+        if context is None or not callable(getattr(context, "read", None)):
+            raise ValueError("fresh-child authority context must provide read()")
+        self.fresh_child_authority_context = context
 
     def invoke_launch_engine(self, request: dict[str, object]) -> dict[str, object]:
         """Invoke the authoritative engine directly in this process once.

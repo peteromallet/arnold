@@ -231,7 +231,7 @@ def provision_fresh_child_authority(
     target_bindings.extend(
         (
             capability,
-            "controller",
+            boundary,
             {**base_target, "operation": operation_id, "boundary": boundary},
         )
         for capability, boundary in (("ssh_engine_invocation", "engine"), ("launch_dispatch", "dispatch"))
