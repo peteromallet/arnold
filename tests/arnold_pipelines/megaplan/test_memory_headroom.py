@@ -18,6 +18,8 @@ import json
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+import pytest
+
 from arnold_pipelines.megaplan.runtime import memory_headroom as mh
 from arnold_pipelines.megaplan.runtime.memory_headroom import (
     classify_memory_headroom,
@@ -132,6 +134,20 @@ def test_cgroup_v2_unlimited_limit_without_memavailable_fails_closed(
         "ok": None,
         "reason": "unknown_cgroup_data",
     }
+
+
+@pytest.mark.parametrize("unit", [None, "bytes"])
+def test_cgroup_v2_unlimited_limit_rejects_malformed_memavailable_unit(
+    tmp_path: Path, monkeypatch, unit: str | None
+) -> None:
+    _write_cgroup_v2(tmp_path, monkeypatch, maximum="max")
+    suffix = "" if unit is None else f" {unit}"
+    (tmp_path / "meminfo").write_text(
+        f"MemAvailable:   25690112{suffix}\nSwapTotal:             0 kB\n",
+        encoding="utf-8",
+    )
+
+    assert read_cgroup_memory_snapshot() is None
 
 
 def test_bounded_limit_arithmetic_is_unchanged(tmp_path: Path, monkeypatch) -> None:

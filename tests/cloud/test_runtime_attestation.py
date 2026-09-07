@@ -1234,9 +1234,13 @@ def _exercise_initial_seed_worker_runtime_observation(
     (cgroup / "memory.events").write_text("oom_kill 0\n", encoding="utf-8")
     meminfo = tmp_path / "meminfo"
     available_kib = 128 * 1024 if memory_mode == "unlimited_insufficient" else 25_690_112
+    memavailable_unit = {
+        "unitless": "",
+        "wrong_unit": " bytes",
+    }.get(memory_mode, " kB")
     meminfo.write_text(
         "MemTotal:       32086424 kB\n"
-        f"MemAvailable:   {available_kib} kB\n"
+        f"MemAvailable:   {available_kib}{memavailable_unit}\n"
         "SwapTotal:             0 kB\n",
         encoding="utf-8",
     )
@@ -1396,7 +1400,13 @@ def test_initial_seed_worker_runtime_observation_drift_is_provider_zero(
 
 @pytest.mark.parametrize(
     "memory_mode",
-    ["unlimited_insufficient", "unreadable", "invalid"],
+    [
+        "unlimited_insufficient",
+        "unreadable",
+        "invalid",
+        "unitless",
+        "wrong_unit",
+    ],
 )
 def test_initial_seed_memory_evidence_failure_is_provider_zero(
     tmp_path: Path,

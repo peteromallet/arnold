@@ -229,7 +229,7 @@ def _host_memory_info() -> dict[str, int]:
                 key, separator, rest = line.partition(":")
                 if separator and key in {"MemAvailable", "SwapTotal"}:
                     fields = rest.split()
-                    if not fields or (len(fields) > 1 and fields[1] != "kB"):
+                    if len(fields) != 2 or fields[1] != "kB":
                         continue
                     value = int(fields[0])
                     if value >= 0:
