@@ -169,13 +169,20 @@ def materialize_command_file(
 
     if not isinstance(command, str):
         raise TypeError("command must be a string")
-    components = (operation_id, request_id, envelope_digest)
-    if any(not value or Path(value).name != value or value in {".", ".."} for value in components):
-        raise ValueError("command-file identity contains a path separator")
+    identities = (
+        ("operation", operation_id),
+        ("request", request_id),
+        ("envelope", envelope_digest),
+    )
+    if any(not isinstance(value, str) or not value for _, value in identities):
+        raise ValueError("command-file identity must be a non-empty string")
     payload = command.encode("utf-8")
     digest = hashlib.sha256(payload).hexdigest()
     root = Path(durable_root).absolute()
-    relative_components = ("command-files", operation_id, request_id, envelope_digest)
+    relative_components = (
+        "command-files",
+        *(_identity_component(label, value) for label, value in identities),
+    )
     directory = root.joinpath(*relative_components)
     target = directory / f"command-{digest}.sh"
     if target.parent != directory or target.is_absolute() is False:
@@ -269,6 +276,12 @@ def _verify_private_directory_fd(fd: int) -> None:
         or stat.S_IMODE(info.st_mode) & 0o077
     ):
         raise ValueError("command-file ancestor is not an owner-private directory")
+
+
+def _identity_component(label: str, value: str) -> str:
+    """Return a bounded filesystem component binding the exact UTF-8 identity."""
+
+    return f"{label}-{hashlib.sha256(value.encode('utf-8')).hexdigest()}"
 
 
 def _verify_command_file_fd(fd: int, payload: bytes) -> None:

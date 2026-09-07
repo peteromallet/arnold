@@ -32,6 +32,15 @@ from agentbox.tmux import (
 from arnold.runtime.durable_ops import ResourceType
 
 
+def _identity_directory(root: Path, operation: str, request: str, envelope: str) -> Path:
+    def component(label: str, value: str) -> str:
+        return f"{label}-{hashlib.sha256(value.encode()).hexdigest()}"
+
+    return root / "command-files" / component("operation", operation) / component(
+        "request", request
+    ) / component("envelope", envelope)
+
+
 def test_tmux_helpers_build_argv_lists_with_deterministic_session_names(
     tmp_path: Path,
 ) -> None:
@@ -184,6 +193,34 @@ def test_materialize_command_file_binds_large_payload_and_reuses_equal_bytes(
     assert command_file_session_argv("agentbox-op", binding)[-1].startswith("exec ")
 
 
+def test_command_file_identity_components_are_bounded_and_separated(
+    tmp_path: Path,
+) -> None:
+    operation_id = "launch:v3:" + ("canonical-operation-identity/雪:" * 20)
+    assert len(operation_id.encode("utf-8")) > 255
+    first = materialize_command_file(
+        "printf bound",
+        durable_root=tmp_path,
+        operation_id=operation_id,
+        request_id="request:v3:one",
+        envelope_digest="sha256:envelope-one",
+    )
+    wrong_identity = materialize_command_file(
+        "printf bound",
+        durable_root=tmp_path,
+        operation_id=operation_id + "-different",
+        request_id="request:v3:one",
+        envelope_digest="sha256:envelope-one",
+    )
+
+    name_max = os.pathconf(tmp_path, "PC_NAME_MAX")
+    assert all(len(component.encode("utf-8")) <= name_max for component in first.components)
+    assert first.components[1].startswith("operation-")
+    assert first.components[1] != wrong_identity.components[1]
+    assert first.path != wrong_identity.path
+    assert operation_id not in command_file_session_argv("agentbox-op", first)[-1]
+
+
 def test_materialize_command_file_rejects_tampering_and_symlink_occupancy(
     tmp_path: Path,
 ) -> None:
@@ -207,7 +244,7 @@ def test_materialize_command_file_rejects_tampering_and_symlink_occupancy(
 
     other = tmp_path / "other"
     other.write_text(payload)
-    target = tmp_path / "command-files" / "op-3" / "req-3" / "sha256:env-3"
+    target = _identity_directory(tmp_path, "op-3", "req-3", "sha256:env-3")
     target.mkdir(parents=True, mode=0o700)
     for directory in (target.parent.parent, target.parent, target):
         directory.chmod(0o700)
@@ -305,7 +342,7 @@ def test_command_file_final_swap_cannot_redirect_execution(
     attacker.write_text("printf attacker", encoding="utf-8")
     attacker.chmod(0o600)
 
-    final_directory = root / "command-files" / "op" / "req" / "sha256:env"
+    final_directory = _identity_directory(root, "op", "req", "sha256:env")
 
     def swap(stage: str, component: str, _fd: int) -> None:
         if stage == "final_verified":
