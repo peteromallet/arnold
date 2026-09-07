@@ -13,7 +13,7 @@ in-container lever is model selection.  This module:
 
 * reads the current cgroup memory snapshot (``memory.current`` /
   ``memory.max`` / ``memory.swap.max`` / ``memory.events`` plus host
-  ``SwapTotal``);
+  ``MemAvailable`` and ``SwapTotal``);
 * classifies usable headroom for the selected spec — a declared
   high-memory spec (frontier) requires more headroom than a normal one, and
   fictional swap (``memory.swap.max > 0`` with host ``SwapTotal == 0``)
@@ -46,6 +46,8 @@ from pathlib import Path
 from typing import Any
 
 _CGROUP_BASE = Path("/sys/fs/cgroup")
+_MEMINFO_PATH = Path("/proc/meminfo")
+_CGROUP_UNLIMITED = "max"
 
 # Evidence-based high-memory classification: the frontier model that OOM'd
 # the container resolves as ``omp:openrouter/stealth/ox-alpha`` or
@@ -164,8 +166,11 @@ def read_cgroup_memory_snapshot() -> dict[str, Any] | None:
     """
     try:
         current = _read_cgroup_int("memory.current")
-        maximum = _read_cgroup_int("memory.max")
+        maximum = _read_cgroup_limit("memory.max")
         if current is None or maximum is None:
+            return None
+        swap_max = _read_cgroup_limit("memory.swap.max")
+        if swap_max is None:
             return None
         events: dict[str, int] = {}
         try:
@@ -176,12 +181,17 @@ def read_cgroup_memory_snapshot() -> dict[str, Any] | None:
             key, _, value = line.partition(" ")
             if key and value.strip().isdigit():
                 events[key] = int(value.strip())
+        host_memory = _host_memory_info()
+        host_available = host_memory.get("MemAvailable")
+        if maximum == _CGROUP_UNLIMITED and host_available is None:
+            return None
         return {
             "memory_current": current,
             "memory_max": maximum,
-            "memory_swap_max": _read_cgroup_int("memory.swap.max") or 0,
+            "memory_swap_max": swap_max,
             "memory_events": events,
-            "host_swap_total": _host_swap_total(),
+            "host_mem_available": host_available,
+            "host_swap_total": host_memory.get("SwapTotal", 0),
         }
     except (OSError, ValueError, UnicodeDecodeError):
         return None
@@ -190,22 +200,47 @@ def read_cgroup_memory_snapshot() -> dict[str, Any] | None:
 def _read_cgroup_int(name: str) -> int | None:
     try:
         raw = (_CGROUP_BASE / name).read_text(encoding="utf-8").strip()
-        if not raw or raw == "max":
+        if not raw or raw == _CGROUP_UNLIMITED:
             return None
-        return int(raw)
+        value = int(raw)
+        return value if value >= 0 else None
     except (OSError, ValueError, UnicodeDecodeError):
         return None
 
 
-def _host_swap_total() -> int:
+def _read_cgroup_limit(name: str) -> int | str | None:
     try:
-        with open("/proc/meminfo", encoding="utf-8") as handle:
+        raw = (_CGROUP_BASE / name).read_text(encoding="utf-8").strip()
+        if raw == _CGROUP_UNLIMITED:
+            return _CGROUP_UNLIMITED
+        if not raw:
+            return None
+        value = int(raw)
+        return value if value >= 0 else None
+    except (OSError, ValueError, UnicodeDecodeError):
+        return None
+
+
+def _host_memory_info() -> dict[str, int]:
+    values: dict[str, int] = {}
+    try:
+        with _MEMINFO_PATH.open(encoding="utf-8") as handle:
             for line in handle:
-                if line.startswith("SwapTotal:"):
-                    return int(line.split()[1]) * 1024
+                key, separator, rest = line.partition(":")
+                if separator and key in {"MemAvailable", "SwapTotal"}:
+                    fields = rest.split()
+                    if not fields or (len(fields) > 1 and fields[1] != "kB"):
+                        continue
+                    value = int(fields[0])
+                    if value >= 0:
+                        values[key] = value * 1024
     except (OSError, ValueError, IndexError):
-        pass
-    return 0
+        return {}
+    return values
+
+
+def _host_swap_total() -> int:
+    return _host_memory_info().get("SwapTotal", 0)
 
 
 def is_high_memory_spec(spec: str) -> bool:
@@ -222,16 +257,36 @@ def classify_memory_headroom(
 ) -> dict[str, Any]:
     """Classify usable headroom for dispatching *spec* under *snapshot*.
 
+    An explicit cgroup-v2 ``memory.max=max`` uses host ``MemAvailable`` as
+    its conservative usable-memory signal.  Unlimited swap is never added.
     ``snapshot is None`` (unreadable cgroup data) classifies as
     ``ok=None`` / ``reason=unknown_cgroup_data`` — callers must not treat
     missing data as permission to launch a known-dangerous worker.
     """
     if not snapshot:
         return {"ok": None, "reason": "unknown_cgroup_data"}
-    current = int(snapshot.get("memory_current") or 0)
-    maximum = int(snapshot.get("memory_max") or 0)
-    usable = max(0, maximum - current)
-    swap_max = int(snapshot.get("memory_swap_max") or 0)
+    try:
+        current = int(snapshot["memory_current"])
+        if current < 0:
+            raise ValueError
+        raw_maximum = snapshot["memory_max"]
+        memory_limit_unlimited = raw_maximum == _CGROUP_UNLIMITED
+        if memory_limit_unlimited:
+            usable = int(snapshot["host_mem_available"])
+            if usable < 0:
+                raise ValueError
+        else:
+            maximum = int(raw_maximum)
+            if maximum < 0:
+                raise ValueError
+            usable = max(0, maximum - current)
+        raw_swap_max = snapshot.get("memory_swap_max", 0)
+        swap_limit_unlimited = raw_swap_max == _CGROUP_UNLIMITED
+        swap_max = 0 if swap_limit_unlimited else int(raw_swap_max or 0)
+        if swap_max < 0:
+            raise ValueError
+    except (KeyError, TypeError, ValueError):
+        return {"ok": None, "reason": "unknown_cgroup_data"}
     host_swap = int(snapshot.get("host_swap_total") or 0)
     # Fictional swap: a swap.max > 0 with no host swap contributes zero.
     usable_swap = swap_max if host_swap > 0 else 0
@@ -248,6 +303,8 @@ def classify_memory_headroom(
         "headroom_bytes": headroom,
         "usable_bytes": usable,
         "usable_swap_bytes": usable_swap,
+        "memory_limit_unlimited": memory_limit_unlimited,
+        "swap_limit_unlimited": swap_limit_unlimited,
         "required_bytes": need,
         "oom_kill_total": oom_kill,
         "reason": "sufficient" if ok else "insufficient_headroom",

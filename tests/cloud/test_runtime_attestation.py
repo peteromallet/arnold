@@ -1136,6 +1136,7 @@ def _exercise_initial_seed_worker_runtime_observation(
     monkeypatch: pytest.MonkeyPatch,
     *,
     runtime_drift: str | None = None,
+    memory_mode: str = "unlimited_sufficient",
 ) -> None:
     """R9: a first managed seed cannot leave the chain binding empty.
 
@@ -1223,11 +1224,24 @@ def _exercise_initial_seed_worker_runtime_observation(
 
     cgroup = tmp_path / "cgroup"
     cgroup.mkdir()
-    (cgroup / "memory.current").write_text("0\n", encoding="utf-8")
-    (cgroup / "memory.max").write_text(str(1024**3), encoding="utf-8")
-    (cgroup / "memory.swap.max").write_text("0\n", encoding="utf-8")
+    (cgroup / "memory.current").write_text("3139612672\n", encoding="utf-8")
+    if memory_mode == "unreadable":
+        pass
+    else:
+        maximum = "invalid" if memory_mode == "invalid" else "max"
+        (cgroup / "memory.max").write_text(f"{maximum}\n", encoding="utf-8")
+    (cgroup / "memory.swap.max").write_text("max\n", encoding="utf-8")
     (cgroup / "memory.events").write_text("oom_kill 0\n", encoding="utf-8")
+    meminfo = tmp_path / "meminfo"
+    available_kib = 128 * 1024 if memory_mode == "unlimited_insufficient" else 25_690_112
+    meminfo.write_text(
+        "MemTotal:       32086424 kB\n"
+        f"MemAvailable:   {available_kib} kB\n"
+        "SwapTotal:             0 kB\n",
+        encoding="utf-8",
+    )
     monkeypatch.setattr(memory_headroom, "_CGROUP_BASE", cgroup)
+    monkeypatch.setattr(memory_headroom, "_MEMINFO_PATH", meminfo, raising=False)
     worker_observations: list[dict[str, object]] = []
 
     def _worker_runtime_provenance(
@@ -1310,9 +1324,20 @@ def _exercise_initial_seed_worker_runtime_observation(
             wbc_dispatch=dispatch,
         )
 
-    if runtime_drift is not None:
-        with pytest.raises(CliError, match="does not match authoritative runtime proof"):
+    if runtime_drift is not None or memory_mode != "unlimited_sufficient":
+        match = (
+            "does not match authoritative runtime proof"
+            if runtime_drift is not None
+            else "insufficient_memory_headroom"
+        )
+        with pytest.raises(CliError) as excinfo:
             _run_worker()
+        assert excinfo.value.code == (
+            "runtime_binding_mismatch"
+            if runtime_drift is not None
+            else "insufficient_memory_headroom"
+        )
+        assert match in (str(excinfo.value) + excinfo.value.code)
         assert provider_calls == []
         assert worker_observations == [
             {
@@ -1366,6 +1391,22 @@ def test_initial_seed_worker_runtime_observation_drift_is_provider_zero(
         tmp_path,
         monkeypatch,
         runtime_drift=runtime_drift,
+    )
+
+
+@pytest.mark.parametrize(
+    "memory_mode",
+    ["unlimited_insufficient", "unreadable", "invalid"],
+)
+def test_initial_seed_memory_evidence_failure_is_provider_zero(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    memory_mode: str,
+) -> None:
+    _exercise_initial_seed_worker_runtime_observation(
+        tmp_path,
+        monkeypatch,
+        memory_mode=memory_mode,
     )
 
 

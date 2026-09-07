@@ -18,18 +18,45 @@ import json
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+from arnold_pipelines.megaplan.runtime import memory_headroom as mh
 from arnold_pipelines.megaplan.runtime.memory_headroom import (
     classify_memory_headroom,
     death_cause_from_markers,
     is_high_memory_spec,
     memory_cooldown_wait_secs,
     prior_cgroup_oom_deaths,
+    read_cgroup_memory_snapshot,
     record_dispatch_memory_marker,
     select_memory_safe_spec,
 )
 
 OX_ALPHA = "omp:openrouter/stealth/ox-alpha"
 FLASH = "omp:deepseek/deepseek-v4-flash"
+
+
+def _write_cgroup_v2(
+    tmp_path: Path,
+    monkeypatch,
+    *,
+    maximum: str,
+    available_kib: int = 25_690_112,
+) -> Path:
+    cgroup = tmp_path / "cgroup"
+    cgroup.mkdir()
+    (cgroup / "memory.current").write_text("3139612672\n", encoding="utf-8")
+    (cgroup / "memory.max").write_text(f"{maximum}\n", encoding="utf-8")
+    (cgroup / "memory.swap.max").write_text("max\n", encoding="utf-8")
+    (cgroup / "memory.events").write_text("oom_kill 0\n", encoding="utf-8")
+    meminfo = tmp_path / "meminfo"
+    meminfo.write_text(
+        "MemTotal:       32086424 kB\n"
+        f"MemAvailable:   {available_kib} kB\n"
+        "SwapTotal:             0 kB\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(mh, "_CGROUP_BASE", cgroup)
+    monkeypatch.setattr(mh, "_MEMINFO_PATH", meminfo, raising=False)
+    return cgroup
 
 
 def _snapshot(
@@ -60,6 +87,65 @@ def test_unreadable_cgroup_fails_closed_for_high_memory() -> None:
     result = classify_memory_headroom(OX_ALPHA, None)
     assert result["ok"] is None
     assert result["reason"] == "unknown_cgroup_data"
+
+
+def test_cgroup_v2_unlimited_limit_uses_host_memavailable_without_swap(
+    tmp_path: Path, monkeypatch
+) -> None:
+    _write_cgroup_v2(tmp_path, monkeypatch, maximum="max")
+
+    snapshot = read_cgroup_memory_snapshot()
+
+    assert snapshot is not None
+    assert snapshot["memory_current"] == 3_139_612_672
+    assert snapshot["memory_max"] == "max"
+    assert snapshot["memory_swap_max"] == "max"
+    assert snapshot["host_mem_available"] == 25_690_112 * 1024
+    assert snapshot["host_swap_total"] == 0
+    result = classify_memory_headroom(FLASH, snapshot)
+    assert result["ok"] is True
+    assert result["usable_bytes"] == 25_690_112 * 1024
+    assert result["usable_swap_bytes"] == 0
+    assert result["memory_limit_unlimited"] is True
+
+
+def test_cgroup_v2_unlimited_limit_respects_insufficient_host_availability(
+    tmp_path: Path, monkeypatch
+) -> None:
+    _write_cgroup_v2(tmp_path, monkeypatch, maximum="max", available_kib=128 * 1024)
+
+    result = classify_memory_headroom(FLASH, read_cgroup_memory_snapshot())
+
+    assert result["ok"] is False
+    assert result["headroom_bytes"] == 128 * 1024**2
+    assert result["reason"] == "insufficient_headroom"
+
+
+def test_cgroup_v2_unlimited_limit_without_memavailable_fails_closed(
+    tmp_path: Path, monkeypatch
+) -> None:
+    _write_cgroup_v2(tmp_path, monkeypatch, maximum="max")
+    (tmp_path / "meminfo").write_text("SwapTotal:             0 kB\n", encoding="utf-8")
+
+    assert read_cgroup_memory_snapshot() is None
+    assert classify_memory_headroom(FLASH, None) == {
+        "ok": None,
+        "reason": "unknown_cgroup_data",
+    }
+
+
+def test_bounded_limit_arithmetic_is_unchanged(tmp_path: Path, monkeypatch) -> None:
+    _write_cgroup_v2(tmp_path, monkeypatch, maximum=str(8 * 1024**3))
+    (tmp_path / "meminfo").unlink()
+    snapshot = read_cgroup_memory_snapshot()
+    assert snapshot is not None
+    result = classify_memory_headroom(
+        FLASH,
+        snapshot,
+    )
+    assert result["ok"] is True
+    assert result["usable_bytes"] == 8 * 1024**3 - 3_139_612_672
+    assert result["memory_limit_unlimited"] is False
 
 
 def test_inert_swap_contributes_zero_headroom() -> None:
