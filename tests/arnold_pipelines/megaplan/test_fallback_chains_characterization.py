@@ -649,6 +649,35 @@ class TestCloudCLIMaterialization:
             assert phase  # phase is non-empty
             assert spec   # spec is non-empty
 
+    def test_generated_phase_bindings_preserve_explicit_effort(self) -> None:
+        from arnold_pipelines.megaplan.cloud.cli import _phase_model_by_label_from_preflight
+
+        route = "omp:openrouter/meta/muse-spark-1.3-contributor:high"
+        result = _phase_model_by_label_from_preflight({
+            "milestones": [{
+                "label": "m1",
+                "profile": None,
+                "explicit_phase_model": [],
+                "resolved_phase_map": {
+                    "prep": route,
+                    "plan": route,
+                    "execute": route,
+                },
+            }]
+        })
+        assert result["m1"] == [f"prep={route}", f"plan={route}", f"execute={route}"]
+
+    def test_profile_projection_preserves_effort_for_every_phase(self) -> None:
+        from arnold_pipelines.megaplan.profiles.policy import profile_to_phase_models
+
+        route = "omp:openrouter/meta/muse-spark-1.3-contributor:high"
+        projected = profile_to_phase_models({
+            "prep": route,
+            "plan": route,
+            "execute": route,
+        })
+        assert projected == [f"prep={route}", f"plan={route}", f"execute={route}"]
+
 
 class TestFallbackChainAncillaryRouting:
     def test_resolve_dispatch_spec_selects_first_tier_chain_element(self) -> None:

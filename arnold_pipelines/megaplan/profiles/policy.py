@@ -448,7 +448,9 @@ def profile_to_phase_models(profile: dict[str, str | list[str]]) -> list[str]:
     result: list[str] = []
     for phase, spec in profile.items():
         if isinstance(spec, str):
-            result.append(f"{phase}={spec}")
+            # Round-trip through the canonical parser/formatter so an
+            # explicit model effort survives every profile projection.
+            result.append(encode_phase_model_value(phase, format_agent_spec(parse_agent_spec(spec))))
         else:
             chain = FallbackSpecChain.from_value(spec, path=f"profile.{phase}")
             result.append(encode_phase_model_value(phase, chain))
