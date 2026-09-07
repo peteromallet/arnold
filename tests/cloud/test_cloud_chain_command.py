@@ -3666,7 +3666,12 @@ def test_composed_cli_on_box_chain_drive_dispatches_once_with_seed_binding(
     assert len(dispatches) == 1
     argv = dispatches[0]
     assert argv.count(f"ARNOLD_RUNTIME_MANIFEST={manifest_path}") == 1
-    marker_path, marker = _parse_marker_write(argv[-1])
+    command_files = list(config.ops_store_root.rglob("command-*.sh"))
+    assert len(command_files) == 1
+    command_file = command_files[0]
+    assert command_file.name in argv[-1]
+    assert len(argv[-1].encode("utf-8")) < 8192
+    marker_path, marker = _parse_marker_write(command_file.read_text(encoding="utf-8"))
     assert marker_path
     marker_binding = marker["runtime_binding"]
     assert marker["bootstrap_manifest_path"] == str(manifest_path)

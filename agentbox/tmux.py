@@ -118,7 +118,8 @@ def command_file_session_argv(
         "flags=os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW;"
         "fd=os.open(root,flags);"
         "check=lambda s,d: (stat.S_ISDIR(s.st_mode) and s.st_uid==os.geteuid() and not(stat.S_IMODE(s.st_mode)&0o077)) or (_ for _ in()).throw(PermissionError('unsafe command directory'));"
-        "check(os.fstat(fd),fd);"
+        "rootcheck=lambda s: (stat.S_ISDIR(s.st_mode) and s.st_uid==os.geteuid() and not(stat.S_IMODE(s.st_mode)&0o022)) or (_ for _ in()).throw(PermissionError('unsafe command root'));"
+        "rootcheck(os.fstat(fd));"
         "exec(\"for part in parts[:-1]:\\n n=os.open(part,flags,dir_fd=fd)\\n check(os.fstat(n),n)\\n os.close(fd)\\n fd=n\");"
         "script=os.open(parts[-1],os.O_RDONLY|os.O_NOFOLLOW,dir_fd=fd);"
         "s=os.fstat(script);"
@@ -191,7 +192,7 @@ def materialize_command_file(
     flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
     parent_fd = os.open(root, flags)
     try:
-        _verify_private_directory_fd(parent_fd)
+        _verify_trusted_root_fd(parent_fd)
         for component in relative_components:
             try:
                 child_fd = os.open(component, flags, dir_fd=parent_fd)
@@ -276,6 +277,16 @@ def _verify_private_directory_fd(fd: int) -> None:
         or stat.S_IMODE(info.st_mode) & 0o077
     ):
         raise ValueError("command-file ancestor is not an owner-private directory")
+
+
+def _verify_trusted_root_fd(fd: int) -> None:
+    info = os.fstat(fd)
+    if (
+        not stat.S_ISDIR(info.st_mode)
+        or info.st_uid != os.geteuid()
+        or stat.S_IMODE(info.st_mode) & 0o022
+    ):
+        raise ValueError("command-file durable root is not a trusted directory")
 
 
 def _identity_component(label: str, value: str) -> str:

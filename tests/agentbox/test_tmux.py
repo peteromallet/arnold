@@ -289,7 +289,7 @@ def _run_bound_command(binding, *, cwd: Path) -> subprocess.CompletedProcess[str
 
 def test_command_file_verified_fd_executes_exact_payload(tmp_path: Path) -> None:
     root = tmp_path / "root"
-    root.mkdir(mode=0o700)
+    root.mkdir(mode=0o755)
     binding = materialize_command_file(
         "printf verified-success",
         durable_root=root,
@@ -302,6 +302,24 @@ def test_command_file_verified_fd_executes_exact_payload(tmp_path: Path) -> None
 
     assert result.returncode == 0, result.stderr
     assert result.stdout == "verified-success"
+
+
+@pytest.mark.parametrize("mode", (0o775, 0o777))
+def test_materialize_command_file_rejects_writable_trusted_root(
+    tmp_path: Path, mode: int
+) -> None:
+    root = tmp_path / "root"
+    root.mkdir(mode=mode)
+    root.chmod(mode)
+
+    with pytest.raises(ValueError, match="trusted directory"):
+        materialize_command_file(
+            "echo safe",
+            durable_root=root,
+            operation_id="op",
+            request_id="req",
+            envelope_digest="sha256:env",
+        )
 
 
 def test_command_file_ancestor_swap_cannot_escape_or_execute(
@@ -385,7 +403,7 @@ def test_materialize_command_file_rejects_foreign_directory_owner(
 ) -> None:
     real_uid = os.geteuid()
     monkeypatch.setattr("agentbox.tmux.os.geteuid", lambda: real_uid + 1)
-    with pytest.raises(ValueError, match="owner-private"):
+    with pytest.raises(ValueError, match="trusted directory"):
         materialize_command_file(
             "echo safe",
             durable_root=tmp_path,
