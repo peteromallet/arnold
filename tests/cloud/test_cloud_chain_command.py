@@ -176,6 +176,10 @@ def _attach_real_fresh_child_admission(
     """Opt the canonical fixture into the real RA/WBC/Custody boundary."""
     owners = project / ".test-fresh-child-owners"
     owners.mkdir(parents=True, exist_ok=True)
+    owners.chmod(0o700)
+    leases = owners / "leases"
+    leases.mkdir(parents=True, exist_ok=True)
+    leases.chmod(0o700)
     raw = yaml.safe_load(spec_path.read_text(encoding="utf-8")) or {}
     raw["fresh_child_admission"] = {
         "enabled": True,
