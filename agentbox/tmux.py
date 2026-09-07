@@ -3,12 +3,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-import errno
 import hashlib
 import os
 import re
 import stat
 import subprocess
+import sys
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -25,6 +25,7 @@ from agentbox.run_dirs import RunDirPaths
 
 TMUX_BIN = "tmux"
 TMUX_COMMAND_INLINE_LIMIT = 8192
+_COMMAND_FILE_TEST_HOOK: Any = None
 
 
 class TmuxError(RuntimeError):
@@ -43,6 +44,17 @@ class TmuxResult:
     returncode: int
     stdout: str
     stderr: str
+
+
+@dataclass(frozen=True)
+class CommandFileBinding:
+    """Descriptor-verifiable identity for one durable command file."""
+
+    path: Path
+    durable_root: Path
+    components: tuple[str, ...]
+    filename: str
+    digest: str
 
 
 @dataclass(frozen=True)
@@ -91,7 +103,7 @@ def new_session_argv(
 
 def command_file_session_argv(
     name: str,
-    command_file: Path | str,
+    command_file: CommandFileBinding,
     *,
     cwd: Path | str | None = None,
     stdout_path: Path | str | None = None,
@@ -100,9 +112,39 @@ def command_file_session_argv(
 ) -> list[str]:
     """Build a short fixed-form argv that executes an already-bound command file."""
 
+    verifier = (
+        "import hashlib,os,stat,sys,tempfile;"
+        "root,*parts,digest=sys.argv[1:];"
+        "flags=os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW;"
+        "fd=os.open(root,flags);"
+        "check=lambda s,d: (stat.S_ISDIR(s.st_mode) and s.st_uid==os.geteuid() and not(stat.S_IMODE(s.st_mode)&0o077)) or (_ for _ in()).throw(PermissionError('unsafe command directory'));"
+        "check(os.fstat(fd),fd);"
+        "exec(\"for part in parts[:-1]:\\n n=os.open(part,flags,dir_fd=fd)\\n check(os.fstat(n),n)\\n os.close(fd)\\n fd=n\");"
+        "script=os.open(parts[-1],os.O_RDONLY|os.O_NOFOLLOW,dir_fd=fd);"
+        "s=os.fstat(script);"
+        "(stat.S_ISREG(s.st_mode) and s.st_uid==os.geteuid() and stat.S_IMODE(s.st_mode)==0o600) or (_ for _ in()).throw(PermissionError('unsafe command file'));"
+        "data=b'';"
+        "exec(\"while True:\\n b=os.read(script,1048576)\\n if not b: break\\n data+=b\");"
+        "hashlib.sha256(data).hexdigest()==digest or (_ for _ in()).throw(ValueError('command digest mismatch'));"
+        "safe=tempfile.TemporaryFile();safe.write(data);safe.flush();safe.seek(0);"
+        "script=safe.fileno();os.set_inheritable(script,True);"
+        "os.execv('/bin/sh',['/bin/sh',f'/dev/fd/{script}'])"
+    )
+    command = " ".join(
+        _shell_quote(value)
+        for value in (
+            sys.executable,
+            "-c",
+            verifier,
+            str(command_file.durable_root),
+            *command_file.components,
+            command_file.filename,
+            command_file.digest,
+        )
+    )
     return new_session_argv(
         name,
-        f"exec /bin/sh {_shell_quote(str(command_file))}",
+        f"exec {command}",
         cwd=cwd,
         stdout_path=stdout_path,
         stderr_path=stderr_path,
@@ -117,7 +159,7 @@ def materialize_command_file(
     operation_id: str,
     request_id: str,
     envelope_digest: str,
-) -> Path:
+) -> CommandFileBinding:
     """Atomically bind command bytes to one admitted launch identity.
 
     The caller must invoke this only after canonical launch admission. Existing
@@ -133,84 +175,121 @@ def materialize_command_file(
     payload = command.encode("utf-8")
     digest = hashlib.sha256(payload).hexdigest()
     root = Path(durable_root).absolute()
-    directory = root / "command-files" / operation_id / request_id / envelope_digest
+    relative_components = ("command-files", operation_id, request_id, envelope_digest)
+    directory = root.joinpath(*relative_components)
     target = directory / f"command-{digest}.sh"
     if target.parent != directory or target.is_absolute() is False:
         raise ValueError("command-file path escaped durable root")
-    _reject_symlink_ancestors(root, directory)
-    directory.mkdir(parents=True, exist_ok=True, mode=0o700)
-    _reject_symlink_ancestors(root, directory)
+    os.makedirs(root, mode=0o700, exist_ok=True)
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    parent_fd = os.open(root, flags)
     try:
-        info = target.lstat()
-        mode = stat.S_IMODE(info.st_mode)
-        if mode != 0o600 or not stat.S_ISREG(info.st_mode):
-            raise ValueError("command-file occupant is not a private regular file")
-        if target.read_bytes() != payload:
-            raise ValueError("command-file occupant bytes differ")
-        _verify_command_file(target, payload)
-        return target
-    except FileNotFoundError:
-        pass
-    except OSError as exc:
-        if exc.errno != errno.ENOENT:
-            raise
+        _verify_private_directory_fd(parent_fd)
+        for component in relative_components:
+            try:
+                child_fd = os.open(component, flags, dir_fd=parent_fd)
+            except FileNotFoundError:
+                try:
+                    os.mkdir(component, 0o700, dir_fd=parent_fd)
+                except FileExistsError:
+                    pass
+                try:
+                    child_fd = os.open(component, flags, dir_fd=parent_fd)
+                except OSError as exc:
+                    raise ValueError("command-file ancestor is not a directory") from exc
+            except OSError as exc:
+                raise ValueError("command-file ancestor is not a directory") from exc
+            try:
+                _verify_private_directory_fd(child_fd)
+            except Exception:
+                os.close(child_fd)
+                raise
+            os.close(parent_fd)
+            parent_fd = child_fd
+            _command_file_test_hook("directory_opened", component, parent_fd)
 
-    temporary = directory / f".{target.name}.{os.getpid()}.{os.urandom(6).hex()}.tmp"
-    fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    try:
-        with os.fdopen(fd, "wb") as handle:
-            handle.write(payload)
-            handle.flush()
-            os.fsync(handle.fileno())
+        filename = target.name
         try:
-            os.link(temporary, target)
-        except FileExistsError:
-            pass
-        finally:
-            temporary.unlink(missing_ok=True)
-        _verify_command_file(target, payload)
-        directory_fd = os.open(directory, os.O_RDONLY)
-        try:
-            os.fsync(directory_fd)
-        finally:
-            os.close(directory_fd)
-        return target
-    except Exception:
-        temporary.unlink(missing_ok=True)
-        raise
-
-
-def _verify_command_file(path: Path, payload: bytes) -> None:
-    info = path.lstat()
-    if not stat.S_ISREG(info.st_mode) or stat.S_IMODE(info.st_mode) != 0o600:
-        raise ValueError("command-file readback is not a private regular file")
-    if info.st_uid != os.geteuid() or path.read_bytes() != payload:
-        raise ValueError("command-file digest or owner readback mismatch")
-
-
-def _reject_symlink_ancestors(root: Path, directory: Path) -> None:
-    """Reject symlinked command-file ancestors before and after publication."""
-
-    try:
-        root_info = root.lstat()
-    except FileNotFoundError:
-        root.mkdir(parents=True, exist_ok=True, mode=0o700)
-        root_info = root.lstat()
-    if stat.S_ISLNK(root_info.st_mode) or not stat.S_ISDIR(root_info.st_mode):
-        raise ValueError("command-file durable root is not a directory")
-    try:
-        relative = directory.relative_to(root)
-    except ValueError as exc:
-        raise ValueError("command-file path escaped durable root") from exc
-    current = root
-    for component in relative.parts:
-        current /= component
-        try:
-            info = current.lstat()
+            final_fd = os.open(filename, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=parent_fd)
         except FileNotFoundError:
-            continue
-        if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
-            raise ValueError("command-file ancestor is not a directory")
+            temporary = f".{filename}.{os.getpid()}.{os.urandom(6).hex()}.tmp"
+            temporary_fd = os.open(
+                temporary,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                0o600,
+                dir_fd=parent_fd,
+            )
+            try:
+                offset = 0
+                while offset < len(payload):
+                    offset += os.write(temporary_fd, payload[offset:])
+                os.fsync(temporary_fd)
+            finally:
+                os.close(temporary_fd)
+            try:
+                os.link(
+                    temporary,
+                    filename,
+                    src_dir_fd=parent_fd,
+                    dst_dir_fd=parent_fd,
+                    follow_symlinks=False,
+                )
+            except FileExistsError:
+                pass
+            finally:
+                os.unlink(temporary, dir_fd=parent_fd)
+            try:
+                final_fd = os.open(filename, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=parent_fd)
+            except OSError as exc:
+                raise ValueError("command-file occupant is not a private regular file") from exc
+        except OSError as exc:
+            raise ValueError("command-file occupant is not a private regular file") from exc
+        try:
+            _verify_command_file_fd(final_fd, payload)
+            _command_file_test_hook("final_verified", filename, final_fd)
+        finally:
+            os.close(final_fd)
+        os.fsync(parent_fd)
+        return CommandFileBinding(
+            path=target,
+            durable_root=root,
+            components=relative_components,
+            filename=filename,
+            digest=digest,
+        )
+    finally:
+        os.close(parent_fd)
+
+
+def _verify_private_directory_fd(fd: int) -> None:
+    info = os.fstat(fd)
+    if (
+        not stat.S_ISDIR(info.st_mode)
+        or info.st_uid != os.geteuid()
+        or stat.S_IMODE(info.st_mode) & 0o077
+    ):
+        raise ValueError("command-file ancestor is not an owner-private directory")
+
+
+def _verify_command_file_fd(fd: int, payload: bytes) -> None:
+    info = os.fstat(fd)
+    if not stat.S_ISREG(info.st_mode) or stat.S_IMODE(info.st_mode) != 0o600:
+        raise ValueError("command-file occupant is not a private regular file")
+    if info.st_uid != os.geteuid():
+        raise ValueError("command-file owner differs")
+    chunks: list[bytes] = []
+    while True:
+        chunk = os.read(fd, 1024 * 1024)
+        if not chunk:
+            break
+        chunks.append(chunk)
+    if b"".join(chunks) != payload:
+        raise ValueError("command-file occupant bytes differ")
+
+
+def _command_file_test_hook(stage: str, component: str, fd: int) -> None:
+    if _COMMAND_FILE_TEST_HOOK is not None:
+        _COMMAND_FILE_TEST_HOOK(stage, component, fd)
 
 
 def has_session_argv(name: str) -> list[str]:
@@ -420,14 +499,17 @@ def _shell_quote(value: str) -> str:
 
 
 __all__ = [
+    "CommandFileBinding",
     "SessionStatus",
     "TmuxError",
     "TmuxResult",
     "attach_argv",
     "capture_pane",
     "capture_pane_argv",
+    "command_file_session_argv",
     "has_session_argv",
     "inspect_session",
+    "materialize_command_file",
     "new_session_argv",
     "record_process_session_resource",
     "run_tmux",

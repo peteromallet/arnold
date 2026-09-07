@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import os
 import subprocess
+import time
 from pathlib import Path
 from shutil import which
 
@@ -12,6 +13,7 @@ from agentbox.config import AgentBoxConfig
 from agentbox.operations import create_agentbox_operation, open_operation_store
 from agentbox.run_dirs import ensure_run_dir
 from agentbox.tmux import (
+    TMUX_COMMAND_INLINE_LIMIT,
     command_file_session_argv,
     materialize_command_file,
     SessionStatus,
@@ -163,37 +165,37 @@ def test_materialize_command_file_binds_large_payload_and_reuses_equal_bytes(
     tmp_path: Path,
 ) -> None:
     payload = "printf exact-identity; " + ("# payload\n" * 5000)
-    path = materialize_command_file(
+    binding = materialize_command_file(
         payload,
         durable_root=tmp_path,
         operation_id="op-1",
         request_id="req-1",
         envelope_digest="sha256:env-1",
     )
-    assert path.read_text() == payload
-    assert path.stat().st_mode & 0o777 == 0o600
+    assert binding.path.read_text() == payload
+    assert binding.path.stat().st_mode & 0o777 == 0o600
     assert materialize_command_file(
         payload,
         durable_root=tmp_path,
         operation_id="op-1",
         request_id="req-1",
         envelope_digest="sha256:env-1",
-    ) == path
-    assert command_file_session_argv("agentbox-op", path)[-1].startswith("exec /bin/sh ")
+    ) == binding
+    assert command_file_session_argv("agentbox-op", binding)[-1].startswith("exec ")
 
 
 def test_materialize_command_file_rejects_tampering_and_symlink_occupancy(
     tmp_path: Path,
 ) -> None:
     payload = "echo safe"
-    path = materialize_command_file(
+    binding = materialize_command_file(
         payload,
         durable_root=tmp_path,
         operation_id="op-2",
         request_id="req-2",
         envelope_digest="sha256:env-2",
     )
-    path.write_text("echo tampered")
+    binding.path.write_text("echo tampered")
     with pytest.raises(ValueError, match="bytes differ"):
         materialize_command_file(
             payload,
@@ -206,7 +208,9 @@ def test_materialize_command_file_rejects_tampering_and_symlink_occupancy(
     other = tmp_path / "other"
     other.write_text(payload)
     target = tmp_path / "command-files" / "op-3" / "req-3" / "sha256:env-3"
-    target.mkdir(parents=True)
+    target.mkdir(parents=True, mode=0o700)
+    for directory in (target.parent.parent, target.parent, target):
+        directory.chmod(0o700)
     digest = hashlib.sha256(payload.encode()).hexdigest()
     (target / f"command-{digest}.sh").symlink_to(other)
     with pytest.raises(ValueError, match="private regular file"):
@@ -229,6 +233,125 @@ def test_materialize_command_file_rejects_symlinked_ancestor(tmp_path: Path) -> 
         materialize_command_file(
             "echo safe",
             durable_root=root,
+            operation_id="op",
+            request_id="req",
+            envelope_digest="sha256:env",
+        )
+
+
+def _run_bound_command(binding, *, cwd: Path) -> subprocess.CompletedProcess[str]:
+    shell_command = command_file_session_argv("agentbox-test", binding)[-1]
+    return subprocess.run(
+        ["/bin/sh", "-c", shell_command],
+        cwd=cwd,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+
+def test_command_file_verified_fd_executes_exact_payload(tmp_path: Path) -> None:
+    root = tmp_path / "root"
+    root.mkdir(mode=0o700)
+    binding = materialize_command_file(
+        "printf verified-success",
+        durable_root=root,
+        operation_id="op",
+        request_id="req",
+        envelope_digest="sha256:env",
+    )
+
+    result = _run_bound_command(binding, cwd=tmp_path)
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == "verified-success"
+
+
+def test_command_file_ancestor_swap_cannot_escape_or_execute(
+    tmp_path: Path, monkeypatch
+) -> None:
+    root = tmp_path / "root"
+    root.mkdir(mode=0o700)
+    outside = tmp_path / "outside"
+    outside.mkdir(mode=0o700)
+    swapped = tmp_path / "held-command-files"
+
+    def swap(stage: str, component: str, _fd: int) -> None:
+        if stage == "directory_opened" and component == "command-files":
+            (root / component).rename(swapped)
+            (root / component).symlink_to(outside, target_is_directory=True)
+
+    monkeypatch.setattr("agentbox.tmux._COMMAND_FILE_TEST_HOOK", swap)
+    binding = materialize_command_file(
+        "printf owned",
+        durable_root=root,
+        operation_id="op",
+        request_id="req",
+        envelope_digest="sha256:env",
+    )
+
+    assert not list(outside.rglob("command-*.sh"))
+    result = _run_bound_command(binding, cwd=tmp_path)
+    assert result.returncode != 0
+    assert result.stdout == ""
+
+
+def test_command_file_final_swap_cannot_redirect_execution(
+    tmp_path: Path, monkeypatch
+) -> None:
+    root = tmp_path / "root"
+    root.mkdir(mode=0o700)
+    attacker = tmp_path / "attacker.sh"
+    attacker.write_text("printf attacker", encoding="utf-8")
+    attacker.chmod(0o600)
+
+    final_directory = root / "command-files" / "op" / "req" / "sha256:env"
+
+    def swap(stage: str, component: str, _fd: int) -> None:
+        if stage == "final_verified":
+            final_path = final_directory / component
+            final_path.rename(final_path.with_suffix(".held"))
+            final_path.symlink_to(attacker)
+
+    monkeypatch.setattr("agentbox.tmux._COMMAND_FILE_TEST_HOOK", swap)
+    binding = materialize_command_file(
+        "printf admitted",
+        durable_root=root,
+        operation_id="op",
+        request_id="req",
+        envelope_digest="sha256:env",
+    )
+
+    result = _run_bound_command(binding, cwd=tmp_path)
+    assert result.returncode != 0
+    assert result.stdout == ""
+
+
+def test_materialize_command_file_rejects_non_private_owned_directory(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "root"
+    root.mkdir(mode=0o700)
+    (root / "command-files").mkdir(mode=0o755)
+    with pytest.raises(ValueError, match="owner-private"):
+        materialize_command_file(
+            "echo safe",
+            durable_root=root,
+            operation_id="op",
+            request_id="req",
+            envelope_digest="sha256:env",
+        )
+
+
+def test_materialize_command_file_rejects_foreign_directory_owner(
+    tmp_path: Path, monkeypatch
+) -> None:
+    real_uid = os.geteuid()
+    monkeypatch.setattr("agentbox.tmux.os.geteuid", lambda: real_uid + 1)
+    with pytest.raises(ValueError, match="owner-private"):
+        materialize_command_file(
+            "echo safe",
+            durable_root=tmp_path,
             operation_id="op",
             request_id="req",
             envelope_digest="sha256:env",
@@ -280,18 +403,34 @@ def test_record_process_session_resource_is_idempotent(tmp_path: Path) -> None:
     reason="set AGENTBOX_LIVE_TMUX=1 to run live tmux smoke",
 )
 @pytest.mark.skipif(which("tmux") is None, reason="tmux is not installed")
-def test_live_tmux_smoke_is_opt_in(tmp_path: Path) -> None:
+def test_live_tmux_long_command_file_smoke_is_opt_in(tmp_path: Path) -> None:
     name = session_name(f"smoke-{tmp_path.name}")
     command = (
-        "printf agentbox-live-smoke; "
-        "while :; do sleep 1; done"
+        "printf agentbox-live-smoke;\n"
+        + ("# long-payload\n" * 4000)
+        + "while :; do sleep 1; done"
+    )
+    binding = materialize_command_file(
+        command,
+        durable_root=tmp_path,
+        operation_id="live-op",
+        request_id="live-req",
+        envelope_digest="sha256:live-env",
     )
 
     try:
-        start_session(name.removeprefix("agentbox-"), command, cwd=tmp_path)
+        argv = command_file_session_argv(name, binding, cwd=tmp_path)
+        assert len(argv[-1].encode("utf-8")) < TMUX_COMMAND_INLINE_LIMIT
+        run_tmux(argv)
         status = inspect_session(name)
         assert status == SessionStatus(name, "running", True)
-        assert "agentbox-live-smoke" in run_tmux(capture_pane_argv(name)).stdout
+        pane = ""
+        for _ in range(20):
+            pane = run_tmux(capture_pane_argv(name)).stdout
+            if "agentbox-live-smoke" in pane:
+                break
+            time.sleep(0.05)
+        assert "agentbox-live-smoke" in pane
     finally:
         subprocess.run(
             ["tmux", "kill-session", "-t", name],
