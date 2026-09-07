@@ -162,8 +162,20 @@ def _install_production_runtime(monkeypatch: pytest.MonkeyPatch, tmp_path: Path)
         lambda *_args, **_kwargs: {"status": "ready", "runtime_vector_sha256": "test"},
     )
     monkeypatch.setattr(
+        runtime_attestation,
+        "validated_configured_worker_runtime_expectation",
+        lambda: (
+            Path(str(provenance["import_root"])),
+            str(provenance["source_revision"]),
+        ),
+    )
+    monkeypatch.setattr(
         "arnold_pipelines.megaplan.cloud.runtime_provenance.runtime_provenance",
-        lambda: provenance,
+        lambda **kwargs: {
+            **provenance,
+            "expected_root": str(kwargs.get("expected_root") or ""),
+            "expected_revision": str(kwargs.get("expected_revision") or ""),
+        },
     )
     monkeypatch.setattr(
         memory_headroom,

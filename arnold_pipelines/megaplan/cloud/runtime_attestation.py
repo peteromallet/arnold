@@ -2956,6 +2956,37 @@ def configured_seed_path() -> Path | None:
     return Path(value).expanduser().resolve(strict=False) if value else None
 
 
+def validated_configured_worker_runtime_expectation() -> tuple[Path, str]:
+    """Return the live-validated root/revision that a worker must observe.
+
+    The launch seed remains the authority for the expected coordinates, but
+    callers must independently observe the runtime against those coordinates;
+    this helper never returns or projects the seed's recorded provenance.
+    """
+
+    seed_path = configured_seed_path()
+    if seed_path is None:
+        raise CliError(
+            RUNTIME_ATTESTATION_ERROR,
+            "canonical runtime launch seed is required but missing",
+        )
+    seed = _json_file(seed_path, label="runtime launch seed")
+    validation = validate_runtime_launch_seed(seed, component="worker")
+    if not isinstance(validation, Mapping) or validation.get("status") != "ready":
+        raise CliError(
+            RUNTIME_ATTESTATION_ERROR,
+            "runtime seed validation did not produce ready worker evidence",
+        )
+    expected_root = str(seed.get("expected_root") or "")
+    expected_revision = str(seed.get("expected_revision") or "")
+    if not expected_root or not expected_revision:
+        raise CliError(
+            RUNTIME_ATTESTATION_ERROR,
+            "validated runtime seed is missing its expected root or revision",
+        )
+    return Path(expected_root).expanduser().resolve(strict=False), expected_revision
+
+
 def readonly_seed_runtime_identity(
     spec_path: Path,
 ) -> dict[str, Any] | None:

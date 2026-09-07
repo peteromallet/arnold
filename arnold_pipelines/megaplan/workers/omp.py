@@ -1255,6 +1255,7 @@ def _run_omp_with_admission(
     from arnold_pipelines.megaplan.cloud.runtime_attestation import (
         configured_seed_path,
         require_production_worker_dispatch_runtime,
+        validated_configured_worker_runtime_expectation,
     )
     from arnold_pipelines.megaplan.cloud.runtime_provenance import runtime_provenance
     from arnold_pipelines.megaplan.cloud.worker_dispatch import (
@@ -1270,7 +1271,13 @@ def _run_omp_with_admission(
     raw_spec = model or ""
     provider, model_id = parse_omp_spec(raw_spec)
     selected_spec = format_omp_spec(provider, model_id)
-    provenance = runtime_provenance()
+    expected_root, expected_revision = (
+        validated_configured_worker_runtime_expectation()
+    )
+    provenance = runtime_provenance(
+        expected_root=expected_root,
+        expected_revision=expected_revision,
+    )
     seed_path = configured_seed_path()
     manifest_path = os.environ.get("ARNOLD_RUNTIME_MANIFEST", "")
     seed_identity = hashlib.sha256(seed_path.read_bytes()).hexdigest() if seed_path and seed_path.is_file() else ""

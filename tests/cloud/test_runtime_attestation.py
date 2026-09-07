@@ -910,15 +910,28 @@ def _ensure_seed_env(
     root = paths["root"]
     state = {"revision": revision}
 
-    def _provenance(**_kwargs: object) -> dict[str, object]:
+    def _provenance(
+        *,
+        expected_root: Path | None = None,
+        expected_revision: str = "",
+    ) -> dict[str, object]:
+        observed_root = str(root)
+        observed_revision = str(state["revision"])
+        errors = []
+        if expected_root is not None and expected_root.resolve() != root.resolve():
+            errors.append("import_root_mismatch")
+        if expected_revision and expected_revision != observed_revision:
+            errors.append("source_revision_mismatch")
         return {
-            "ok": True,
+            "ok": not errors,
             "ready": True,
-            "errors": [],
-            "import_root": str(root),
+            "errors": errors,
+            "expected_root": str(expected_root.resolve()) if expected_root else "",
+            "expected_revision": expected_revision,
+            "import_root": observed_root,
             "editable_root": str(root),
-            "source_revision": state["revision"],
-            "runtime_revision": state["revision"],
+            "source_revision": observed_revision,
+            "runtime_revision": observed_revision,
             "direct_url": {},
             "pth": [],
             "imports": {
@@ -1118,9 +1131,11 @@ def test_ensure_runtime_launch_seed_rebuilds_on_head_change(
     assert len(marker["runtime_binding"].get("rebind_events") or []) == 1
 
 
-def test_initial_seed_adopts_empty_chain_runtime_identity_before_worker_validation(
+def _exercise_initial_seed_worker_runtime_observation(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    *,
+    runtime_drift: str | None = None,
 ) -> None:
     """R9: a first managed seed cannot leave the chain binding empty.
 
@@ -1213,10 +1228,40 @@ def test_initial_seed_adopts_empty_chain_runtime_identity_before_worker_validati
     (cgroup / "memory.swap.max").write_text("0\n", encoding="utf-8")
     (cgroup / "memory.events").write_text("oom_kill 0\n", encoding="utf-8")
     monkeypatch.setattr(memory_headroom, "_CGROUP_BASE", cgroup)
+    worker_observations: list[dict[str, object]] = []
+
+    def _worker_runtime_provenance(
+        *,
+        expected_root: Path | None = None,
+        expected_revision: str = "",
+    ) -> dict[str, object]:
+        worker_observations.append(
+            {
+                "expected_root": expected_root,
+                "expected_revision": expected_revision,
+            }
+        )
+        provenance = env["provenance"]
+        assert callable(provenance)
+        observed = provenance(
+            expected_root=expected_root,
+            expected_revision=expected_revision,
+        )
+        if runtime_drift == "root":
+            observed["ok"] = False
+            observed["errors"] = ["import_root_mismatch"]
+            observed["import_root"] = f"{paths['root']}-drifted"
+        elif runtime_drift == "revision":
+            observed["ok"] = False
+            observed["errors"] = ["source_revision_mismatch"]
+            observed["source_revision"] = "c" * 40
+            observed["runtime_revision"] = "c" * 40
+        return observed
+
     monkeypatch.setattr(
         provenance_module,
         "runtime_provenance",
-        lambda: proof["runtime_vector"],
+        _worker_runtime_provenance,
     )
     provider_calls: list[dict[str, object]] = []
 
@@ -1248,26 +1293,47 @@ def test_initial_seed_adopts_empty_chain_runtime_identity_before_worker_validati
         )
 
     monkeypatch.setattr(worker_impl, "_run_step_with_worker_legacy", provider_stub)
-    worker_impl.run_step_with_worker(
-        "plan",
-        {
-            "name": "child-plan",
-            "iteration": 1,
-            "config": {"project_dir": str(plan_dir.parent.parent.parent)},
-            "meta": {"current_invocation_id": "r9-first-plan"},
-            "active_step": {"run_id": "r9-first-plan"},
-        },
-        plan_dir,
-        types.SimpleNamespace(),
-        root=plan_dir.parent.parent.parent,
-        resolved=("codex", "fresh", False, "gpt-5.5"),
-        wbc_dispatch=dispatch,
-    )
+    def _run_worker() -> None:
+        worker_impl.run_step_with_worker(
+            "plan",
+            {
+                "name": "child-plan",
+                "iteration": 1,
+                "config": {"project_dir": str(plan_dir.parent.parent.parent)},
+                "meta": {"current_invocation_id": "r9-first-plan"},
+                "active_step": {"run_id": "r9-first-plan"},
+            },
+            plan_dir,
+            types.SimpleNamespace(),
+            root=plan_dir.parent.parent.parent,
+            resolved=("codex", "fresh", False, "gpt-5.5"),
+            wbc_dispatch=dispatch,
+        )
+
+    if runtime_drift is not None:
+        with pytest.raises(CliError, match="does not match authoritative runtime proof"):
+            _run_worker()
+        assert provider_calls == []
+        assert worker_observations == [
+            {
+                "expected_root": paths["root"],
+                "expected_revision": "a" * 40,
+            }
+        ]
+        return
+
+    _run_worker()
     assert provider_calls == [
         {
             "import_root": str(paths["root"]),
             "source_revision": "a" * 40,
             "generation": 3,
+        }
+    ]
+    assert worker_observations == [
+        {
+            "expected_root": paths["root"],
+            "expected_revision": "a" * 40,
         }
     ]
     persisted = load_chain_state(
@@ -1281,6 +1347,26 @@ def test_initial_seed_adopts_empty_chain_runtime_identity_before_worker_validati
         "runtime_identity"
     ]
     assert seed["manifest_generation"] == 3
+
+
+def test_initial_seed_adopts_empty_chain_runtime_identity_before_worker_validation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _exercise_initial_seed_worker_runtime_observation(tmp_path, monkeypatch)
+
+
+@pytest.mark.parametrize("runtime_drift", ["root", "revision"])
+def test_initial_seed_worker_runtime_observation_drift_is_provider_zero(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    runtime_drift: str,
+) -> None:
+    _exercise_initial_seed_worker_runtime_observation(
+        tmp_path,
+        monkeypatch,
+        runtime_drift=runtime_drift,
+    )
 
 
 def test_initial_seed_refuses_nonempty_different_runtime_root(
