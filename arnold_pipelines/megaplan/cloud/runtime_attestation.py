@@ -2033,7 +2033,35 @@ def ensure_runtime_launch_seed(
                 reason="manifest_generation_adopt",
             )
     else:
-        bound_identity = live_identity
+        # A managed chain can reach its first seed build with an established
+        # execution binding whose runtime identity is still empty.  The seed
+        # must not become the only record of the live identity: worker-side
+        # validation rereads the chain binding and would then compare
+        # ``<empty>`` against this seed.  Adopt the already manifest-validated
+        # identity through the canonical chain-state writer before issuing the
+        # seed.  A nonempty recorded identity still uses the normal
+        # adopt-or-refuse rules, so a different runtime root fails closed.
+        recorded_identity = _chain_binding_runtime_identity(chain_spec_path)
+        if recorded_identity:
+            bound_identity = _adopt_or_refuse_launch_identity(
+                recorded_identity,
+                live_identity,
+                recorded_generation=_recorded_seed_generation(chain_spec_path),
+                live_generation=int(manifest.generation),
+            )
+        else:
+            bound_identity = live_identity
+        if (
+            str(recorded_identity.get("import_root") or "").rstrip("/")
+            != str(bound_identity.get("import_root") or "").rstrip("/")
+            or str(recorded_identity.get("source_revision") or "")
+            != str(bound_identity.get("source_revision") or "")
+        ):
+            _persist_adopted_chain_runtime_identity(
+                chain_spec_path=chain_spec_path,
+                bound_identity=bound_identity,
+                reason="manifest_initial_runtime_identity_adopt",
+            )
     marker = _json_file(marker_path, label="cloud session marker")
     _rebind_marker_if_stale(
         marker_path,

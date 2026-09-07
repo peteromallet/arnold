@@ -1118,6 +1118,207 @@ def test_ensure_runtime_launch_seed_rebuilds_on_head_change(
     assert len(marker["runtime_binding"].get("rebind_events") or []) == 1
 
 
+def test_initial_seed_adopts_empty_chain_runtime_identity_before_worker_validation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """R9: a first managed seed cannot leave the chain binding empty.
+
+    This follows the production boundary in order: manifest validation and
+    seed issuance, canonical chain-state persistence, then the worker's seed
+    validation immediately before its external provider call.
+    """
+    from arnold_pipelines.megaplan.chain.spec import (
+        ChainState,
+        load_chain_state,
+        save_chain_state,
+    )
+
+    real_chain_binding = attestation._chain_binding
+    env = _ensure_seed_env(tmp_path, monkeypatch)
+    paths = env["paths"]
+    assert isinstance(paths, dict)
+    monkeypatch.setattr(attestation, "_chain_binding", real_chain_binding)
+    save_chain_state(
+        paths["chain_spec"],
+        ChainState(
+            current_milestone_index=0,
+            current_plan_name="m10",
+            metadata={
+                "execution_binding": {
+                    "schema": "megaplan.chain.execution-binding.v1",
+                    "launched_identity": {"content_sha256": "launch-binding"},
+                    "runtime_binding": {"current_identity": {}},
+                }
+            },
+        ),
+        _record_projection=False,
+    )
+    seed_path = attestation.ensure_runtime_launch_seed(
+        manifest_path=env["manifest"],
+        chain_spec_path=paths["chain_spec"],
+        marker_path=paths["marker"],
+        chain_runtime_identity=None,
+        seed_dir=env["seed_dir"],
+        supervisor_receipt_path=paths["receipt"],
+        hot_env_path=paths["hot_env"],
+    )
+    seed = json.loads(seed_path.read_text(encoding="utf-8"))
+
+    monkeypatch.setenv("MEGAPLAN_RUNTIME_LAUNCH_SEED", str(seed_path))
+    monkeypatch.setenv("ARNOLD_RUNTIME_MANIFEST", str(env["manifest"]))
+    from arnold_pipelines.megaplan.cloud.worker_dispatch import (
+        _runtime_binding_proof,
+    )
+
+    proof = _runtime_binding_proof(
+        types.SimpleNamespace(
+            production_intent=True,
+            source_runtime_validator=None,
+        )
+    )
+    from arnold_pipelines.megaplan.workers import _impl as worker_impl
+    from arnold_pipelines.megaplan.cloud import runtime_provenance as provenance_module
+    from tests.arnold_pipelines.megaplan.test_fresh_child_launch import (
+        _admit_worker_child,
+        _worker_dispatch_for_phase,
+    )
+
+    plan_dir, pointer = _admit_worker_child(tmp_path / "worker-child")
+    dispatch = _worker_dispatch_for_phase(
+        plan_dir, pointer, "plan", "r9-first-plan"
+    )
+    fixture_home = tmp_path / "home"
+    codex_home = fixture_home / ".codex"
+    codex_home.mkdir(parents=True)
+    _write_json(
+        codex_home / "auth.json",
+        {
+            "auth_mode": "chatgpt",
+            "tokens": {
+                "access_token": "fixture",
+                "refresh_token": "fixture",
+                "id_token": "fixture",
+            },
+        },
+    )
+    monkeypatch.setenv("HOME", str(fixture_home))
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    from arnold_pipelines.megaplan.runtime import memory_headroom
+
+    cgroup = tmp_path / "cgroup"
+    cgroup.mkdir()
+    (cgroup / "memory.current").write_text("0\n", encoding="utf-8")
+    (cgroup / "memory.max").write_text(str(1024**3), encoding="utf-8")
+    (cgroup / "memory.swap.max").write_text("0\n", encoding="utf-8")
+    (cgroup / "memory.events").write_text("oom_kill 0\n", encoding="utf-8")
+    monkeypatch.setattr(memory_headroom, "_CGROUP_BASE", cgroup)
+    monkeypatch.setattr(
+        provenance_module,
+        "runtime_provenance",
+        lambda: proof["runtime_vector"],
+    )
+    provider_calls: list[dict[str, object]] = []
+
+    def provider_stub(*_args, **_kwargs):
+        provider_calls.append(
+            {
+                "import_root": proof["runtime_vector"]["import_root"],
+                "source_revision": proof["source_revision"],
+                "generation": seed["manifest_generation"],
+            }
+        )
+        return (
+            worker_impl.WorkerResult(
+                payload={"success": True},
+                raw_output="ok",
+                duration_ms=1,
+                cost_usd=0.0,
+                session_id="r9-provider-stub",
+                worker_identity={
+                    "host": "fixture",
+                    "pid": os.getpid(),
+                    "boot_id": "fixture-boot",
+                    "process_start_identity": "fixture-start",
+                },
+            ),
+            "codex",
+            "fresh",
+            False,
+        )
+
+    monkeypatch.setattr(worker_impl, "_run_step_with_worker_legacy", provider_stub)
+    worker_impl.run_step_with_worker(
+        "plan",
+        {
+            "name": "child-plan",
+            "iteration": 1,
+            "config": {"project_dir": str(plan_dir.parent.parent.parent)},
+            "meta": {"current_invocation_id": "r9-first-plan"},
+            "active_step": {"run_id": "r9-first-plan"},
+        },
+        plan_dir,
+        types.SimpleNamespace(),
+        root=plan_dir.parent.parent.parent,
+        resolved=("codex", "fresh", False, "gpt-5.5"),
+        wbc_dispatch=dispatch,
+    )
+    assert provider_calls == [
+        {
+            "import_root": str(paths["root"]),
+            "source_revision": "a" * 40,
+            "generation": 3,
+        }
+    ]
+    persisted = load_chain_state(
+        paths["chain_spec"], verify_execution_binding=False
+    ).metadata["execution_binding"]["runtime_binding"]
+    assert persisted["current_identity"] == env["identity"]
+    assert persisted["rebind_events"][-1]["reason"] == (
+        "manifest_initial_runtime_identity_adopt"
+    )
+    assert persisted["current_identity"] == seed["chain_runtime_binding"][
+        "runtime_identity"
+    ]
+    assert seed["manifest_generation"] == 3
+
+
+def test_initial_seed_refuses_nonempty_different_runtime_root(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    env = _ensure_seed_env(tmp_path, monkeypatch)
+    paths = env["paths"]
+    assert isinstance(paths, dict)
+    chain_binding = {
+        "spec_path": str(paths["chain_spec"]),
+        "current_milestone_index": 0,
+        "current_plan_name": "m10",
+        "runtime_identity": {
+            "import_root": "/foreign/runtime",
+            "source_revision": "f" * 40,
+        },
+    }
+    chain_binding["content_sha256"] = attestation._canonical_sha256(
+        chain_binding
+    )
+    monkeypatch.setattr(attestation, "_chain_binding", lambda _path: chain_binding)
+
+    with pytest.raises(
+        CliError,
+        match="chain execution binding does not match the live manifest-pinned runtime",
+    ):
+        attestation.ensure_runtime_launch_seed(
+            manifest_path=env["manifest"],
+            chain_spec_path=paths["chain_spec"],
+            marker_path=paths["marker"],
+            chain_runtime_identity=None,
+            seed_dir=env["seed_dir"],
+            supervisor_receipt_path=paths["receipt"],
+            hot_env_path=paths["hot_env"],
+        )
+
+
 def test_ensure_runtime_launch_seed_rebuilds_on_seed_document_drift(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

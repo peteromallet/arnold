@@ -7890,6 +7890,10 @@ def run_chain(
     # Bind before the first state save or milestone initialization. Existing
     # progressed state without a launch binding is refused by the loader.
     bind_execution_identity(spec_path, state)
+    # The launch-seed builder and every provider-boundary validator reread the
+    # canonical chain record.  Persist the in-memory bind before seed creation
+    # so those readers never observe a stale pre-bind snapshot.
+    chain_spec.save_chain_state(spec_path, state)
     # Runtime-launch seed (G14): build/refresh the content-addressed launch
     # seed for the per-epic runtime and export it so every child worker and
     # watchdog relaunch finds MEGAPLAN_RUNTIME_LAUNCH_SEED.  The manifest pin
@@ -7961,6 +7965,12 @@ def run_chain(
             chain_runtime_identity=_bound_identity,
         )
         os.environ["MEGAPLAN_RUNTIME_LAUNCH_SEED"] = str(_launch_seed_path)
+        # Seed creation may canonically adopt an initially empty or stale
+        # same-root runtime identity.  Continue from that persisted record so
+        # the normal chain-state save below cannot restore the stale snapshot.
+        state = chain_spec.load_chain_state(
+            spec_path, verify_execution_binding=False
+        )
     from arnold_pipelines.megaplan.chain.operator_pause import is_paused
 
     if is_paused(state):
