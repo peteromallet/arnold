@@ -4294,6 +4294,8 @@ def _chain_start_command(
     *,
     project_dir: str | None = None,
     engine_dir: str | None = None,
+    expected_runtime_root: str | None = None,
+    expected_runtime_revision: str | None = None,
     one_shot: bool = False,
     no_git_refresh: bool = False,
     log_relative: str = _CHAIN_LOG_RELATIVE,
@@ -4394,12 +4396,28 @@ def _chain_start_command(
             f'echo "[megaplan-launch] isolated_chain_runtime_binding_drift: manifest lacks runtime identity" >> {log_target}; '
             'exit 24; '
             'fi; '
+        )
+        if expected_runtime_root is not None or expected_runtime_revision is not None:
+            if not expected_runtime_root or not expected_runtime_revision:
+                raise ValueError(
+                    "runtime-bound chain start requires both literal root and revision"
+                )
+            prefix += (
+                f'_EXPECTED_RUNTIME_ROOT_LITERAL={shlex.quote(str(expected_runtime_root))}; '
+                f'_EXPECTED_RUNTIME_REVISION_LITERAL={shlex.quote(str(expected_runtime_revision))}; '
+                'if [ "$ENGINE_DIR" != "$_EXPECTED_RUNTIME_ROOT_LITERAL" ] || '
+                '[ "$_EXPECTED_REVISION" != "$_EXPECTED_RUNTIME_REVISION_LITERAL" ]; then '
+                f'echo "[megaplan-launch] isolated_chain_runtime_binding_drift: manifest runtime identity disagrees with accepted binding" >> {log_target}; '
+                'exit 24; '
+                'fi; '
+            )
+        prefix += (
             # T-0301: the generation interpreter gate runs before the
             # provenance check; BOTH the provenance probe and the launch run
             # under the generation interpreter (worktree-first PYTHONPATH,
             # frozen deps from the immutable generation).  No ambient-python
             # launch and no editable-install fallback.
-            + _generation_interpreter_gate(log_target)
+            _generation_interpreter_gate(log_target)
             + 'if ! env -u PYTHONHOME PYTHONSAFEPATH=1 '
             'PYTHONPATH="$ENGINE_DIR" '
             '"$GEN_INTERPRETER" -P -m arnold_pipelines.megaplan.cloud.runtime_provenance '
@@ -5215,7 +5233,7 @@ def _refresh_then_chain_start_command(
         refresh = _manifest_runtime_activate_command(runtime_binding)
         return (
             f"{{ {refresh}; }} >> {shlex.quote(log_relative)} 2>&1 && "
-            f"{_chain_start_command(remote_spec_path, project_dir=project_dir, engine_dir=engine_dir, one_shot=one_shot, no_git_refresh=no_git_refresh, log_relative=log_relative, repair_session=repair_session, repair_run_kind=repair_run_kind, repair_marker_dir=repair_marker_dir)}"
+            f"{_chain_start_command(remote_spec_path, project_dir=project_dir, engine_dir=engine_dir, expected_runtime_root=str(runtime_binding['runtime_src']), expected_runtime_revision=str(runtime_binding['runtime_revision']), one_shot=one_shot, no_git_refresh=no_git_refresh, log_relative=log_relative, repair_session=repair_session, repair_run_kind=repair_run_kind, repair_marker_dir=repair_marker_dir)}"
         )
     # No binding (pre-binding marker write / legacy path): the editable-install
     # machinery is deleted; the manifest pin is mandatory and fails closed —
@@ -6664,6 +6682,16 @@ def _run_authoritative_chain_wrapper(root: Path, args: argparse.Namespace, spec:
         launch_ctx.remote_spec_path,
         project_dir=launch_ctx.workspace,
         engine_dir=spec.megaplan.src_path,
+        expected_runtime_root=(
+            str(runtime_binding["runtime_src"])
+            if runtime_binding is not None
+            else None
+        ),
+        expected_runtime_revision=(
+            str(runtime_binding["runtime_revision"])
+            if runtime_binding is not None
+            else None
+        ),
         one_shot=bool(getattr(args, "one", False)),
         no_git_refresh=bool(getattr(args, "no_git_refresh", False)),
         log_relative=launch_ctx.log_relative,

@@ -1521,6 +1521,8 @@ def test_chain_launch_keeps_manifest_pin_across_poisoned_hot_env(
         str(tmp_path / "chain.yaml"),
         project_dir=str(tmp_path),
         engine_dir="/fallback/runtime",
+        expected_runtime_root=str(accepted),
+        expected_runtime_revision=revision,
         log_relative="chain.log",
     )
 
@@ -1605,6 +1607,8 @@ def test_chain_launch_fails_closed_before_chain_on_runtime_drift(
         str(tmp_path / "chain.yaml"),
         project_dir=str(tmp_path),
         engine_dir="/fallback/runtime",
+        expected_runtime_root=str(accepted),
+        expected_runtime_revision="a" * 40,
         log_relative="chain.log",
     )
 
@@ -1635,9 +1639,60 @@ def test_chain_launch_fails_closed_before_chain_on_runtime_drift(
     assert len(main) == 1, observations
     assert "runtime_provenance" in main[0]
     assert "chain start" not in main[0]
+
+
+@pytest.mark.parametrize("mismatch", ["root", "revision"])
+def test_bound_chain_launch_rejects_manifest_identity_mismatch_before_provenance(
+    tmp_path: Path,
+    mismatch: str,
+) -> None:
+    from arnold_pipelines.megaplan.cloud import cli as cloud_cli
+
+    accepted = tmp_path / "accepted-runtime"
+    accepted.mkdir()
+    revision = "a" * 40
+    shim = _runtime_probe_shim(tmp_path)
+    manifest = _write_runtime_manifest(
+        tmp_path / "accepted-manifest.json",
+        runtime_root=accepted,
+        revision=revision,
+        interpreter_path=str(shim),
+    )
+    capture = tmp_path / "capture.txt"
+    command = cloud_cli._chain_start_command(
+        str(tmp_path / "chain.yaml"),
+        project_dir=str(tmp_path),
+        engine_dir="/fallback/runtime",
+        expected_runtime_root=(
+            str(tmp_path / "wrong-runtime") if mismatch == "root" else str(accepted)
+        ),
+        expected_runtime_revision=("b" * 40 if mismatch == "revision" else revision),
+        log_relative="chain.log",
+    )
+    result = subprocess.run(
+        ["bash", "-c", command],
+        capture_output=True,
+        text=True,
+        check=False,
+        env={
+            **os.environ,
+            "RUNTIME_CAPTURE": str(capture),
+            "REAL_PYTHON": sys.executable,
+            "ARNOLD_RUNTIME_MANIFEST": str(manifest),
+        },
+    )
+
+    assert result.returncode == 24
+    observations = capture.read_text(encoding="utf-8").splitlines() if capture.exists() else []
+    assert not any("runtime_provenance" in line for line in observations)
+    assert not any("chain start" in line for line in observations)
     assert "isolated_chain_runtime_binding_drift" in (
         tmp_path / "chain.log"
     ).read_text(encoding="utf-8")
+    assert not (tmp_path / ".megaplan").exists()
+    assert not list(tmp_path.rglob("*marker*"))
+    assert not list(tmp_path.rglob("*seed*"))
+    assert not list(tmp_path.rglob("*state*"))
 
 
 def test_chain_launch_schema_invalid_manifest_fails_closed_before_launch(
@@ -2667,6 +2722,59 @@ def test_refresh_then_chain_start_command_uses_activate_when_bound() -> None:
     assert "megaplan-refresh" not in command
     assert "pip install -e" not in command
     assert 'export ARNOLD_RUNTIME_MANIFEST="$MANIFEST"' in command
+
+
+def test_bound_chain_start_embeds_and_checks_manifest_runtime_identity() -> None:
+    from arnold_pipelines.megaplan.cloud.relaunch_resolution import (
+        relaunch_matches_runtime,
+    )
+
+    binding = _runtime_binding()
+    command = _refresh_then_chain_start_command(
+        "/workspace/chain/.megaplan/initiatives/demo/chain.yaml",
+        spec=_cloud_spec(),
+        project_dir="/workspace/chain",
+        log_relative=".megaplan/cloud-chain.log",
+        runtime_binding=binding,
+    )
+
+    root = str(binding["runtime_src"])
+    revision = str(binding["runtime_revision"])
+    assert root in command
+    assert revision in command
+    assert '"$ENGINE_DIR" != "$_EXPECTED_RUNTIME_ROOT_LITERAL"' in command
+    assert '"$_EXPECTED_REVISION" != "$_EXPECTED_RUNTIME_REVISION_LITERAL"' in command
+    assert command.index("_EXPECTED_RUNTIME_ROOT_LITERAL") < command.index(
+        "runtime_provenance"
+    )
+    ctx = ChainLaunchContext(
+        identity="demo",
+        slug="demo",
+        digest="d" * 64,
+        workspace="/workspace/chain",
+        remote_spec_path="/workspace/chain/chain.yaml",
+        session_name="demo-chain",
+        log_relative=".megaplan/cloud-chain.log",
+        log_path="/workspace/chain/.megaplan/cloud-chain.log",
+        state_path="/workspace/chain/.megaplan/state.json",
+        marker_path="/workspace/chain/.megaplan/marker.json",
+    )
+    projected = _chain_command_with_runtime_binding(
+        command,
+        launch_ctx=ctx,
+        binding=binding,
+        operation_id="op",
+        request_id="req",
+    )
+    marker_match = re.search(
+        r"payload = json.loads\('((?:\\.|[^'])*)'\)", projected, re.S
+    )
+    assert marker_match is not None
+    payload = json.loads(ast.literal_eval("'" + marker_match.group(1) + "'"))
+    assert payload["relaunch_command"] == command
+    assert relaunch_matches_runtime(
+        payload["relaunch_command"], binding["runtime_identity"]
+    )
 
 
 def test_parse_chain_runtime_binding_accepts_binding_record() -> None:
