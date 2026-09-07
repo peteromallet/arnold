@@ -222,6 +222,33 @@ def build_worker_dispatch_spec(
         "fallback_trigger": fallback_trigger,
         "phase_attempt_id": phase_attempt_id,
     }
+    fresh_child_authority_check = None
+    if bool(phase.get("projected_from_fresh_child")):
+        binding = phase.get("authority_binding")
+        pointer = phase.get("fresh_child_pointer")
+        if not isinstance(binding, Mapping) or not isinstance(pointer, Mapping):
+            raise ValueError("fresh-child worker dispatch projection is malformed")
+        for key in (
+            "run_id", "run_revision", "subject_attempt_id", "grant_id",
+            "fence_token", "wbc_attempt_id", "glek", "custody_lease_id",
+            "custody_epoch", "custody_ref",
+        ):
+            metadata[f"fresh_child_{key}"] = binding[key]
+        metadata["fresh_child_target_descriptor_digest"] = binding[
+            "target_descriptor"
+        ]["descriptor_digest"]
+        expected_binding = dict(binding)
+        child_pointer = dict(pointer)
+
+        def fresh_child_authority_check(stage: str) -> Mapping[str, Any]:
+            from arnold_pipelines.megaplan.chain.fresh_child_launch import (
+                read_fresh_child_authority,
+            )
+
+            observed = read_fresh_child_authority(
+                child_pointer, plan_dir=plan_dir, expected=expected_binding
+            )
+            return {**observed, "dispatch_stage": stage}
     if normalized_dispatch_key is not None:
         metadata["dispatch_key"] = normalized_dispatch_key
     owner_host, owner_pid, owner_boot_id = _runtime_owner()
@@ -229,7 +256,11 @@ def build_worker_dispatch_spec(
     # repair occurrence, its authoritative identity fence/epoch stamp every
     # dispatch lease + outbox record (and the action-boundary contexts)
     # instead of a fabricated 0/1.
-    fence_token, dispatch_custody_epoch = _repair_identity_carry(state)
+    if bool(phase.get("projected_from_fresh_child")):
+        fence_token = int(binding["fence_token"])
+        dispatch_custody_epoch = int(binding["custody_epoch"])
+    else:
+        fence_token, dispatch_custody_epoch = _repair_identity_carry(state)
     start_action_context = _shadow_action_context(
         phase_step=phase_name,
         worker_step=step,
@@ -370,6 +401,7 @@ def build_worker_dispatch_spec(
         success_action_context=success_action_context,
         failure_action_context=failure_action_context,
         artifacts=artifacts,
+        authority_check=fresh_child_authority_check,
         writer_id=writer_spec.writer_id,
         surface_name=writer_spec.surface_name,
         expected_source_version=expected_source_version,

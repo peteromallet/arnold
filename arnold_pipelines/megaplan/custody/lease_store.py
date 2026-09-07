@@ -53,6 +53,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import stat
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
@@ -563,6 +564,56 @@ class CustodyLeaseStore:
 
     base_dir: Path
     flock: bool = True
+    directory_fd: int | None = field(default=None, repr=False)
+
+    def close(self) -> None:
+        """Release an injected descriptor that pins this store directory."""
+        if self.directory_fd is not None:
+            os.close(self.directory_fd)
+            self.directory_fd = None
+
+    def __del__(self) -> None:  # pragma: no cover - interpreter cleanup
+        try:
+            self.close()
+        except OSError:
+            pass
+
+    def _read_member_text(self, name: str) -> str | None:
+        """Read one direct store member through the pinned directory."""
+        if self.directory_fd is None:
+            path = self.base_dir / name
+            if not path.exists():
+                return None
+            try:
+                return path.read_text(encoding="utf-8")
+            except (FileNotFoundError, OSError):
+                return None
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+        try:
+            fd = os.open(name, flags, dir_fd=self.directory_fd)
+        except FileNotFoundError:
+            return None
+        except OSError as exc:
+            raise LeaseStoreError("custody member could not be opened safely") from exc
+        try:
+            before = os.fstat(fd)
+            if not stat.S_ISREG(before.st_mode):
+                raise LeaseStoreError("custody member is not a regular file")
+            chunks: list[bytes] = []
+            while chunk := os.read(fd, 1024 * 1024):
+                chunks.append(chunk)
+            after = os.fstat(fd)
+            if (before.st_dev, before.st_ino, before.st_size) != (
+                after.st_dev,
+                after.st_ino,
+                after.st_size,
+            ):
+                raise LeaseStoreError("custody member changed during read")
+            return b"".join(chunks).decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise LeaseStoreError("custody member is not UTF-8") from exc
+        finally:
+            os.close(fd)
 
     # -- record event (Step 11A: token-guarded) ------------------------------
 
@@ -1121,12 +1172,8 @@ class CustodyLeaseStore:
 
         Returns an empty tuple if no history exists.
         """
-        path = _history_path(self.base_dir, lease_id)
-        if not path.exists():
-            return ()
-        try:
-            text = path.read_text(encoding="utf-8")
-        except (FileNotFoundError, OSError):
+        text = self._read_member_text(_history_path(self.base_dir, lease_id).name)
+        if text is None:
             return ()
         if not text.strip():
             return ()
@@ -1255,12 +1302,12 @@ class CustodyLeaseStore:
 
     def _read_cached_state(self, lease_id: str) -> CustodyLease | None:
         """Read the cached state if it exists."""
-        path = _state_path(self.base_dir, lease_id)
-        if not path.exists():
+        text = self._read_member_text(_state_path(self.base_dir, lease_id).name)
+        if text is None:
             return None
         try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-        except (FileNotFoundError, OSError, json.JSONDecodeError):
+            data = json.loads(text)
+        except json.JSONDecodeError:
             return None
         return normalize_custody_lease(data)
 
@@ -1350,13 +1397,25 @@ def open_lease_store(
     base_dir: Path | None = None,
     *,
     flock: bool = True,
+    directory_fd: int | None = None,
 ) -> CustodyLeaseStore:
     """Open a custody lease store rooted at *base_dir*.
 
     If *base_dir* is ``None``, defaults to ``~/.megaplan/custody/leases``.
     """
-    base = (base_dir or default_lease_store_dir()).resolve()
-    return CustodyLeaseStore(base_dir=base, flock=flock)
+    base = base_dir or default_lease_store_dir()
+    if directory_fd is None:
+        base = base.resolve()
+    else:
+        opened = os.fstat(directory_fd)
+        if not stat.S_ISDIR(opened.st_mode):
+            raise LeaseStoreError("custody directory descriptor is not a directory")
+        base = base.absolute()
+    return CustodyLeaseStore(
+        base_dir=base,
+        flock=flock,
+        directory_fd=directory_fd,
+    )
 
 
 # ── Convenience: record a batch of events ─────────────────────────────────

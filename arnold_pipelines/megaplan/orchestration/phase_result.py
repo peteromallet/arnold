@@ -1208,7 +1208,19 @@ def phase_result_guard(plan_dir: Path):
                     try:
                         from arnold_pipelines.megaplan.custody.phase_wbc import fail_phase_wbc, phase_wbc_required
 
-                        if ek != ExitKind.scheduling_condition.value and phase_wbc_required(phase):
+                        phase_wbc = (
+                            raw.get("active_step", {}).get("_phase_wbc")
+                            if isinstance(raw.get("active_step"), dict)
+                            else None
+                        )
+                        projected_child = isinstance(phase_wbc, dict) and bool(
+                            phase_wbc.get("projected_from_fresh_child")
+                        )
+                        if (
+                            ek != ExitKind.scheduling_condition.value
+                            and phase_wbc_required(phase)
+                            and not projected_child
+                        ):
                             fail_phase_wbc(
                                 state=raw,
                                 plan_dir=plan_dir,

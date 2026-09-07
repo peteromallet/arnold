@@ -2299,7 +2299,10 @@ def _finalize_review_outcome(
             "warnings": list(policy_decision.reasons),
             "_phase_outcome": "blocked_by_quality",
         }
-        if phase_wbc_state(state, step="review") is not None:
+        review_phase = phase_wbc_state(state, step="review")
+        if review_phase is not None and not bool(
+            review_phase.get("projected_from_fresh_child")
+        ):
             fail_phase_wbc(
                 state=state,
                 plan_dir=plan_dir,
@@ -2466,7 +2469,10 @@ def _finalize_review_outcome(
             exit_kind="success",
         )
     review_artifact_hash = sha256_file(plan_dir / "review.json")
-    strict_review_receipts = phase_wbc_state(state, step="review") is not None
+    review_phase = phase_wbc_state(state, step="review")
+    strict_review_receipts = review_phase is not None and not bool(
+        review_phase.get("projected_from_fresh_child")
+    )
     emitted_boundary_ids = _emit_review_route_boundary_receipts(
         plan_dir=plan_dir,
         state=state,

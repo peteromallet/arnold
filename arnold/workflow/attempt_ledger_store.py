@@ -1340,13 +1340,23 @@ class SqliteAttemptLedgerStore(AttemptLedgerStore):
       (``LEDGER_SCHEMA_VERSION``) so readers can detect drift.
     """
 
-    def __init__(self, db_path: str | Path) -> None:
+    def __init__(
+        self,
+        db_path: str | Path,
+        *,
+        connection: sqlite3.Connection | None = None,
+    ) -> None:
         db_path = Path(db_path) if isinstance(db_path, str) else db_path
-        db_path.parent.mkdir(parents=True, exist_ok=True)
+        if connection is None:
+            db_path.parent.mkdir(parents=True, exist_ok=True)
 
         self._db_path = db_path
-        self._conn: Optional[sqlite3.Connection] = None
+        self._conn: Optional[sqlite3.Connection] = connection
         self._contract_version: str = LEDGER_SCHEMA_VERSION
+        if connection is not None:
+            connection.execute("PRAGMA journal_mode=WAL")
+            connection.execute("PRAGMA foreign_keys=OFF")
+            self._init_schema()
 
     # ── connection management ──────────────────────────────────────────
 

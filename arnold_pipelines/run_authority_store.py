@@ -289,11 +289,19 @@ class RunAuthorityJournal:
         database: str | Path,
         *,
         fault_hook: Callable[[str], None] | None = None,
+        connection: sqlite3.Connection | None = None,
     ) -> None:
         self.database = Path(database).expanduser().absolute()
         self._fault_hook = fault_hook
-        self._assert_safe_database_path()
-        self.database.parent.mkdir(parents=True, exist_ok=True)
+        self._owned_connection = connection
+        if connection is None:
+            self._assert_safe_database_path()
+            self.database.parent.mkdir(parents=True, exist_ok=True)
+        else:
+            connection.row_factory = sqlite3.Row
+            connection.execute("PRAGMA synchronous=FULL")
+            connection.execute("PRAGMA foreign_keys=ON")
+            connection.execute("PRAGMA busy_timeout=30000")
         self._initialize_schema()
 
     def _assert_safe_database_path(self) -> None:
@@ -305,6 +313,8 @@ class RunAuthorityJournal:
             self._fault_hook(stage)
 
     def _connect(self) -> sqlite3.Connection:
+        if self._owned_connection is not None:
+            return self._owned_connection
         self._assert_safe_database_path()
         try:
             connection = sqlite3.connect(
@@ -318,6 +328,16 @@ class RunAuthorityJournal:
             return connection
         except sqlite3.Error as exc:
             raise JournalStorageError("authority journal could not be opened") from exc
+
+    def _release_connection(self, connection: sqlite3.Connection) -> None:
+        if connection is not self._owned_connection:
+            connection.close()
+
+    def close(self) -> None:
+        """Close an injected persistent connection; default journals are stateless."""
+        if self._owned_connection is not None:
+            self._owned_connection.close()
+            self._owned_connection = None
 
     def _initialize_schema(self) -> None:
         connection = self._connect()
@@ -347,7 +367,7 @@ class RunAuthorityJournal:
         except sqlite3.Error as exc:
             raise JournalStorageError("authority journal schema could not be initialized") from exc
         finally:
-            connection.close()
+            self._release_connection(connection)
 
     @staticmethod
     def _rows_for_view(
@@ -465,7 +485,7 @@ class RunAuthorityJournal:
         except sqlite3.Error as exc:
             raise JournalStorageError("authority journal view could not be read") from exc
         finally:
-            connection.close()
+            self._release_connection(connection)
 
     def compare_and_append(
         self,
@@ -632,7 +652,7 @@ class RunAuthorityJournal:
             raise JournalStorageError("authority journal append failed") from exc
         finally:
             if connection is not None:
-                connection.close()
+                self._release_connection(connection)
 
 
 __all__ = [

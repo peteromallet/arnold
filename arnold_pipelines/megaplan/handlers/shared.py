@@ -437,11 +437,25 @@ def _run_worker(
             model=model,
             **_active_step_fallback_fields(step, args, agent=agent, model=model, effort=effort),
         )
-    _canonical_production = bool(
-        os.environ.get("ARNOLD_RUNTIME_MANIFEST")
-        or os.environ.get("MEGAPLAN_RUNTIME_LAUNCH_SEED")
-        or (getattr(args, "production_intent", False))
-    )
+    # Fresh-child admission owns the initial WBC reservation.  In canonical
+    # production, project that child-scoped identity into the exact phase
+    # state consumed by the common worker-dispatch adapter; never activate a
+    # second local phase owner here.
+    if _canonical_production and not reuse_active_phase:
+        child_admission = (state.get("meta") or {}).get("fresh_child_admission")
+        if isinstance(child_admission, dict):
+            from arnold_pipelines.megaplan.chain.fresh_child_launch import phase_wbc_handoff
+            active = state.get("active_step")
+            if not isinstance(active, dict):
+                raise RuntimeError("fresh-child WBC handoff requires an active step")
+            active["_phase_wbc"] = phase_wbc_handoff(
+                child_admission,
+                plan_dir=plan_dir,
+                step=step,
+                invocation_id=str(
+                    (state.get("meta") or {}).get("current_invocation_id") or ""
+                ),
+            )
     _emit_phase_notice(step)
     try:
         if phase_wbc_required(step) and not reuse_active_phase and not _canonical_production:
@@ -1156,7 +1170,12 @@ def _finish_step(
         dispatch_outcome=dispatch_outcome,
     )
     try:
-        strict_boundary_receipt = phase_wbc_required(step) and phase_wbc_state(state, step=step) is not None
+        phase_projection = phase_wbc_state(state, step=step)
+        strict_boundary_receipt = (
+            phase_wbc_required(step)
+            and phase_projection is not None
+            and not bool(phase_projection.get("projected_from_fresh_child"))
+        )
         receipt = _emit_boundary_receipt(
             plan_dir=plan_dir,
             state=state,
@@ -1192,23 +1211,24 @@ def _finish_step(
             for boundary_id in extra_boundary_ids
         )
     except Exception as exc:
-        fail_phase_wbc(
-            state=state,
-            plan_dir=plan_dir,
-            step=step,
-            agent=agent,
-            payload={
-                "phase": step,
-                "status": "failed",
-                "failure_stage": "result_evidence",
-                "error_class": type(exc).__name__,
-                "message": str(exc),
-                "phase_result_ref": "phase_result.json",
-            },
-        )
+        if not bool((phase_wbc_state(state, step=step) or {}).get("projected_from_fresh_child")):
+            fail_phase_wbc(
+                state=state,
+                plan_dir=plan_dir,
+                step=step,
+                agent=agent,
+                payload={
+                    "phase": step,
+                    "status": "failed",
+                    "failure_stage": "result_evidence",
+                    "error_class": type(exc).__name__,
+                    "message": str(exc),
+                    "phase_result_ref": "phase_result.json",
+                },
+            )
         raise
     else:
-        if phase_wbc_required(step):
+        if phase_wbc_required(step) and not bool((phase_wbc_state(state, step=step) or {}).get("projected_from_fresh_child")):
             receipt_ids = [
                 emitted.boundary_id
                 for emitted in (receipt, *extra_receipts)

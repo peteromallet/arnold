@@ -140,6 +140,7 @@ class CommonWorkerDispatchSpec:
     artifacts: ImmutableAttemptArtifacts | None = None
     post_dispatch_certificate: Callable[[Any], None] | None = None
     indeterminate_event_factory: Callable[[BaseException], LedgerEvent] | None = None
+    authority_check: Callable[[str], Mapping[str, Any]] | None = None
     writer_id: str = COMMON_WORKER_DISPATCH_WRITER_ID
     surface_name: str = COMMON_WORKER_DISPATCH_SURFACE
     expected_source_version: str = "source.v1"
@@ -258,9 +259,39 @@ class CommonWorkerDispatchSpec:
             production=bool(getattr(context, "production_intent", True)),
         )
         start = replace(start, spawn_registration_callback=control)
+        if self.authority_check is not None:
+            try:
+                self.authority_check("provider_dispatch")
+            except BaseException as exc:
+                terminal = self.facade.fail_attempt(
+                    attempt_id=self.attempt_id,
+                    event=self.failure_event_factory(exc),
+                    writer_id=self.writer_id,
+                    surface_name=self.surface_name,
+                    source_lookup_key=self.failure_source_lookup_key,
+                    expected_source_version=self.expected_source_version,
+                    action_context=self.failure_action_context,
+                    artifacts=self.artifacts,
+                )
+                raise exc from _FailureEvidenceRecorded(terminal)
         try:
             worker_result = dispatch(start)
         except BaseException as exc:
+            if self.authority_check is not None:
+                try:
+                    self.authority_check("worker_failure_terminal")
+                except BaseException as authority_exc:
+                    terminal = self.facade.fail_attempt(
+                        attempt_id=self.attempt_id,
+                        event=self.failure_event_factory(authority_exc),
+                        writer_id=self.writer_id,
+                        surface_name=self.surface_name,
+                        source_lookup_key=self.failure_source_lookup_key,
+                        expected_source_version=self.expected_source_version,
+                        action_context=self.failure_action_context,
+                        artifacts=self.artifacts,
+                    )
+                    raise exc from _FailureEvidenceRecorded(terminal)
             terminal = self.facade.fail_attempt(
                 attempt_id=self.attempt_id,
                 event=self.failure_event_factory(exc),
@@ -282,6 +313,11 @@ class CommonWorkerDispatchSpec:
             try:
                 self.post_dispatch_certificate(worker_result)
             except BaseException as exc:
+                if self.authority_check is not None:
+                    try:
+                        self.authority_check("worker_indeterminate_terminal")
+                    except BaseException as authority_exc:
+                        exc = authority_exc
                 terminal = self.facade.fail_attempt(
                     attempt_id=self.attempt_id,
                     event=(self.indeterminate_event_factory or self.failure_event_factory)(exc),
@@ -298,6 +334,25 @@ class CommonWorkerDispatchSpec:
                     terminal_result=terminal,
                 ) from exc
 
+        if self.authority_check is not None:
+            try:
+                self.authority_check("worker_success_terminal")
+            except BaseException as exc:
+                terminal = self.facade.fail_attempt(
+                    attempt_id=self.attempt_id,
+                    event=(self.indeterminate_event_factory or self.failure_event_factory)(exc),
+                    writer_id=self.writer_id,
+                    surface_name=self.surface_name,
+                    source_lookup_key=self.failure_source_lookup_key,
+                    expected_source_version=self.expected_source_version,
+                    action_context=self.failure_action_context,
+                    artifacts=self.artifacts,
+                )
+                raise PostLaunchIndeterminateError(
+                    "child authority changed after worker dispatch",
+                    worker_result=worker_result,
+                    terminal_result=terminal,
+                ) from exc
         terminal = self.facade.complete_attempt(
             attempt_id=self.attempt_id,
             event=self.success_event_factory(worker_result),

@@ -195,6 +195,25 @@ def _ensure_fresh_child_for_plan(
     metadata = state.metadata if isinstance(state.metadata, dict) else {}
     records = metadata.get("fresh_child_admissions")
     if isinstance(records, dict) and isinstance(records.get(milestone.label), dict):
+        from arnold_pipelines.megaplan._core.state import write_plan_state
+        plan_dir = resolve_plan_dir(root, plan_name)
+        recorded = dict(records[milestone.label])
+
+        def _reproject_child(current: dict[str, Any]) -> bool:
+            meta = current.setdefault("meta", {})
+            if not isinstance(meta, dict):
+                current["meta"] = meta = {}
+            existing = meta.get("fresh_child_admission")
+            if existing is not None and existing != recorded:
+                raise CliError(
+                    "fresh_child_admission_failed",
+                    "child admission replay identity conflict",
+                )
+            meta["fresh_child_admission"] = recorded
+            return True
+        write_plan_state(
+            plan_dir, mode="patch-many", patch={}, mutation=_reproject_child
+        )
         return None
     admission = _admit_fresh_child_for_plan(
         root=root,
@@ -211,7 +230,64 @@ def _ensure_fresh_child_for_plan(
     admissions = dict(state.metadata.get("fresh_child_admissions") or {})
     admissions[milestone.label] = admission
     state.metadata["fresh_child_admissions"] = admissions
+    # Carry the owner-admitted child tuple into the initialized plan.  This is
+    # an additive projection; it does not activate or write a phase ledger.
+    from arnold_pipelines.megaplan._core.state import write_plan_state
+    plan_dir = resolve_plan_dir(root, plan_name)
+
+    def _project_child(current: dict[str, Any]) -> bool:
+        meta = current.setdefault("meta", {})
+        if not isinstance(meta, dict):
+            current["meta"] = meta = {}
+        existing = meta.get("fresh_child_admission")
+        if existing is not None and existing != admission:
+            raise CliError(
+                "fresh_child_admission_failed",
+                "child admission projection identity conflict",
+            )
+        meta["fresh_child_admission"] = dict(admission)
+        return True
+    write_plan_state(plan_dir, mode="patch-many", patch={}, mutation=_project_child)
     return admission
+
+
+def _terminalize_fresh_child_for_plan(
+    *,
+    root: Path,
+    state: ChainState,
+    milestone: MilestoneSpec,
+    milestone_index: int,
+    plan_name: str,
+    outcome_kind: str,
+    outcome_status: str,
+) -> None:
+    """Close the admitted child lifecycle once the milestone is terminal."""
+    records = (
+        state.metadata.get("fresh_child_admissions")
+        if isinstance(state.metadata, dict)
+        else None
+    )
+    if not isinstance(records, dict):
+        return
+    pointer = records.get(milestone.label)
+    if not isinstance(pointer, dict):
+        return
+    from arnold_pipelines.megaplan.chain.fresh_child_launch import (
+        terminalize_fresh_child,
+    )
+
+    terminalize_fresh_child(
+        pointer,
+        plan_dir=resolve_plan_dir(root, plan_name),
+        outcome_kind=outcome_kind,
+        outcome_payload={
+            "schema": "arnold.megaplan.fresh_child_terminal.v1",
+            "milestone_label": milestone.label,
+            "milestone_index": milestone_index,
+            "plan_name": plan_name,
+            "outcome_status": outcome_status,
+        },
+    )
 
 
 def _automatic_pr_progression_permitted(
@@ -9237,6 +9313,18 @@ def run_chain(
         )
         if fresh_admission is not None:
             chain_spec.save_chain_state(spec_path, state)
+
+        def terminal_child(outcome_kind: str, outcome_status: str) -> None:
+            _terminalize_fresh_child_for_plan(
+                root=root,
+                state=state,
+                milestone=milestone,
+                milestone_index=idx,
+                plan_name=plan_name,
+                outcome_kind=outcome_kind,
+                outcome_status=outcome_status,
+            )
+
         # P6 reconcile executor inputs (idempotent re-write covers both the
         # fresh-init and the crash-resume path; harmless for other kinds).
         _write_reconcile_plan_inputs(
@@ -9315,6 +9403,7 @@ def run_chain(
             spec_path=spec_path,
         )
         if decision == "authority_blocked":
+            terminal_child("BLOCKED", "authority_divergence")
             state.last_state = "authority_divergence"
             chain_spec.save_chain_state(spec_path, state)
             return _result(
@@ -9329,6 +9418,7 @@ def run_chain(
                 root, plan_name
             )
             if not authoritative:
+                terminal_child("BLOCKED", "task_authority_divergence")
                 writer(
                     f"[chain] milestone {milestone.label} outcome={outcome.status} "
                     f"lacks task authority; stopping: {reason}\n"
@@ -9355,6 +9445,14 @@ def run_chain(
                 )
 
         if decision == "stop":
+            terminal_child(
+                (
+                    "BLOCKED"
+                    if outcome.status in {"blocked", "stalled", "awaiting_human"}
+                    else "FAILED"
+                ),
+                outcome.status,
+            )
             _maybe_file_ladder_ticket(
                 root, spec_path, milestone, outcome, state, writer=writer
             )
@@ -9435,6 +9533,7 @@ def run_chain(
                         f"; deleted_tests={deleted_tests[:10]}" if deleted_tests else ""
                     )
                 )
+                terminal_child("BLOCKED", "full_suite_backstop_blocked")
                 chain_spec.save_chain_state(spec_path, state)
                 return _result(
                     "blocked",
@@ -9504,6 +9603,7 @@ def run_chain(
                 log=log,
             )
             if publish_reason is not None:
+                terminal_child("BLOCKED", "reconcile_publication_blocked")
                 state.last_state = STATE_BLOCKED
                 chain_spec.save_chain_state(spec_path, state)
                 return _result(
@@ -9572,6 +9672,7 @@ def run_chain(
                     chain_state=state,
                 )
                 if not accepted:
+                    terminal_child("BLOCKED", "completion_revalidation_blocked")
                     state.last_state = STATE_BLOCKED
                     chain_spec.save_chain_state(spec_path, state)
                     return _result(
@@ -9588,6 +9689,7 @@ def run_chain(
                     f"milestone {milestone.label} advanced by accepted local "
                     "completion during sync; continuing without PR metadata"
                 )
+                terminal_child("COMPLETED", outcome.status)
                 _mark_plan_completed_by_chain(
                     root,
                     plan_name,
@@ -9642,6 +9744,7 @@ def run_chain(
                         return blocked
                     continue
                 log(f"PR #{state.pr_number} closed during milestone completion; stopping chain")
+                terminal_child("BLOCKED", "pull_request_closed")
                 return _stop_for_closed_pr(
                     spec_path=spec_path,
                     state=state,
@@ -9684,6 +9787,7 @@ def run_chain(
                             "published evidence"
                         )
                     else:
+                        terminal_child("BLOCKED", "premerge_completion_guard_blocked")
                         writer(
                             f"[chain] completion guard blocked {milestone.label} before "
                             f"PR merge: {premerge_reason}\n"
@@ -9813,6 +9917,7 @@ def run_chain(
                 state.enforce_revise_counts.get(milestone.label, 0)
             )
             if milestone_retry_count >= max_retries:
+                terminal_child("BLOCKED", "completion_contract_retry_exhausted")
                 log(
                     f"completion_contract_mode=enforce: milestone {milestone.label!r} "
                     f"blocked; retry cap {max_retries} exhausted — operator action required"
@@ -9881,6 +9986,7 @@ def run_chain(
             no_git_refresh=no_git_refresh,
         )
         if validation_reason is not None:
+            terminal_child("BLOCKED", "milestone_validation_blocked")
             return _result(
                 "blocked",
                 state,
@@ -9896,6 +10002,7 @@ def run_chain(
             writer=writer,
         )
         if not appended:
+            terminal_child("BLOCKED", "completion_guard_blocked")
             return _handle_completion_guard_failure(
                 root=root,
                 spec_path=spec_path,
@@ -9908,6 +10015,7 @@ def run_chain(
                 events=events,
                 writer=writer,
             )
+        terminal_child("COMPLETED", outcome.status)
         _mark_plan_completed_by_chain(
             root,
             plan_name,
