@@ -218,7 +218,11 @@ def test_command_file_identity_components_are_bounded_and_separated(
     assert first.components[1].startswith("operation-")
     assert first.components[1] != wrong_identity.components[1]
     assert first.path != wrong_identity.path
-    assert operation_id not in command_file_session_argv("agentbox-op", first)[-1]
+    verifier_command = command_file_session_argv("agentbox-op", first)[-1]
+    assert "/bin/bash" in verifier_command
+    assert operation_id not in verifier_command
+    assert "request:v3:one" not in verifier_command
+    assert "sha256:envelope-one" not in verifier_command
 
 
 def test_materialize_command_file_rejects_tampering_and_symlink_occupancy(
@@ -302,6 +306,66 @@ def test_command_file_verified_fd_executes_exact_payload(tmp_path: Path) -> None
 
     assert result.returncode == 0, result.stderr
     assert result.stdout == "verified-success"
+
+
+@pytest.mark.skipif(which("tmux") is None, reason="tmux is not installed")
+def test_command_file_real_tmux_executes_bash_boundary_payload_once(
+    tmp_path: Path,
+) -> None:
+    """The fd-bound command seam must run the Bash-shaped launch boundary."""
+
+    command = (
+        "set -e; "
+        "stub=$(mktemp); "
+        "printf '%s\\n' '#!/usr/bin/env bash' "
+        "'boundary_stub() {' "
+        "'  local value=$1' "
+        "'  [[ $value == expected ]] && printf bash-boundary-success' "
+        "'}' >\"$stub\"; "
+        "source \"$stub\"; "
+        "boundary_stub expected; rm -f \"$stub\"; sleep 1; "
+        + ("# harmless-long-payload\\n" * 4000)
+    )
+    assert len(command.encode("utf-8")) > TMUX_COMMAND_INLINE_LIMIT
+
+    # macOS ships a Bash-derived /bin/sh; use dash when /bin/sh is not the
+    # POSIX shell used by the production Linux runtime to prove the old seam.
+    sh_path = "/bin/sh"
+    if Path(sh_path).resolve().name != "dash":
+        sh_path = "/bin/dash"
+    sh_result = subprocess.run(
+        [sh_path, "-c", command],
+        cwd=tmp_path,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert sh_result.returncode != 0
+
+    binding = materialize_command_file(
+        command,
+        durable_root=tmp_path / "root",
+        operation_id="bash-op",
+        request_id="bash-req",
+        envelope_digest="sha256:bash-env",
+    )
+    name = session_name(f"bash-boundary-{tmp_path.name}")
+    try:
+        run_tmux(command_file_session_argv(name, binding, cwd=tmp_path))
+        pane = ""
+        for _ in range(40):
+            pane = run_tmux(capture_pane_argv(name)).stdout
+            if "bash-boundary-success" in pane:
+                break
+            time.sleep(0.05)
+        assert "bash-boundary-success" in pane
+    finally:
+        subprocess.run(
+            ["tmux", "kill-session", "-t", name],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
 
 
 @pytest.mark.parametrize("mode", (0o775, 0o777))

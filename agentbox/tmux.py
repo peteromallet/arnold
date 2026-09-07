@@ -25,6 +25,7 @@ from agentbox.run_dirs import RunDirPaths
 
 TMUX_BIN = "tmux"
 TMUX_COMMAND_INLINE_LIMIT = 8192
+COMMAND_FILE_INTERPRETER = "/bin/bash"
 _COMMAND_FILE_TEST_HOOK: Any = None
 
 
@@ -112,6 +113,11 @@ def command_file_session_argv(
 ) -> list[str]:
     """Build a short fixed-form argv that executes an already-bound command file."""
 
+    if not os.path.isfile(COMMAND_FILE_INTERPRETER) or not os.access(
+        COMMAND_FILE_INTERPRETER, os.X_OK
+    ):
+        raise TmuxError("required command interpreter is unavailable")
+
     verifier = (
         "import hashlib,os,stat,sys,tempfile;"
         "root,*parts,digest=sys.argv[1:];"
@@ -129,7 +135,7 @@ def command_file_session_argv(
         "hashlib.sha256(data).hexdigest()==digest or (_ for _ in()).throw(ValueError('command digest mismatch'));"
         "safe=tempfile.TemporaryFile();safe.write(data);safe.flush();safe.seek(0);"
         "script=safe.fileno();os.set_inheritable(script,True);"
-        "os.execv('/bin/sh',['/bin/sh',f'/dev/fd/{script}'])"
+        "os.execv('/bin/bash',['/bin/bash',f'/dev/fd/{script}'])"
     )
     command = " ".join(
         _shell_quote(value)
