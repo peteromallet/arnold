@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import os
 import subprocess
 from pathlib import Path
@@ -11,6 +12,8 @@ from agentbox.config import AgentBoxConfig
 from agentbox.operations import create_agentbox_operation, open_operation_store
 from agentbox.run_dirs import ensure_run_dir
 from agentbox.tmux import (
+    command_file_session_argv,
+    materialize_command_file,
     SessionStatus,
     TmuxResult,
     capture_pane_argv,
@@ -154,6 +157,66 @@ def test_start_session_wires_run_logs_into_new_session_command(
     assert captured["argv"][-1] == (
         f"echo hello >> {paths.stdout_path} 2>> {paths.stderr_path}"
     )
+
+
+def test_materialize_command_file_binds_large_payload_and_reuses_equal_bytes(
+    tmp_path: Path,
+) -> None:
+    payload = "printf exact-identity; " + ("# payload\n" * 5000)
+    path = materialize_command_file(
+        payload,
+        durable_root=tmp_path,
+        operation_id="op-1",
+        request_id="req-1",
+        envelope_digest="sha256:env-1",
+    )
+    assert path.read_text() == payload
+    assert path.stat().st_mode & 0o777 == 0o600
+    assert materialize_command_file(
+        payload,
+        durable_root=tmp_path,
+        operation_id="op-1",
+        request_id="req-1",
+        envelope_digest="sha256:env-1",
+    ) == path
+    assert command_file_session_argv("agentbox-op", path)[-1].startswith("exec /bin/sh ")
+
+
+def test_materialize_command_file_rejects_tampering_and_symlink_occupancy(
+    tmp_path: Path,
+) -> None:
+    payload = "echo safe"
+    path = materialize_command_file(
+        payload,
+        durable_root=tmp_path,
+        operation_id="op-2",
+        request_id="req-2",
+        envelope_digest="sha256:env-2",
+    )
+    path.write_text("echo tampered")
+    with pytest.raises(ValueError, match="bytes differ"):
+        materialize_command_file(
+            payload,
+            durable_root=tmp_path,
+            operation_id="op-2",
+            request_id="req-2",
+            envelope_digest="sha256:env-2",
+        )
+
+    other = tmp_path / "other"
+    other.write_text(payload)
+    target = tmp_path / "command-files" / "op-3" / "req-3" / "sha256:env-3"
+    target.mkdir(parents=True)
+    digest = hashlib.sha256(payload.encode()).hexdigest()
+    (target / f"command-{digest}.sh").symlink_to(other)
+    with pytest.raises(ValueError, match="private regular file"):
+        materialize_command_file(
+            payload,
+            durable_root=tmp_path,
+            operation_id="op-3",
+            request_id="req-3",
+            envelope_digest="sha256:env-3",
+        )
 
 
 def test_stop_session_returns_missing_status_without_sending_keys(monkeypatch) -> None:

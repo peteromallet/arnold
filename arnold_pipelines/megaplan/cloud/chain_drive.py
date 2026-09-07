@@ -21,6 +21,7 @@ from arnold.runtime.durable_ops import (
     LaunchDispatchRejected,
     LaunchEnvelope,
     LaunchResult,
+    OperationEvent,
     ResourceType,
     TypedResource,
     inspect_launch,
@@ -30,7 +31,15 @@ from arnold.runtime.durable_ops import (
 
 from agentbox.config import load_agentbox_config
 from agentbox.operations import open_operation_store
-from agentbox.tmux import inspect_session, new_session_argv, run_tmux
+from agentbox.tmux import (
+    TMUX_COMMAND_INLINE_LIMIT,
+    command_file_session_argv,
+    inspect_session,
+    materialize_command_file,
+    new_session_argv,
+    run_tmux,
+    TmuxError,
+)
 from arnold_pipelines.megaplan.cloud.runtime_manifest import (
     DEPENDENCY_GENERATION_REQUIRED,
     EPIC_REQUIRED,
@@ -687,7 +696,38 @@ def execute_authoritative_launch(request: Mapping[str, Any]) -> dict[str, Any]:
 
     def dispatch(candidate: LaunchEnvelope) -> str:
         try:
-            run_tmux(new_session_argv(session, command, cwd=Path(cwd), environment=identity))
+            if isinstance(command, str) and len(command.encode("utf-8")) > TMUX_COMMAND_INLINE_LIMIT:
+                command_file = materialize_command_file(
+                    command,
+                    durable_root=config.ops_store_root,
+                    operation_id=candidate.operation_id,
+                    request_id=candidate.request_id,
+                    envelope_digest=candidate.digest,
+                )
+                argv = command_file_session_argv(
+                    session,
+                    command_file,
+                    cwd=Path(cwd),
+                    environment=identity,
+                )
+            else:
+                argv = new_session_argv(session, command, cwd=Path(cwd), environment=identity)
+            run_tmux(argv)
+        except TmuxError as exc:
+            detail = str(exc).replace("\x00", "")[:512]
+            try:
+                store.append_operation_event(
+                    OperationEvent(
+                        id=f"launch-dispatch-rejected:{candidate.request_id}",
+                        operation_id=candidate.operation_id,
+                        event_type="launch.dispatch_rejected",
+                        summary="launch dispatch rejected by tmux",
+                        payload={"reason": "dispatch_rejected", "detail": detail},
+                    )
+                )
+            except Exception:
+                pass
+            raise LaunchDispatchRejected(detail) from exc
         except Exception as exc:
             raise LaunchDispatchRejected(str(exc)) from exc
         return session

@@ -3,7 +3,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import errno
+import hashlib
+import os
 import re
+import stat
 import subprocess
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -20,6 +24,7 @@ from agentbox.run_dirs import RunDirPaths
 
 
 TMUX_BIN = "tmux"
+TMUX_COMMAND_INLINE_LIMIT = 8192
 
 
 class TmuxError(RuntimeError):
@@ -78,6 +83,103 @@ def new_session_argv(
         argv.extend(["-e", f"{key}={value}"])
     argv.append(_command_for_shell(command, stdout_path=stdout_path, stderr_path=stderr_path))
     return argv
+
+
+def command_file_session_argv(
+    name: str,
+    command_file: Path | str,
+    *,
+    cwd: Path | str | None = None,
+    stdout_path: Path | str | None = None,
+    stderr_path: Path | str | None = None,
+    environment: Mapping[str, str] | None = None,
+) -> list[str]:
+    """Build a short fixed-form argv that executes an already-bound command file."""
+
+    return new_session_argv(
+        name,
+        f"exec /bin/sh {_shell_quote(str(command_file))}",
+        cwd=cwd,
+        stdout_path=stdout_path,
+        stderr_path=stderr_path,
+        environment=environment,
+    )
+
+
+def materialize_command_file(
+    command: str,
+    *,
+    durable_root: Path | str,
+    operation_id: str,
+    request_id: str,
+    envelope_digest: str,
+) -> Path:
+    """Atomically bind command bytes to one admitted launch identity.
+
+    The caller must invoke this only after canonical launch admission. Existing
+    equal bytes are reused for idempotent re-entry; every other occupancy is a
+    hard failure.
+    """
+
+    if not isinstance(command, str):
+        raise TypeError("command must be a string")
+    components = (operation_id, request_id, envelope_digest)
+    if any(not value or Path(value).name != value or value in {".", ".."} for value in components):
+        raise ValueError("command-file identity contains a path separator")
+    payload = command.encode("utf-8")
+    digest = hashlib.sha256(payload).hexdigest()
+    root = Path(durable_root).absolute()
+    directory = root / "command-files" / operation_id / request_id / envelope_digest
+    target = directory / f"command-{digest}.sh"
+    if target.parent != directory or target.is_absolute() is False:
+        raise ValueError("command-file path escaped durable root")
+    directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+    try:
+        info = target.lstat()
+        mode = stat.S_IMODE(info.st_mode)
+        if mode != 0o600 or not stat.S_ISREG(info.st_mode):
+            raise ValueError("command-file occupant is not a private regular file")
+        if target.read_bytes() != payload:
+            raise ValueError("command-file occupant bytes differ")
+        _verify_command_file(target, payload)
+        return target
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        if exc.errno != errno.ENOENT:
+            raise
+
+    temporary = directory / f".{target.name}.{os.getpid()}.{os.urandom(6).hex()}.tmp"
+    fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        try:
+            os.link(temporary, target)
+        except FileExistsError:
+            pass
+        finally:
+            temporary.unlink(missing_ok=True)
+        _verify_command_file(target, payload)
+        directory_fd = os.open(directory, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+        return target
+    except Exception:
+        temporary.unlink(missing_ok=True)
+        raise
+
+
+def _verify_command_file(path: Path, payload: bytes) -> None:
+    info = path.lstat()
+    if not stat.S_ISREG(info.st_mode) or stat.S_IMODE(info.st_mode) != 0o600:
+        raise ValueError("command-file readback is not a private regular file")
+    if info.st_uid != os.geteuid() or path.read_bytes() != payload:
+        raise ValueError("command-file digest or owner readback mismatch")
 
 
 def has_session_argv(name: str) -> list[str]:
