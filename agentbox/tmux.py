@@ -30,6 +30,10 @@ TMUX_COMMAND_INLINE_LIMIT = 8192
 class TmuxError(RuntimeError):
     """Raised for tmux command failures that are not structured statuses."""
 
+    def __init__(self, detail: str, *, returncode: int | None = None) -> None:
+        super().__init__(detail)
+        self.returncode = returncode
+
 
 @dataclass(frozen=True)
 class TmuxResult:
@@ -133,7 +137,9 @@ def materialize_command_file(
     target = directory / f"command-{digest}.sh"
     if target.parent != directory or target.is_absolute() is False:
         raise ValueError("command-file path escaped durable root")
+    _reject_symlink_ancestors(root, directory)
     directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+    _reject_symlink_ancestors(root, directory)
     try:
         info = target.lstat()
         mode = stat.S_IMODE(info.st_mode)
@@ -182,6 +188,31 @@ def _verify_command_file(path: Path, payload: bytes) -> None:
         raise ValueError("command-file digest or owner readback mismatch")
 
 
+def _reject_symlink_ancestors(root: Path, directory: Path) -> None:
+    """Reject symlinked command-file ancestors before and after publication."""
+
+    try:
+        root_info = root.lstat()
+    except FileNotFoundError:
+        root.mkdir(parents=True, exist_ok=True, mode=0o700)
+        root_info = root.lstat()
+    if stat.S_ISLNK(root_info.st_mode) or not stat.S_ISDIR(root_info.st_mode):
+        raise ValueError("command-file durable root is not a directory")
+    try:
+        relative = directory.relative_to(root)
+    except ValueError as exc:
+        raise ValueError("command-file path escaped durable root") from exc
+    current = root
+    for component in relative.parts:
+        current /= component
+        try:
+            info = current.lstat()
+        except FileNotFoundError:
+            continue
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+            raise ValueError("command-file ancestor is not a directory")
+
+
 def has_session_argv(name: str) -> list[str]:
     return [TMUX_BIN, "has-session", "-t", name]
 
@@ -223,7 +254,10 @@ def run_tmux(argv: Sequence[str], *, check: bool = True) -> TmuxResult:
         stderr=completed.stderr.strip(),
     )
     if check and result.returncode != 0:
-        raise TmuxError(result.stderr or result.stdout or f"tmux exited {result.returncode}")
+        raise TmuxError(
+            result.stderr or result.stdout or f"tmux exited {result.returncode}",
+            returncode=result.returncode,
+        )
     return result
 
 

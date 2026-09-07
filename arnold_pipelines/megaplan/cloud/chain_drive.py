@@ -714,20 +714,22 @@ def execute_authoritative_launch(request: Mapping[str, Any]) -> dict[str, Any]:
                 argv = new_session_argv(session, command, cwd=Path(cwd), environment=identity)
             run_tmux(argv)
         except TmuxError as exc:
-            detail = str(exc).replace("\x00", "")[:512]
-            try:
-                store.append_operation_event(
-                    OperationEvent(
-                        id=f"launch-dispatch-rejected:{candidate.request_id}",
-                        operation_id=candidate.operation_id,
-                        event_type="launch.dispatch_rejected",
-                        summary="launch dispatch rejected by tmux",
-                        payload={"reason": "dispatch_rejected", "detail": detail},
-                    )
+            raw_detail = str(exc).lower()
+            code = "command_too_long" if "command too long" in raw_detail else "tmux_rejected"
+            store.append_operation_event(
+                OperationEvent(
+                    id=f"launch-dispatch-rejected:{candidate.request_id}",
+                    operation_id=candidate.operation_id,
+                    event_type="launch.dispatch_rejected",
+                    summary="launch dispatch rejected by tmux",
+                    payload={
+                        "reason": "dispatch_rejected",
+                        "code": code,
+                        "returncode": exc.returncode,
+                    },
                 )
-            except Exception:
-                pass
-            raise LaunchDispatchRejected(detail) from exc
+            )
+            raise LaunchDispatchRejected(code) from exc
         except Exception as exc:
             raise LaunchDispatchRejected(str(exc)) from exc
         return session

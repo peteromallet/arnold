@@ -219,6 +219,21 @@ def test_materialize_command_file_rejects_tampering_and_symlink_occupancy(
         )
 
 
+def test_materialize_command_file_rejects_symlinked_ancestor(tmp_path: Path) -> None:
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    root = tmp_path / "root"
+    root.mkdir()
+    (root / "command-files").symlink_to(outside, target_is_directory=True)
+    with pytest.raises(ValueError, match="ancestor"):
+        materialize_command_file(
+            "echo safe",
+            durable_root=root,
+            operation_id="op",
+            request_id="req",
+            envelope_digest="sha256:env",
+        )
+
 def test_stop_session_returns_missing_status_without_sending_keys(monkeypatch) -> None:
     calls: list[tuple[str, ...]] = []
 
