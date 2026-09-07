@@ -47,6 +47,12 @@ from arnold_pipelines.megaplan.custody.wbc_runtime import (
     WbcRuntimeProducerFacade,
 )
 from arnold_pipelines.megaplan.handlers import shared as shared_handlers
+from arnold_pipelines.megaplan.orchestration.phase_result import (
+    DispatchOutcome,
+    ExitKind,
+    read_phase_result,
+)
+from arnold_pipelines.megaplan.types import CliError
 from arnold_pipelines.megaplan.workers import _impl as worker_impl
 from arnold_pipelines.run_authority import CapabilityGrant, CoordinatorFence
 
@@ -529,6 +535,84 @@ def test_run_worker_passes_wbc_dispatch_to_run_step_with_worker(tmp_path: Path, 
 
     assert captured["wbc_dispatch"] is dispatch_spec
     assert (worker.session_id, agent, mode, refreshed) == ("session-T13", "codex", "persistent", False)
+
+
+def test_run_worker_preserves_post_provider_unresolved_outcome_without_finished_at(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A post-provider unresolved terminal remains typed at the phase boundary."""
+    _register_writer()
+    attempt_id = "17171717-1717-4717-8717-171717171717"
+    store, facade = _facade(tmp_path)
+    provider_calls = 0
+    outcome = DispatchOutcome(
+        kind="unresolved_launch",
+        launch_state="ambiguous",
+        plan_id="plan-T17",
+        phase="plan",
+        dispatch_family_id="family-T17",
+        logical_dispatch_id="logical-T17",
+        admission_receipt_id=None,
+        semantic_dispatch_fingerprint=None,
+        selected_spec="codex:gpt-5.5",
+        terminal_outcome_event_id="terminal-T17",
+        finished_at=None,
+    )
+
+    def post_provider_unresolved(*args: Any, **kwargs: Any) -> tuple[worker_impl.WorkerResult, str, str, bool]:
+        nonlocal provider_calls
+        del args, kwargs
+        provider_calls += 1
+        raise CliError(
+            "scheduling_condition",
+            "canonical worker launch remains unresolved",
+            extra={"reason": "unresolved_launch", "dispatch_outcome": outcome.to_dict()},
+        )
+
+    monkeypatch.delenv("ARNOLD_RUNTIME_MANIFEST", raising=False)
+    monkeypatch.delenv("MEGAPLAN_RUNTIME_LAUNCH_SEED", raising=False)
+    monkeypatch.setattr(shared_handlers, "apply_profile_expansion", lambda *args, **kwargs: None)
+    monkeypatch.setattr(shared_handlers, "activate_phase_wbc", lambda *args, **kwargs: None)
+    monkeypatch.setattr(worker_impl, "_run_step_with_worker_legacy", post_provider_unresolved)
+
+    state = {
+        "name": "plan-T17",
+        "iteration": 1,
+        "config": {"project_dir": str(tmp_path)},
+        "history": [],
+        "sessions": {},
+        "meta": {},
+    }
+    with pytest.raises(CliError, match="canonical worker launch remains unresolved") as caught:
+        shared_handlers._run_worker(
+            "plan",
+            state,  # type: ignore[arg-type]
+            tmp_path,
+            argparse.Namespace(phase_model=[]),
+            root=tmp_path,
+            resolved=("codex", "persistent", False, "gpt-5.5"),
+            wbc_dispatch=_spec(facade, attempt_id),
+        )
+
+    assert provider_calls == 1
+    assert caught.value.code == "scheduling_condition"
+    assert caught.value.extra["reason"] == "unresolved_launch"
+    assert caught.value.extra["dispatch_outcome"] == outcome.to_dict()
+    result = read_phase_result(tmp_path)
+    assert result is not None
+    assert result.exit_kind == ExitKind.scheduling_condition.value
+    assert result.scheduling_condition is not None
+    assert result.scheduling_condition.reason == "unresolved_launch"
+    assert result.scheduling_condition.observed_at
+    assert result.scheduling_condition.cause_event_id == "terminal-T17"
+    assert result.dispatch_outcome == outcome
+    events = store.read_events(attempt_id)
+    assert [event.event_type for event in events] == [
+        AttemptEventType.STARTED,
+        AttemptEventType.FAILED,
+    ]
+    assert events[-1].outcome == AttemptOutcome.FAILED
 
 
 def test_auto_phase_worker_dispatch_rejects_stale_exact_source_before_provider_launch(

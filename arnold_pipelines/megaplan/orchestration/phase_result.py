@@ -16,6 +16,8 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Mapping
 
+from arnold_pipelines.megaplan._core.io import now_utc
+
 PHASE_RESULT_SCHEMA = "megaplan.phase_result"
 PHASE_RESULT_SCHEMA_VERSION = 1
 PHASE_RESULT_CONTRACT_VERSION = 1
