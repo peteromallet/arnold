@@ -19,6 +19,8 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
+import subprocess
+import sys
 from types import SimpleNamespace
 from typing import Any, Mapping
 
@@ -649,34 +651,35 @@ class TestCloudCLIMaterialization:
             assert phase  # phase is non-empty
             assert spec   # spec is non-empty
 
-    def test_generated_phase_bindings_preserve_explicit_effort(self) -> None:
-        from arnold_pipelines.megaplan.cloud.cli import _phase_model_by_label_from_preflight
-
+    def test_r8_named_profile_init_persists_high_phase_tier_and_prep_bindings(
+        self, tmp_path: Path
+    ) -> None:
         route = "omp:openrouter/meta/muse-spark-1.3-contributor:high"
-        result = _phase_model_by_label_from_preflight({
-            "milestones": [{
-                "label": "m1",
-                "profile": None,
-                "explicit_phase_model": [],
-                "resolved_phase_map": {
-                    "prep": route,
-                    "plan": route,
-                    "execute": route,
-                },
-            }]
-        })
-        assert result["m1"] == [f"prep={route}", f"plan={route}", f"execute={route}"]
-
-    def test_profile_projection_preserves_effort_for_every_phase(self) -> None:
-        from arnold_pipelines.megaplan.profiles.policy import profile_to_phase_models
-
-        route = "omp:openrouter/meta/muse-spark-1.3-contributor:high"
-        projected = profile_to_phase_models({
-            "prep": route,
-            "plan": route,
-            "execute": route,
-        })
-        assert projected == [f"prep={route}", f"plan={route}", f"execute={route}"]
+        idea = tmp_path / "idea.md"
+        idea.write_text("# r8\n", encoding="utf-8")
+        proc = subprocess.run(
+            [
+                sys.executable, "-m", "arnold_pipelines.megaplan", "init",
+                "--project-dir", str(tmp_path),
+                "--profile", "all-muse-spark-openrouter",
+                "--phase-model", f"plan={route}",
+                "--robustness", "bare", "--idea-file", str(idea),
+            ],
+            cwd=Path(__file__).parents[4],
+            check=False, capture_output=True, text=True,
+        )
+        assert proc.returncode == 0, proc.stderr or proc.stdout
+        payload = json.loads(proc.stdout)
+        state_path = tmp_path / ".megaplan" / "plans" / payload["plan"] / "state.json"
+        config = json.loads(state_path.read_text(encoding="utf-8"))["config"]
+        assert config["phase_model"]
+        assert all(item.endswith(":high") for item in config["phase_model"])
+        assert all(
+            value.endswith(":high")
+            for tiers in config["tier_models"].values()
+            for value in tiers.values()
+        )
+        assert all(value.endswith(":high") for value in config["prep_models"].values())
 
 
 class TestFallbackChainAncillaryRouting:

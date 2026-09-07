@@ -69,7 +69,7 @@ from arnold_pipelines.megaplan.cloud.template import (
     render_ensure_repos_block,
 )
 from arnold_pipelines.megaplan.layout import is_canonical_chain_spec
-from arnold_pipelines.megaplan.types import CliError, format_agent_spec, parse_agent_spec
+from arnold_pipelines.megaplan.types import CliError
 from arnold.runtime.durable_ops import (
     read_only_capacity_observation,
     read_only_network_observation,
@@ -2846,11 +2846,7 @@ def _phase_model_by_label_from_preflight(preflight_summary: Mapping[str, Any]) -
         elif isinstance(resolved, Mapping):
             for phase, spec in resolved.items():
                 if isinstance(phase, str) and isinstance(spec, str) and phase and spec and phase not in explicit_steps:
-                    # Preserve model/effort structure through the same
-                    # canonical formatter used by profile expansion.
-                    phase_models.append(
-                        encode_phase_model_value(phase, format_agent_spec(parse_agent_spec(spec)))
-                    )
+                    phase_models.append(f"{phase}={spec}")
         if phase_models:
             phase_model_by_label[label] = phase_models
     return phase_model_by_label
